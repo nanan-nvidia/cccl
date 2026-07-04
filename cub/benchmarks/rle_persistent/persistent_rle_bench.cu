@@ -58,6 +58,7 @@ struct Bufs
   int n      = 0;
   int ntiles = 0;
   int R      = 0; // #runs
+};
 
 Bufs setup(int n, int max_seg)
 {
@@ -74,6 +75,7 @@ Bufs setup(int n, int max_seg)
   cudaMalloc(&b.dc, sizeof(int) * n);
   cudaMalloc(&b.dn, sizeof(int));
   cudaMalloc(&b.dts, sizeof(u64) * b.ntiles);
+  cudaMemset(b.dts, 0, sizeof(u64) * b.ntiles); // one-time: states are gen-tagged, launches never clear
   cudaMalloc(&b.dctr, sizeof(int));
   cudaMemcpy(b.dk, h.data(), sizeof(int) * n, cudaMemcpyHostToDevice);
 
