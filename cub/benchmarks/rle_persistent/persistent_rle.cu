@@ -368,7 +368,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
 #if !RLE_USE_CLC && !RLE_STATIC_ASSIGN
   int* __restrict__ global_tile_counter, // global work steal counter when there is no CLC
 #endif
-  unsigned launch_gen, // >=1; stamps this launch's tile states (see publish_state)
+  const unsigned* __restrict__ d_launch_gen, // device-side call generation (graph-safe, no host state)
   OffT num_items,
   int num_tiles)
 {
@@ -416,10 +416,11 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   __shared__ u64 clc_bar;
 #endif
 
-  const int thr_id  = threadIdx.x;
-  const int warp_id = thr_id >> 5;
-  const int lane_id = thr_id & 31;
-  const int blk_id  = blockIdx.x;
+  const int thr_id          = threadIdx.x;
+  const int warp_id         = thr_id >> 5;
+  const int lane_id         = thr_id & 31;
+  const int blk_id          = blockIdx.x;
+  const unsigned launch_gen = __ldg(d_launch_gen); // written by the init kernel, stream-ordered
 
   if (thr_id == 0)
   {
@@ -498,22 +499,40 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         __syncwarp();
         break;
       }
+      // over-fetch one 16B chunk to the left: slot[0..kSlotPad-1] = previous tile's last keys,
+      // so COMPUTE reads element 0's predecessor from smem instead of a blocking LDG here.
+      // tile 0 has no predecessor and skips the over-fetch; its slot[0..kSlotPad-1] stay
+      // unread because is_global_first forces element 0's head flag.
+      const bool first_tile = (tile_id == 0);
+      const int tile_len    = (int) min((OffT) kTileSize, num_items - (OffT) tile_id * kTileSize);
+      // partial LAST tile: cp_async_bulk moves 16B multiples only, and reading past num_items
+      // would touch memory the user never allocated -- round the TMA down to the quantum and fetch
+      // the ragged tail (< 16B) with plain per-lane loads. The epilogue stores happen-before the
+      // release arrive below, so full[]'s acquire waiters see them along with the TMA bytes.
+      const int tma_elems = (tile_len == kTileSize) ? kTileSize : (tile_len & ~(kSlotPad - 1));
+      if (tile_len != kTileSize)
+      {
+        KeyT* const slot_keys = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad;
+        for (int e = tma_elems + lane_id; e < tile_len; e += 32)
+        {
+          slot_keys[e] = d_keys[(size_t) tile_id * kTileSize + e];
+        }
+        __syncwarp(); // all epilogue stores done before lane 0's release arrive
+      }
       if (lane_id == 0)
       {
-        // over-fetch one 16B chunk to the left: slot[0..kSlotPad-1] = previous tile's last keys,
-        // so COMPUTE reads element 0's predecessor from smem instead of a blocking LDG here.
-        // tile 0 has no predecessor and skips the over-fetch; its slot[0..kSlotPad-1] stay
-        // unread because is_global_first forces element 0's head flag.
-        const bool first_tile = (tile_id == 0);
-        const unsigned nbytes = (unsigned) ((kTileSize + (first_tile ? 0 : kSlotPad)) * sizeof(KeyT));
+        const unsigned nbytes = (unsigned) (((size_t) tma_elems + (first_tile ? 0 : kSlotPad)) * sizeof(KeyT));
         ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &full[slot_id], nbytes);
-        ptx::cp_async_bulk(
-          ptx::space_shared,
-          ptx::space_global,
-          tile_buf + (size_t) slot_id * kSlotStride + (first_tile ? kSlotPad : 0),
-          d_keys + (size_t) tile_id * kTileSize - (first_tile ? 0 : kSlotPad),
-          nbytes,
-          &full[slot_id]);
+        if (nbytes != 0)
+        {
+          ptx::cp_async_bulk(
+            ptx::space_shared,
+            ptx::space_global,
+            tile_buf + (size_t) slot_id * kSlotStride + (first_tile ? kSlotPad : 0),
+            d_keys + (size_t) tile_id * kTileSize - (first_tile ? 0 : kSlotPad),
+            nbytes,
+            &full[slot_id]);
+        }
       }
       __syncwarp();
 #if RLE_USE_CLC
@@ -1184,6 +1203,7 @@ inline void persistent_rle_launch(
   LenT* d_counts,
   NumRunsT* d_num_runs,
   u64* tile_state,
+  const unsigned* d_launch_gen,
   [[maybe_unused]] int* global_tile_counter,
   OffT num_items,
   int num_tiles,
@@ -1196,16 +1216,9 @@ inline void persistent_rle_launch(
   }();
   (void) smem_cap_set;
 
-  // no per-launch clear of tile_state: states are generation-tagged (see publish_state). The array
-  // only needs to be zeroed ONCE at allocation; each launch bumps the gen and stale words never match.
-#ifndef RLE_L2_CARVEOUT
-#endif
-  static unsigned launch_gen = 0;
-  ++launch_gen;
-  if (launch_gen == 0) // paranoia: on u32 wrap, skip gen 0 (matches the zeroed-at-alloc words)
-  {
-    ++launch_gen;
-  }
+  // no per-launch clear of tile_state: states are generation-tagged (see publish_state) and the
+  // generation lives in DEVICE memory (see the init kernel in rle_dispatch.cuh) -- no host-side
+  // state, so calls are CUDA-graph-capturable and thread-safe per temp-storage allocation.
 #if RLE_USE_CLC || RLE_STATIC_ASSIGN
   const int blocks = num_tiles;
 #else
@@ -1224,7 +1237,7 @@ inline void persistent_rle_launch(
 #if !RLE_USE_CLC && !RLE_STATIC_ASSIGN
     global_tile_counter,
 #endif
-    launch_gen,
+    d_launch_gen,
     num_items,
     num_tiles);
 }

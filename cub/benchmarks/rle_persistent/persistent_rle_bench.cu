@@ -52,22 +52,20 @@ long long cpu_run_count(const std::vector<KeyT>& h)
 
 struct Bufs
 {
-  KeyT* dk         = nullptr;
-  KeyT* du         = nullptr;
-  LenT* dc         = nullptr;
-  NumRunsT* dn     = nullptr;
-  u64* dts         = nullptr; // persistent-RLE per-tile state
-  int* dctr        = nullptr; // persistent-RLE work-steal counter (unused on CLC path)
-  long long n      = 0;
-  long long ntiles = 0;
-  long long R      = 0; // #runs
+  KeyT* dk     = nullptr;
+  KeyT* du     = nullptr;
+  LenT* dc     = nullptr;
+  NumRunsT* dn = nullptr;
+  void* dtemp  = nullptr; // persistent-RLE temp storage (header + gen-tagged tile states)
+  size_t tempb = 0;
+  long long n  = 0;
+  long long R  = 0; // #runs
 };
 
 Bufs setup(long long n, int max_seg)
 {
   Bufs b;
   b.n                  = n;
-  b.ntiles             = rle_state_tiles(n); // state slots for the small-tile path (the larger count)
   const size_t pad     = (size_t) ((n + kTileSize - 1) / kTileSize) * kTileSize;
   auto h               = gen_keys(n, max_seg, 1u);
   const long long cpuR = cpu_run_count(h);
@@ -77,9 +75,9 @@ Bufs setup(long long n, int max_seg)
   cudaMalloc(&b.du, sizeof(KeyT) * (size_t) n);
   cudaMalloc(&b.dc, sizeof(LenT) * (size_t) n);
   cudaMalloc(&b.dn, sizeof(NumRunsT));
-  cudaMalloc(&b.dts, sizeof(u64) * b.ntiles);
-  cudaMemset(b.dts, 0, sizeof(u64) * b.ntiles); // one-time: states are gen-tagged, launches never clear
-  cudaMalloc(&b.dctr, sizeof(int));
+  persistent_rle_encode(nullptr, b.tempb, b.dk, b.du, b.dc, b.dn, (OffT) n);
+  cudaMalloc(&b.dtemp, b.tempb);
+  cudaMemset(b.dtemp, 0xAB, b.tempb); // cold start; steady-state calls take the gen-bump path
   cudaMemcpy(b.dk, h.data(), sizeof(KeyT) * (size_t) n, cudaMemcpyHostToDevice);
 
   // Run CUB once for the authoritative run count + a correctness gate (aborts a fast-but-wrong build).
@@ -107,8 +105,7 @@ void teardown(Bufs& b)
   cudaFree(b.du);
   cudaFree(b.dc);
   cudaFree(b.dn);
-  cudaFree(b.dts);
-  cudaFree(b.dctr);
+  cudaFree(b.dtemp);
 }
 
 void add_counters(nvbench::state& s, const Bufs& b)
@@ -132,7 +129,7 @@ static void persistent_rle_bench(nvbench::state& state)
   Bufs b = setup(n, max_seg);
   add_counters(state, b);
   state.exec(nvbench::exec_tag::no_batch, [&](nvbench::launch& launch) {
-    persistent_rle_dispatch_launch(b.dk, b.du, b.dc, b.dn, b.dts, b.dctr, (OffT) n, launch.get_stream());
+    persistent_rle_encode(b.dtemp, b.tempb, b.dk, b.du, b.dc, b.dn, (OffT) n, launch.get_stream());
   });
   teardown(b);
 }

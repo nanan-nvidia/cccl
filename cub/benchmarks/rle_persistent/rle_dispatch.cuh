@@ -76,12 +76,53 @@ inline long long rle_state_tiles(long long n)
 #  define RLE_DISPATCH_MID_TILES 296
 #endif
 
+// ---- CUB-shaped temp-storage protocol -----------------------------------------------------
+// temp layout: [ header: u64 magic | u32 gen | u32 rsvd ][ u64 tile states ... ]
+// The init kernel bumps the generation when the header matches (allocate-once-call-many pays a
+// tiny kernel, cheaper than stock CUB per-call state init) and clears states exactly once
+// otherwise. All state is device-side: graph-capturable, no host statics.
+struct RleTempHeader
+{
+  unsigned long long magic;
+  unsigned gen;
+  unsigned rsvd;
+};
+inline constexpr unsigned long long kRleTempMagic = 0x524c455f54454d50ull; // "RLE_TEMP"
+
+__global__ void rle_init_states(RleTempHeader* hdr, u64* states, long long n_states)
+{
+  const bool fresh = (hdr->magic != kRleTempMagic) || (hdr->gen >= 0xfffffff0u);
+  if (fresh)
+  {
+    const long long stride = (long long) gridDim.x * blockDim.x;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n_states; i += stride)
+    {
+      states[i] = 0;
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+      hdr->magic = kRleTempMagic;
+      hdr->gen   = 1; // stale zeroed words carry gen 0 and never match gen >= 1
+    }
+  }
+  else if (blockIdx.x == 0 && threadIdx.x == 0)
+  {
+    hdr->gen = hdr->gen + 1;
+  }
+}
+
+inline size_t persistent_rle_temp_bytes(long long num_items)
+{
+  return sizeof(RleTempHeader) + (size_t) rle_state_tiles(num_items) * sizeof(u64);
+}
+
 inline void persistent_rle_dispatch_launch(
   const KeyT* d_keys,
   KeyT* d_unique,
   LenT* d_counts,
   NumRunsT* d_num_runs,
   u64* d_tile_states,
+  const unsigned* d_launch_gen,
   int* d_tile_counter,
   OffT num_items,
   cudaStream_t stream)
@@ -91,17 +132,57 @@ inline void persistent_rle_dispatch_launch(
   {
     const int small_tiles = (int) ((num_items + rle_small::kTileSize - 1) / rle_small::kTileSize);
     rle_small::persistent_rle_launch(
-      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_tile_counter, num_items, small_tiles, stream);
+      d_keys,
+      d_unique,
+      d_counts,
+      d_num_runs,
+      d_tile_states,
+      d_launch_gen,
+      d_tile_counter,
+      num_items,
+      small_tiles,
+      stream);
   }
   else if (big_tiles < RLE_DISPATCH_MID_TILES)
   {
     const int mid_tiles = (int) ((num_items + rle_mid::kTileSize - 1) / rle_mid::kTileSize);
     rle_mid::persistent_rle_launch(
-      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_tile_counter, num_items, mid_tiles, stream);
+      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_launch_gen, d_tile_counter, num_items, mid_tiles, stream);
   }
   else
   {
     rle_big::persistent_rle_launch(
-      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_tile_counter, num_items, big_tiles, stream);
+      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_launch_gen, d_tile_counter, num_items, big_tiles, stream);
   }
+}
+
+// CUB-shaped entry point: two-phase (null d_temp_storage -> required size), stream-ordered,
+// graph-capturable. Mirrors the cub::DeviceRunLengthEncode::Encode calling convention.
+inline cudaError_t persistent_rle_encode(
+  void* d_temp_storage,
+  size_t& temp_storage_bytes,
+  const KeyT* d_keys,
+  KeyT* d_unique,
+  LenT* d_counts,
+  NumRunsT* d_num_runs,
+  OffT num_items,
+  cudaStream_t stream = 0)
+{
+  const size_t required = persistent_rle_temp_bytes((long long) num_items);
+  if (d_temp_storage == nullptr)
+  {
+    temp_storage_bytes = required;
+    return cudaSuccess;
+  }
+  if (temp_storage_bytes < required)
+  {
+    return cudaErrorInvalidValue;
+  }
+  auto* hdr                = (RleTempHeader*) d_temp_storage;
+  u64* states              = (u64*) (hdr + 1);
+  const long long n_states = rle_state_tiles((long long) num_items);
+  rle_init_states<<<128, 256, 0, stream>>>(hdr, states, n_states);
+  persistent_rle_dispatch_launch(
+    d_keys, d_unique, d_counts, d_num_runs, states, &hdr->gen, /*d_tile_counter=*/nullptr, num_items, stream);
+  return cudaGetLastError();
 }
