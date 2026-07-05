@@ -11,18 +11,21 @@
 namespace
 {
 // random keys with run lengths uniform in [1, max_seg]; consecutive runs never share a key
-std::vector<int> gen_keys(int n, int max_seg, unsigned seed)
+// (adjacency-distinctness enforced post-cast so narrow key types can't merge segments)
+std::vector<KeyT> gen_keys(int n, int max_seg, unsigned seed)
 {
-  std::vector<int> k(n);
+  std::vector<KeyT> k(n);
   std::mt19937 rng(seed);
   std::uniform_int_distribution<int> seg(1, max_seg), kd(0, 1000000);
-  int i = 0, prev = -1;
+  int i     = 0;
+  KeyT prev = KeyT(-1);
   while (i < n)
   {
-    int run = seg(rng), v = kd(rng);
-    if (v == prev)
+    int run = seg(rng);
+    KeyT v  = KeyT(kd(rng));
+    for (int tries = 0; v == prev && tries < 8; ++tries)
     {
-      v = (v + 1) % 1000001;
+      v = KeyT(kd(rng));
     }
     prev  = v;
     int e = std::min(i + run, n);
@@ -34,12 +37,12 @@ std::vector<int> gen_keys(int n, int max_seg, unsigned seed)
   return k;
 }
 
-int cpu_run_count(const std::vector<int>& h)
+int cpu_run_count(const std::vector<KeyT>& h)
 {
   int r = 0;
   for (size_t i = 0; i < h.size(); ++i)
   {
-    if (i == 0 || h[i] != h[i - 1])
+    if (i == 0 || !(h[i] == h[i - 1]))
     {
       ++r;
     }
@@ -49,9 +52,9 @@ int cpu_run_count(const std::vector<int>& h)
 
 struct Bufs
 {
-  int* dk    = nullptr;
-  int* du    = nullptr;
-  int* dc    = nullptr;
+  KeyT* dk   = nullptr;
+  KeyT* du   = nullptr;
+  LenT* dc   = nullptr;
   int* dn    = nullptr;
   u64* dts   = nullptr; // persistent-RLE per-tile state
   int* dctr  = nullptr; // persistent-RLE work-steal counter (unused on CLC path)
@@ -69,15 +72,15 @@ Bufs setup(int n, int max_seg)
   auto h           = gen_keys(n, max_seg, 1u);
   const int cpuR   = cpu_run_count(h);
 
-  cudaMalloc(&b.dk, sizeof(int) * pad);
-  cudaMemset(b.dk, 0, sizeof(int) * pad);
-  cudaMalloc(&b.du, sizeof(int) * n);
-  cudaMalloc(&b.dc, sizeof(int) * n);
+  cudaMalloc(&b.dk, sizeof(KeyT) * pad);
+  cudaMemset(b.dk, 0, sizeof(KeyT) * pad);
+  cudaMalloc(&b.du, sizeof(KeyT) * n);
+  cudaMalloc(&b.dc, sizeof(LenT) * n);
   cudaMalloc(&b.dn, sizeof(int));
   cudaMalloc(&b.dts, sizeof(u64) * b.ntiles);
   cudaMemset(b.dts, 0, sizeof(u64) * b.ntiles); // one-time: states are gen-tagged, launches never clear
   cudaMalloc(&b.dctr, sizeof(int));
-  cudaMemcpy(b.dk, h.data(), sizeof(int) * n, cudaMemcpyHostToDevice);
+  cudaMemcpy(b.dk, h.data(), sizeof(KeyT) * n, cudaMemcpyHostToDevice);
 
   // Run CUB once for the authoritative run count + a correctness gate (aborts a fast-but-wrong build).
   void* tmp   = nullptr;
@@ -109,8 +112,9 @@ void teardown(Bufs& b)
 void add_counters(nvbench::state& s, const Bufs& b)
 {
   s.add_element_count(b.n);
-  s.add_global_memory_reads<int>(b.n, "keys"); // minimal RLE traffic, identical charge for both impls
-  s.add_global_memory_writes<int>(2ll * b.R, "unique+counts");
+  s.add_global_memory_reads<KeyT>(b.n, "keys"); // minimal RLE traffic, identical charge for both impls
+  s.add_global_memory_writes<KeyT>(b.R, "unique");
+  s.add_global_memory_writes<LenT>(b.R, "counts");
 }
 } // namespace
 

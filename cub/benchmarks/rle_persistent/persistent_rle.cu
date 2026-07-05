@@ -5,6 +5,7 @@
 
 #include <cuda/atomic>
 #include <cuda/ptx>
+#include <cuda/std/complex> // complex32 key instantiations
 #include <cuda/std/cstdint>
 
 #include <algorithm> // std::min (host launcher)
@@ -14,10 +15,27 @@
 namespace ptx = cuda::ptx;
 using u64     = cuda::std::uint64_t;
 
-#ifndef K_IPT
-#  define K_IPT 32
+// key/output types: one translation unit per instantiation (mirrors CUB's per-type bench TUs).
+// KeyT needs only operator== with CUB's equality semantics (floats: NaN breaks runs; complex:
+// componentwise). LenT is the run-length output type; run-length arithmetic is tile-local int,
+// widened at the store (valid while the longest run < 2^31, i.e. num_items < 2^31).
+#ifndef RLE_KEY_T
+#  define RLE_KEY_T int
 #endif
-constexpr int kIPT = K_IPT; // FP32s/thread; tile = kNumCompWarps*kIPT*32 = 8192 (small K_IPT: local-GPU debug)
+#ifndef RLE_LEN_T
+#  define RLE_LEN_T int
+#endif
+using KeyT = RLE_KEY_T;
+using LenT = RLE_LEN_T;
+
+#ifndef K_IPT
+// size-class tile policy: the tile is capped at 8192 ELEMENTS by the ballot design (32 chunks x
+// 32 lanes x kNumCompWarps warps); big keys shrink the tile to keep the 5-deep key ring inside
+// the smem cap (8B keys: 5x4096x8=160KB; 16B: 5x2048x16=160KB; <=4B: the tuned 8192 geometry).
+constexpr int kIPT = (sizeof(KeyT) >= 16) ? 8 : (sizeof(KeyT) == 8 ? 16 : 32);
+#else
+constexpr int kIPT = K_IPT; // elements/thread; tile = kNumCompWarps*kIPT*32 (small K_IPT: local-GPU debug)
+#endif
 #ifndef K_COMP_WARPS
 #  define K_COMP_WARPS 8
 #endif
@@ -112,15 +130,15 @@ constexpr unsigned kFullMask     = 0xffffffffu;
 constexpr int poll_warp_id       = 1 + kNumCompWarps;
 constexpr int store_warp_id      = poll_warp_id + 1;
 constexpr int bookkeeper_warp_id = store_warp_id + kNumStoreWarps;
-// for each input tile, we need to store the keys (I32) and in tile position
+// for each input tile, we need to store the keys and in-tile positions
 // for in tile position we can just do U16 since tile size is never bigger than 2^16.
-// each key slot carries kSlotPad extra leading ints: the TMA over-fetches one 16B chunk to the
-// left, so slot[0..kSlotPad-1] hold the previous tile's last keys and element 0's predecessor
+// each key slot carries kSlotPad extra leading elements: the TMA over-fetches one 16B chunk to
+// the left, so slot[0..kSlotPad-1] hold the previous tile's last keys and element 0's predecessor
 // is slot[kSlotPad-1] -- no separate (blocking) LDG of the previous tile's last key needed.
-constexpr int kSlotPad    = 4; // ints; 16 bytes = cp_async_bulk alignment quantum
+constexpr int kSlotPad    = 16 / sizeof(KeyT); // elements; 16 bytes = cp_async_bulk quantum
 constexpr int kSlotStride = kTileSize + kSlotPad;
 constexpr size_t kDynSmem =
-  (size_t) kStages * kSlotStride * sizeof(int) + (size_t) kPosStages * kTileSize * sizeof(short);
+  (size_t) kStages * kSlotStride * sizeof(KeyT) + (size_t) kPosStages * kTileSize * sizeof(short);
 
 // tile_partial_states is one 64-bit word [launch_gen:32][open_len:16][run_count:16].
 // run_count and open_len are per-tile so both fit 16 bits; the high half holds the launch
@@ -267,9 +285,9 @@ __device__ __forceinline__ void poll_and_fold(
 
 // we aim for 1 block/SM since it is easier to manage resources: do not need to worry about occupancy anymore
 __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
-  const int* __restrict__ d_keys,
-  int* __restrict__ d_unique,
-  int* __restrict__ d_counts,
+  const KeyT* __restrict__ d_keys,
+  KeyT* __restrict__ d_unique,
+  LenT* __restrict__ d_counts,
   int* __restrict__ d_num_runs,
   u64* __restrict__ tile_partial_states,
 #if !USE_CLC
@@ -281,7 +299,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
 {
   // [kStages][kTileSize] int32 ring (input keys)
   // [kStages][kTileSize] int16 staged head positions
-  extern __shared__ int tile_buf[];
+  extern __shared__ char smem_raw[]; // 16B-aligned; KeyT alignment <= 16 for all supported types
+  KeyT* const tile_buf    = (KeyT*) smem_raw;
   short* const staged_pos = (short*) (tile_buf + (size_t) kStages * kSlotStride);
   __shared__ int tile_seq[kStages]; // which global tile each ring slot holds (LOAD gets it with try_cancel)
   __shared__ int warp_run_counts[kStages][kNumCompWarps]; // per compute warp run counts
@@ -408,7 +427,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         // tile 0 has no predecessor and skips the over-fetch; its slot[0..kSlotPad-1] stay
         // unread because is_global_first forces element 0's head flag.
         const bool first_tile = (tile_id == 0);
-        const unsigned nbytes = (unsigned) ((kTileSize + (first_tile ? 0 : kSlotPad)) * sizeof(int));
+        const unsigned nbytes = (unsigned) ((kTileSize + (first_tile ? 0 : kSlotPad)) * sizeof(KeyT));
         ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &full[slot_id], nbytes);
         ptx::cp_async_bulk(
           ptx::space_shared,
@@ -468,7 +487,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       }
       // slot is ready! (under split, half-1 warps index through +2*kSlotPad so pad1 sits at loc
       // kHalfTile-1's predecessor position; all their accesses incl. loc-1 stay in half 1 + pad1)
-      const int* key_buf  = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad;
+      const KeyT* key_buf = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad;
       const int tile_len  = min(kTileSize, num_items - tile_id * kTileSize);
       int local_run_count = 0, warp_first_head = -1, warp_last_head = -1;
       static_assert(kIPT <= 32, "one lane per iter requires kIPT<=32");
@@ -486,8 +505,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       for (int iter = 0; iter < kIPT; ++iter)
       {
         const int loc             = warp_tile_base + iter * 32 + lane_id;
-        const int key             = (loc < tile_len) ? key_buf[loc] : 0;
-        const int pred            = key_buf[loc - 1]; // loc==0 reads the over-fetched slot[kSlotPad-1]
+        const KeyT key            = (loc < tile_len) ? key_buf[loc] : KeyT{};
+        const KeyT pred           = key_buf[loc - 1]; // loc==0 reads the over-fetched slot[kSlotPad-1]
         const int is_global_first = (tile_id == 0 && loc == 0);
         const int head            = (loc < tile_len) ? (is_global_first ? 1 : (key != pred)) : 0;
         const unsigned flags      = __ballot_sync(kFullMask, head);
@@ -712,8 +731,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           wt_incl_ln += p;
         }
       }
-      const int wt_base_ln = wt_incl_ln - wt_count_ln; // lane i: warp-tile i's exclusive run base
-      const int* tile_keys = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad;
+      const int wt_base_ln  = wt_incl_ln - wt_count_ln; // lane i: warp-tile i's exclusive run base
+      const KeyT* tile_keys = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad;
       // staged positions
       const short* run_positions = staged_pos + (size_t) (gen % kPosStages) * kTileSize;
       // wait for prefixed (2/3); drains only need the run-count prefix (addresses) -- the
@@ -830,7 +849,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         const int warp_tile_run_count        = __shfl_sync(kFullMask, wt_count_ln, warp_tile_id);
         const int warp_tile_run_base         = __shfl_sync(kFullMask, wt_base_ln, warp_tile_id);
 #if RLE_REGBUF
-        if (warp_tile_run_count >= RLE_RB_MIN && warp_tile_run_count <= RLE_REGBUF)
+        if (warp_tile_run_count >= RLE_RB_MIN
+            && warp_tile_run_count <= ((sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64)))
         {
           const int run_begin = (int) ((long) warp_tile_run_count * sub / kStoreWarpsPerWarpTile);
           const int run_end   = (int) ((long) warp_tile_run_count * (sub + 1) / kStoreWarpsPerWarpTile);
@@ -838,8 +858,10 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           while (!ptx::mbarrier_try_wait_parity(&staged_wt[slot_id][warp_tile_id], (unsigned) ((gen / kStages) & 1)))
           {
           }
-          constexpr int kBufPerLane = (RLE_REGBUF + 31) / 32;
-          int buf_key[kBufPerLane];
+          // register-budget scale: big keys hold fewer buffered runs/lane (16B keys: 2 -> 8 regs)
+          constexpr int kRegBufCap  = (sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64);
+          constexpr int kBufPerLane = (kRegBufCap + 31) / 32;
+          KeyT buf_key[kBufPerLane];
           int buf_cnt[kBufPerLane];
           const int warp_tile_offset = warp_tile_id * kWarpTileSize;
           const int niter            = (run_end - run_begin + 31) >> 5;
@@ -892,8 +914,12 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               const int pcw         = __popc(mw);
               const int local_pos   = w * 32 + nth_set_bit(mw, (j < pcw) ? j : 0);
               const int in_word_nxt = w * 32 + nth_set_bit(mw, (j + 1 < pcw) ? (j + 1) : 0);
-              buf_key[it]           = tile_keys[warp_tile_offset + local_pos];
-              buf_cnt[it]           = ((j + 1 < pcw) ? in_word_nxt : nxt_after_w) - local_pos;
+              // inactive lanes (run_idx >= run_end) decode garbage positions up to wt_offset+1023,
+              // which is out of the key window whenever the warp-tile is under 1024 elements (any
+              // key type over 4B, or debug kIPT<32) -- predicate the read, keep the shuffles above
+              // unconditional
+              buf_key[it] = (run_idx < run_end) ? tile_keys[warp_tile_offset + local_pos] : KeyT{};
+              buf_cnt[it] = ((j + 1 < pcw) ? in_word_nxt : nxt_after_w) - local_pos;
             }
           }
           else
@@ -1073,9 +1099,9 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
 }
 
 inline void persistent_rle_launch(
-  const int* d_keys,
-  int* d_unique,
-  int* d_counts,
+  const KeyT* d_keys,
+  KeyT* d_unique,
+  LenT* d_counts,
   int* d_num_runs,
   u64* tile_state,
   [[maybe_unused]] int* global_tile_counter,
