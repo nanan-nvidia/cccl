@@ -56,56 +56,11 @@ constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in f
 // drain-loop unroll (gather MLP): 2 is the measured default winner (+6.5pt dense, ~flat elsewhere);
 // 4 gains less at dense and costs 1.3-1.5pt at seg8-16; 0 = no unroll. NOTE this knob's verdict
 // FLIPPED twice as the surrounding design changed -- re-sweep it after any store-path change.
-#ifndef RLE_DRAIN_UNROLL4
-#  define RLE_DRAIN_UNROLL4 0
-#endif
-#ifndef RLE_DRAIN_UNROLL2
-#  define RLE_DRAIN_UNROLL2 (!RLE_DRAIN_UNROLL4)
-#endif
 
 #ifndef RLE_POLL_ORACLE
 #  define RLE_POLL_ORACLE 0 // 1 = WRONG RESULTS: free-prefix ceiling probe (skips the poll fold)
 #endif
 
-// RLE_BK_EARLY_ARRIVE: bookkeeper reads all slot metadata into registers BEFORE the prefix wait and
-//   arrives `empty` right after reading the prefix -- its global writes come off the recycle chain.
-// RLE_STCS_OUT: streaming (evict-first) stores for d_unique/d_counts -- keeps ~2GB of output from
-//   churning the L2 lines the prefix states and staged data live in.
-#ifndef RLE_BK_EARLY_ARRIVE
-#  define RLE_BK_EARLY_ARRIVE 0
-#endif
-#ifndef RLE_STCS_OUT
-#  define RLE_STCS_OUT 0
-#endif
-// RLE_GLOBAL_GATHER: drain gathers run keys from GLOBAL d_keys (L2-hot: the tile just streamed
-// through) instead of smem tile_keys. The smem gather is bank-conflicted at seg4-16 (heads sit
-// 4-16 elements apart -> few banks); global loads have no bank structure and dense stays coalesced.
-#ifndef RLE_GLOBAL_GATHER
-#  define RLE_GLOBAL_GATHER 0
-#endif
-// RLE_POLL_BACKOFF: ns to __nanosleep when a full reload pass still has missing frontier states.
-// Probe+fix for the L2 state-line hammering theory of the mid-regime oracle residual: 148 polls
-// spin-loading the same hot lines with strong loads. 0 = off (spin hard, today's behavior).
-#ifndef RLE_POLL_BACKOFF
-#  define RLE_POLL_BACKOFF 0
-#endif
-// RLE_CNT_SHFL: derive run counts from the NEIGHBOR lane's position (shfl_down) instead of a second
-// swizzled LDS.16 at run_idx+1 -- one pos load per run instead of two (lane-31 boundary comes from
-// software-pipelining the next iteration's load). Trades a sometimes-conflicted LDS for a
-// never-conflicted shuffle on the same MIO pipe.
-#ifndef RLE_CNT_SHFL
-#  define RLE_CNT_SHFL 0
-#endif
-// RLE_PROBE_GATHER_FREE / RLE_PROBE_PEEL_FREE: WRONG-RESULTS perf probes (like RLE_POLL_ORACLE).
-// Replace the two measured bank-conflict hot spots (v31: gather line ~951K, peel STS ~915K
-// excessive wavefronts at seg8) with conflict-free addresses of identical instruction cost.
-// The A/B delta vs base IS the harvestable conflict prize -- measure before restructuring.
-#ifndef RLE_PROBE_GATHER_FREE
-#  define RLE_PROBE_GATHER_FREE 0
-#endif
-#ifndef RLE_PROBE_PEEL_FREE
-#  define RLE_PROBE_PEEL_FREE 0
-#endif
 // RLE_FLAGWORD: adaptive staging. Warp-tiles with run count < RLE_FW_THRESH stage their 32 raw
 // head-flag words (one conflict-free STS.32 per lane; no scan, no peel, no pos-ring use) and the
 // drain rank-selects head positions from them (5-shfl binary search + branchless nth-set-bit, pure
@@ -134,45 +89,11 @@ constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in f
 #ifndef RLE_RB_MIN
 #  define RLE_RB_MIN 8
 #endif
-// RLE_SEQ_EARLY: give POLL its own tile-id barrier armed at TMA-ISSUE time instead of waiting for
-// TMA COMPLETION. The fold reads only tile_seq[slot] (written before the TMA is issued), never the
-// keys -- waiting on full[] wastes a whole TMA flight (~600ns) of frontier latency per gen, and the
-// prefixed publish shifts earlier by that much device-wide. Recycling safety is unchanged: the
-// barrier is armed only after the empty[] wait, exactly like full[], so the "poll never overwrites
-// a live prefix_packed slot" proof still holds.
-#ifndef RLE_SEQ_EARLY
-#  define RLE_SEQ_EARLY 0
-#endif
-// RLE_TMA_SPLIT: deliver each tile as TWO self-contained half-TMAs (each with its own 16B left-pad,
-// so warp kNumCompWarps/2's predecessor element arrives in half-2's pad). Compute warps of half 1
-// start flagging ~a half-TMA earlier -- attacks the TMA->all-compute serialization in the gen floor.
-#ifndef RLE_TMA_SPLIT
-#  define RLE_TMA_SPLIT 0
-#endif
-#ifndef RLE_L2_POLICY
-// persisting accessPolicyWindow on tile_partial_states: +0.6pt at 2^20, +0.45 at 4096, floor +0.1,
-// but costs -0.2..-0.5 at seg2-16 (carveout size irrelevant; the trade is inherent to the window).
-// seg2-16 are priority regimes => default OFF; enable for long-run-leaning workloads.
-#  define RLE_L2_POLICY 0
-#endif
 
 // This is important for position staging on dense cases (16 way bank conflicts).
-// RLE_SWZ selects the mix: 0 = x^(x>>5) (ncu-tuned for DENSE head patterns; measured 4.6x MORE STS
-// conflicts at seg2 whose run indices stride differently), 1 = x^(x>>4), 2 = x^(x>>4)^(x>>5).
-// All variants are bijections, so correctness is layout-independent (compute writes / store reads
-// through this same function).
-#ifndef RLE_SWZ
-#  define RLE_SWZ 0
-#endif
 __device__ __forceinline__ int swizzle_xor_stride32(int x)
 {
-#if RLE_SWZ == 1
-  return x ^ (x >> 4);
-#elif RLE_SWZ == 2
-  return x ^ (x >> 4) ^ (x >> 5);
-#else
   return x ^ (x >> 5);
-#endif
 }
 
 // CLC = 1 => use shiny new blackwell feature (UGETNEXTWORKID)
@@ -196,14 +117,8 @@ constexpr int bookkeeper_warp_id = store_warp_id + kNumStoreWarps;
 // each key slot carries kSlotPad extra leading ints: the TMA over-fetches one 16B chunk to the
 // left, so slot[0..kSlotPad-1] hold the previous tile's last keys and element 0's predecessor
 // is slot[kSlotPad-1] -- no separate (blocking) LDG of the previous tile's last key needed.
-constexpr int kSlotPad = 4; // ints; 16 bytes = cp_async_bulk alignment quantum
-#if RLE_TMA_SPLIT
-constexpr int kHalfTile   = kTileSize / 2;
-constexpr int kSlotStride = kTileSize + 2 * kSlotPad; // [pad0|half0|pad1|half1]
-static_assert(kNumCompWarps % 2 == 0 && kHalfTile % 4 == 0, "split needs even halves");
-#else
+constexpr int kSlotPad    = 4; // ints; 16 bytes = cp_async_bulk alignment quantum
 constexpr int kSlotStride = kTileSize + kSlotPad;
-#endif
 constexpr size_t kDynSmem =
   (size_t) kStages * kSlotStride * sizeof(int) + (size_t) kPosStages * kTileSize * sizeof(short);
 
@@ -313,16 +228,7 @@ __device__ __forceinline__ void poll_and_fold(
           }
         }
       }
-#if RLE_POLL_BACKOFF
-      if (__ballot_sync(kFullMask, !ready) == 0u)
-      {
-        break;
-      }
-      __nanosleep(RLE_POLL_BACKOFF);
-    } while (true);
-#else
     } while (__ballot_sync(kFullMask, !ready) != 0u);
-#endif
     // ordered reduce this lane's own tiles (increasing left -> right)
     int lane_run_count = 0, lane_open_length = 0;
 #pragma unroll
@@ -402,15 +308,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   // STORE --empty--> LOAD & POLL
   // (an `assigned` barrier that woke POLL at TMA-issue time was measured a small pure loss once the
   // poll spin stopped re-loading valid states -- see the bench notes; POLL waits `full` like COMPUTE)
-#if RLE_TMA_SPLIT
-  __shared__ u64 full[kStages][2]; // one per half-TMA; compute warp w waits its half, POLL waits half 0
-#else
-  __shared__ u64 full[kStages][1];
-#endif
+  __shared__ u64 full[kStages];
   __shared__ u64 computed[kStages], prefixed[kStages], empty[kStages];
-#if RLE_SEQ_EARLY
-  __shared__ u64 seq_ready[kStages]; // tile_seq[slot] valid -- armed at TMA issue, POLL's trigger
-#endif
   // COMPUTE warp w --staged_wt[w]--> STORE: per-warp-tile handoff, so store warps drain a warp-tile
   // as soon as ITS positions are staged instead of waiting for all 8 compute warps (warp 0 is always
   // last -- it does the publish fan-in first). The shared metadata store also needs (run counts,
@@ -432,14 +331,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   {
     for (int slot_id = 0; slot_id < kStages; ++slot_id)
     {
-      for (int h = 0; h < (RLE_TMA_SPLIT ? 2 : 1); ++h)
-      {
-        ptx::mbarrier_init(&full[slot_id][h], 1);
-      }
+      ptx::mbarrier_init(&full[slot_id], 1);
       ptx::mbarrier_init(&computed[slot_id], kNumCompWarps); // every compute warp arrives
-#if RLE_SEQ_EARLY
-      ptx::mbarrier_init(&seq_ready[slot_id], 1);
-#endif
       ptx::mbarrier_init(&prefixed[slot_id], 1);
       ptx::mbarrier_init(&empty[slot_id], kNumStoreWarps + 1); // store warps + the bookkeeper
       for (int cw = 0; cw < kNumCompWarps; ++cw)
@@ -498,18 +391,12 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       if (lane_id == 0)
       {
         tile_seq[slot_id] = tile_id;
-#if RLE_SEQ_EARLY
-        ptx::mbarrier_arrive(&seq_ready[slot_id]); // covers the sentinel path too (write precedes it)
-#endif
       }
       if (tile_id >= num_tiles)
       {
         if (lane_id == 0)
         {
-          for (int h = 0; h < (RLE_TMA_SPLIT ? 2 : 1); ++h)
-          {
-            ptx::mbarrier_arrive(&full[slot_id][h]);
-          }
+          ptx::mbarrier_arrive(&full[slot_id]);
         }
         __syncwarp();
         break;
@@ -521,39 +408,15 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         // tile 0 has no predecessor and skips the over-fetch; its slot[0..kSlotPad-1] stay
         // unread because is_global_first forces element 0's head flag.
         const bool first_tile = (tile_id == 0);
-#if RLE_TMA_SPLIT
-        int* const slot_base = tile_buf + (size_t) slot_id * kSlotStride;
-        // half 0: [pad0|half0]
-        const unsigned nb0 = (unsigned) ((kHalfTile + (first_tile ? 0 : kSlotPad)) * sizeof(int));
-        ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &full[slot_id][0], nb0);
-        ptx::cp_async_bulk(
-          ptx::space_shared,
-          ptx::space_global,
-          slot_base + (first_tile ? kSlotPad : 0),
-          d_keys + (size_t) tile_id * kTileSize - (first_tile ? 0 : kSlotPad),
-          nb0,
-          &full[slot_id][0]);
-        // half 1: [pad1|half1], pad1 = elements kHalfTile-4..kHalfTile-1 (always in-bounds, even tile 0)
-        const unsigned nb1 = (unsigned) ((kHalfTile + kSlotPad) * sizeof(int));
-        ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &full[slot_id][1], nb1);
-        ptx::cp_async_bulk(
-          ptx::space_shared,
-          ptx::space_global,
-          slot_base + kSlotPad + kHalfTile,
-          d_keys + (size_t) tile_id * kTileSize + kHalfTile - kSlotPad,
-          nb1,
-          &full[slot_id][1]);
-#else
         const unsigned nbytes = (unsigned) ((kTileSize + (first_tile ? 0 : kSlotPad)) * sizeof(int));
-        ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &full[slot_id][0], nbytes);
+        ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &full[slot_id], nbytes);
         ptx::cp_async_bulk(
           ptx::space_shared,
           ptx::space_global,
           tile_buf + (size_t) slot_id * kSlotStride + (first_tile ? kSlotPad : 0),
           d_keys + (size_t) tile_id * kTileSize - (first_tile ? 0 : kSlotPad),
           nbytes,
-          &full[slot_id][0]);
-#endif
+          &full[slot_id]);
       }
       __syncwarp();
 #if USE_CLC
@@ -589,12 +452,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
     {
       const int slot_id  = gen % kStages;
       const int slot_gen = gen / kStages;
-#if RLE_TMA_SPLIT
-      const int my_half = (compute_warp_id >= kNumCompWarps / 2) ? 1 : 0;
-#else
-      const int my_half = 0;
-#endif
-      while (!ptx::mbarrier_try_wait_parity(&full[slot_id][my_half], (unsigned) (slot_gen & 1)))
+      while (!ptx::mbarrier_try_wait_parity(&full[slot_id], (unsigned) (slot_gen & 1)))
       {
       }
       const int tile_id = tile_seq[slot_id];
@@ -610,7 +468,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       }
       // slot is ready! (under split, half-1 warps index through +2*kSlotPad so pad1 sits at loc
       // kHalfTile-1's predecessor position; all their accesses incl. loc-1 stay in half 1 + pad1)
-      const int* key_buf  = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad + (my_half ? kSlotPad : 0);
+      const int* key_buf  = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad;
       const int tile_len  = min(kTileSize, num_items - tile_id * kTileSize);
       int local_run_count = 0, warp_first_head = -1, warp_last_head = -1;
       static_assert(kIPT <= 32, "one lane per iter requires kIPT<=32");
@@ -738,13 +596,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             while (pending_heads)
             {
               const int head_offset = __ffs(pending_heads) - 1; // offset (0..31) of the next head within the word
-#if RLE_PROBE_PEEL_FREE
-              // PROBE: lane-major slot (lane_id + 32*step) -- stride-1 shorts across lanes at each
-              // peel step = conflict-free; drain then reads garbage positions (WRONG results)
-              pos_dst[warp_tile_base + lane_id + ((run_index - word_run_base) << 5)] = (short) (word_pos + head_offset);
-#else
               pos_dst[warp_tile_base + swizzle_xor_stride32(run_index)] = (short) (word_pos + head_offset);
-#endif
               ++run_index;
               pending_heads &= (pending_heads - 1); // clear the lowest set bit
             }
@@ -765,11 +617,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
     {
       const int slot_id  = gen % kStages;
       const int slot_gen = gen / kStages;
-#if RLE_SEQ_EARLY
-      while (!ptx::mbarrier_try_wait_parity(&seq_ready[slot_id], (unsigned) (slot_gen & 1)))
-#else
-      while (!ptx::mbarrier_try_wait_parity(&full[slot_id][0], (unsigned) (slot_gen & 1)))
-#endif
+      while (!ptx::mbarrier_try_wait_parity(&full[slot_id], (unsigned) (slot_gen & 1)))
       {
       }
       const int tile_id = tile_seq[slot_id];
@@ -865,16 +713,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         }
       }
       const int wt_base_ln = wt_incl_ln - wt_count_ln; // lane i: warp-tile i's exclusive run base
-#if RLE_GLOBAL_GATHER
-      const int* tile_keys = d_keys + (size_t) tile_id * kTileSize; // L2-hot; no smem bank structure
-#else
       const int* tile_keys = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad;
-#endif
-#if RLE_TMA_SPLIT
-#  define RLE_KEY_AT(p) tile_keys[(p) + (((p) >= kHalfTile) ? kSlotPad : 0)]
-#else
-#  define RLE_KEY_AT(p) tile_keys[(p)]
-#endif
       // staged positions
       const short* run_positions = staged_pos + (size_t) (gen % kPosStages) * kTileSize;
       // wait for prefixed (2/3); drains only need the run-count prefix (addresses) -- the
@@ -953,77 +792,17 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               {
                 const int head_pos       = warp_tile_offset + local_pos;
                 const int global_run_idx = global_run_base + run_idx;
-#  if RLE_STCS_OUT
-                __stcs(d_unique + global_run_idx, RLE_KEY_AT(head_pos));
-#  else
-                d_unique[global_run_idx] = RLE_KEY_AT(head_pos);
-#  endif
+                d_unique[global_run_idx] = tile_keys[head_pos];
                 if (run_idx + 1 < warp_tile_run_count)
                 {
-#  if RLE_STCS_OUT
-                  __stcs(d_counts + global_run_idx, next_local - local_pos);
-#  else
                   d_counts[global_run_idx] = next_local - local_pos;
-#  endif
                 }
               }
             }
             return;
           }
 #endif
-#if RLE_CNT_SHFL
-          // one pos load per run: run r+1's head sits in lane l+1's register (shfl_down); the lane-31
-          // boundary is fed by software-pipelining the NEXT iteration's (guarded) load. The loop is
-          // warp-uniform (niter) so the shuffles never see exited lanes.
-          const int niter = (run_end - run_begin + 31) / 32;
-          int head_pos    = (run_begin + lane_id < run_end)
-                            ? (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_begin + lane_id)]
-                            : 0;
-#  if RLE_DRAIN_UNROLL4
-#    pragma unroll 4
-#  elif RLE_DRAIN_UNROLL2
-#    pragma unroll 2
-#  endif
-          for (int it = 0; it < niter; ++it)
-          {
-            const int run_idx     = run_begin + it * 32 + lane_id;
-            const int preload_idx = run_idx + 32;
-            const int preload_pos =
-              (preload_idx < run_end) ? (int) run_positions[warp_tile_offset + swizzle_xor_stride32(preload_idx)] : 0;
-            const int nbr_pos      = __shfl_down_sync(kFullMask, head_pos, 1); // lane l+1's run = run_idx+1
-            const int next0_pos    = __shfl_sync(kFullMask, preload_pos, 0); // next iteration, lane 0
-            const int next_run_pos = (lane_id == 31) ? next0_pos : nbr_pos;
-            if (run_idx < run_end)
-            {
-              const int global_run_idx = global_run_base + run_idx;
-#  if RLE_STCS_OUT
-              __stcs(d_unique + global_run_idx, RLE_KEY_AT(head_pos));
-#  else
-              d_unique[global_run_idx] = RLE_KEY_AT(head_pos);
-#  endif
-              if (run_idx + 1 < warp_tile_run_count)
-              {
-                // slice-boundary fallback (run_idx+1 == run_end < warp_tile_run_count) only exists
-                // when a warp-tile is split across store warps; whole-warp-tile configs never take it
-                const int cnt =
-                  ((run_idx + 1 < run_end) ? next_run_pos
-                                           : (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)])
-                  - head_pos;
-#  if RLE_STCS_OUT
-                __stcs(d_counts + global_run_idx, cnt);
-#  else
-                d_counts[global_run_idx] = cnt;
-#  endif
-              }
-            }
-            head_pos = preload_pos;
-          }
-#else
-#  if RLE_DRAIN_UNROLL4
-#    pragma unroll 4
-#  elif RLE_DRAIN_UNROLL2
-#    pragma unroll 2
-#  endif
+#pragma unroll 2
           for (int run_idx = run_begin + lane_id; run_idx < run_end; run_idx += 32)
           {
             const int global_run_idx = global_run_base + run_idx;
@@ -1032,24 +811,15 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             // unchanged. Warp-local matters: v32's tile-local fake collapsed all store warps onto the
             // same words and cost -4pt dense by itself. At seg1 this fake == the real pattern exactly
             // (every element is a head), so the dense delta doubles as the probe's sanity check.
-            const int gather_pos = RLE_PROBE_GATHER_FREE ? (warp_tile_offset + run_idx) : head_pos;
-#  if RLE_STCS_OUT
-            __stcs(d_unique + global_run_idx, RLE_KEY_AT(gather_pos)); // streaming: outputs are never re-read
-#  else
-            d_unique[global_run_idx] = RLE_KEY_AT(gather_pos); // gather the run's key at its head position
-#  endif
+
+            d_unique[global_run_idx] = tile_keys[head_pos]; // gather the run's key at its head position
             if (run_idx + 1 < warp_tile_run_count)
             {
               // within-warp delta (next head - this head); the last run is fixed separately
               const int cnt = (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)] - head_pos;
-#  if RLE_STCS_OUT
-              __stcs(d_counts + global_run_idx, cnt);
-#  else
               d_counts[global_run_idx] = cnt;
-#  endif
             }
           }
-#endif
         };
       if constexpr (kNumStoreWarps >= kNumCompWarps)
       {
@@ -1122,7 +892,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               const int pcw         = __popc(mw);
               const int local_pos   = w * 32 + nth_set_bit(mw, (j < pcw) ? j : 0);
               const int in_word_nxt = w * 32 + nth_set_bit(mw, (j + 1 < pcw) ? (j + 1) : 0);
-              buf_key[it]           = RLE_KEY_AT(warp_tile_offset + local_pos);
+              buf_key[it]           = tile_keys[warp_tile_offset + local_pos];
               buf_cnt[it]           = ((j + 1 < pcw) ? in_word_nxt : nxt_after_w) - local_pos;
             }
           }
@@ -1140,7 +910,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               const bool act    = run_idx < run_end;
               // stale ring shorts can be OOB gather addresses -- clamp inactive lanes to 0
               const int head_pos = act ? (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx)] : 0;
-              buf_key[it]        = RLE_KEY_AT(head_pos);
+              buf_key[it]        = tile_keys[head_pos];
               buf_cnt[it]        = (act && run_idx + 1 < warp_tile_run_count)
                                    ? (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)] - head_pos
                                    : 0;
@@ -1255,62 +1025,9 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       while (!ptx::mbarrier_try_wait_parity(&prefixed[slot_id], (unsigned) ((gen / kStages) & 1)))
       {
       }
-#if RLE_BK_EARLY_ARRIVE
-      // read ALL slot metadata into registers BEFORE the prefix wait (it is computed-gated), so the
-      // moment the prefix lands we can release the slot -- the global writes never ride the recycle
-      // chain. (the reads here duplicate the pre-wait scan's sources; all lane-local.)
-      const unsigned later_wts = wt_runs_mask >> (lane_id + 1);
-      int reg_next_first = 0, reg_my_last = 0, reg_first_head = -1;
-      if (lane_id < kNumCompWarps && wt_count_ln > 0)
-      {
-        if (later_wts)
-        {
-          reg_next_first = warp_first_heads[slot_id][lane_id + 1 + __ffs(later_wts) - 1];
-        }
-        reg_my_last = warp_last_heads[slot_id][lane_id];
-      }
-      if (lane_id == 0 && wt_runs_mask != 0)
-      {
-        reg_first_head = warp_first_heads[slot_id][__ffs(wt_runs_mask) - 1];
-      }
-#endif
       const u64 packed_prefix           = prefix_packed[slot_id][RLE_REGBUF ? ((gen / kStages) & 1) : 0];
       const int curr_prefix_run_count   = (int) (packed_prefix & 0xffffffffull);
       const int curr_prefix_open_length = (int) (packed_prefix >> 32);
-#if RLE_BK_EARLY_ARRIVE
-      if (lane_id == 0)
-      {
-        ptx::mbarrier_arrive(&empty[slot_id]); // slot may recycle NOW; writes below use registers only
-      }
-      if (lane_id < kNumCompWarps && wt_count_ln > 0)
-      {
-        const int last_run_global_idx = curr_prefix_run_count + wt_base_ln + wt_count_ln - 1;
-        if (later_wts)
-        {
-          d_counts[last_run_global_idx] = reg_next_first - reg_my_last;
-        }
-        else if (is_last)
-        {
-          d_counts[last_run_global_idx] = tile_len - reg_my_last;
-        }
-      }
-      if (lane_id == 0)
-      {
-        const bool any_head = (wt_runs_mask != 0);
-        if (any_head && curr_prefix_run_count > 0)
-        {
-          d_counts[curr_prefix_run_count - 1] = curr_prefix_open_length + reg_first_head;
-        }
-        if (is_last && !any_head && curr_prefix_run_count > 0)
-        {
-          d_counts[curr_prefix_run_count - 1] = curr_prefix_open_length + tile_len;
-        }
-        if (is_last)
-        {
-          *d_num_runs = curr_prefix_run_count + tile_total_runs;
-        }
-      }
-#else
       // per-warp-tile boundary: a warp-tile's last run is closed by the next nonempty warp-tile's
       // first head. lane L handles warp-tile L.
       if (lane_id < kNumCompWarps && wt_count_ln > 0)
@@ -1351,7 +1068,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         }
         ptx::mbarrier_arrive(&empty[slot_id]); // bookkeeping done, slot may recycle
       }
-#endif
     }
   }
 }
@@ -1376,24 +1092,7 @@ inline void persistent_rle_launch(
 
   // no per-launch clear of tile_state: states are generation-tagged (see publish_state). The array
   // only needs to be zeroed ONCE at allocation; each launch bumps the gen and stale words never match.
-#if RLE_L2_POLICY
-  // pin the tile-state array as L2-persisting: it is the hottest latency-critical data in the
-  // kernel and otherwise fights ~3GB/launch of streaming key/output traffic for residency
-  static bool l2_policy_set = [] {
-#  ifndef RLE_L2_CARVEOUT
-#    define RLE_L2_CARVEOUT (1 << 20) // 256KB..4MB all measured identical; 1MB default
-#  endif
-    cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, RLE_L2_CARVEOUT);
-    return true;
-  }();
-  (void) l2_policy_set;
-  cudaStreamAttrValue l2attr          = {};
-  l2attr.accessPolicyWindow.base_ptr  = tile_state;
-  l2attr.accessPolicyWindow.num_bytes = sizeof(u64) * (size_t) num_tiles;
-  l2attr.accessPolicyWindow.hitRatio  = 1.0f;
-  l2attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
-  l2attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
-  cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &l2attr);
+#ifndef RLE_L2_CARVEOUT
 #endif
   static unsigned launch_gen = 0;
   ++launch_gen;
