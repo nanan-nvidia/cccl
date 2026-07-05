@@ -16,6 +16,10 @@
 #endif
 #define K_IPT  RLE_SMALL_IPT
 #define RLE_NS rle_small
+#ifdef RLE_STATIC_ASSIGN
+#  undef RLE_STATIC_ASSIGN
+#endif
+#define RLE_STATIC_ASSIGN 1 // ~1 tile/block: steal machinery is pure exit latency
 #include "persistent_rle.cu"
 #undef RLE_NS
 #undef K_IPT
@@ -26,13 +30,25 @@
 #ifndef RLE_MID_STAGES
 #  define RLE_MID_STAGES 2
 #endif
-#define K_STAGES     RLE_MID_STAGES
-#define K_POS_STAGES RLE_MID_STAGES
-#define RLE_NS       rle_mid
+#ifndef RLE_MID_IPT
+#  define RLE_MID_IPT 32 // mid tile = kNumCompWarps * 32 * this
+#endif
+#ifndef RLE_MID_STATIC
+#  define RLE_MID_STATIC 1
+#endif
+#undef RLE_STATIC_ASSIGN
+#define RLE_STATIC_ASSIGN RLE_MID_STATIC
+#define K_IPT             RLE_MID_IPT
+#define K_STAGES          RLE_MID_STAGES
+#define K_POS_STAGES      RLE_MID_STAGES
+#define RLE_NS            rle_mid
 #include "persistent_rle.cu"
 #undef RLE_NS
+#undef K_IPT
 #undef K_STAGES
 #undef K_POS_STAGES
+#undef RLE_STATIC_ASSIGN
+#define RLE_STATIC_ASSIGN 0 // restore for any later includes
 
 using KeyT     = rle_big::KeyT;
 using LenT     = rle_big::LenT;
@@ -43,6 +59,7 @@ using u64      = rle_big::u64;
 // small tile), size the state array by the small tile count (the larger of the two)
 constexpr int kTileSize = rle_big::kTileSize;
 static_assert(rle_big::kTileSize % rle_small::kTileSize == 0, "small tile must divide big tile");
+static_assert(rle_mid::kTileSize % rle_small::kTileSize == 0, "small tile must divide mid tile");
 
 inline long long rle_state_tiles(long long n)
 {
@@ -78,8 +95,9 @@ inline void persistent_rle_dispatch_launch(
   }
   else if (big_tiles < RLE_DISPATCH_MID_TILES)
   {
+    const int mid_tiles = (int) ((num_items + rle_mid::kTileSize - 1) / rle_mid::kTileSize);
     rle_mid::persistent_rle_launch(
-      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_tile_counter, num_items, big_tiles, stream);
+      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_tile_counter, num_items, mid_tiles, stream);
   }
   else
   {

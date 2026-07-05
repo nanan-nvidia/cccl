@@ -139,6 +139,17 @@ __device__ __forceinline__ int swizzle_xor_stride32(int x)
 // CLC = 1 => use shiny new blackwell feature (UGETNEXTWORKID)
 // CLC = 0 => use atomics for work stealing
 // no perf difference observed on blackwell
+// RLE_STATIC_ASSIGN: strided-static tile assignment (tile = blockIdx + gen*gridDim) -- NO work
+// stealing. For grids with ~1 tile/block the steal machinery is pure exit latency: the CLC
+// try_cancel response round-trip sits between the last TMA and the sentinel that lets every warp
+// finish. Meant for the small/mid dispatch instantiations.
+#ifndef RLE_STATIC_ASSIGN
+#  define RLE_STATIC_ASSIGN 0
+#endif
+#ifdef RLE_USE_CLC
+#  undef RLE_USE_CLC
+#endif
+#define RLE_USE_CLC (USE_CLC && !RLE_STATIC_ASSIGN)
 #ifndef USE_CLC
 #  define USE_CLC 1
 #endif
@@ -354,7 +365,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   LenT* __restrict__ d_counts,
   NumRunsT* __restrict__ d_num_runs,
   u64* __restrict__ tile_partial_states,
-#if !USE_CLC
+#if !RLE_USE_CLC && !RLE_STATIC_ASSIGN
   int* __restrict__ global_tile_counter, // global work steal counter when there is no CLC
 #endif
   unsigned launch_gen, // >=1; stamps this launch's tile states (see publish_state)
@@ -399,7 +410,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   // first/last heads, tile_seq) is covered by `computed`.
   __shared__ u64 staged_wt[kStages][kNumCompWarps];
 
-#if USE_CLC
+#if RLE_USE_CLC
   // try_cancel writes a 16-byte response into clc_resp + completes clc_bar's tx.
   __shared__ __align__(16) uint4 clc_resp;
   __shared__ u64 clc_bar;
@@ -428,7 +439,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       ptx::mbarrier_init(&pos_free[p], kNumStoreWarps);
     }
 
-#if USE_CLC
+#if RLE_USE_CLC
     ptx::mbarrier_init(&clc_bar, 1); // 1 arrival
 #endif
   }
@@ -441,7 +452,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   // if you are load
   if (warp_id == 0)
   {
-#if USE_CLC
+#if RLE_USE_CLC
     // CLC tile assignment: gen0 tile = this CTA's launch id (blockIdx.x)
     int tile_id = blk_id;
     if (lane_id == 0)
@@ -462,7 +473,10 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         {
         }
       }
-#if !USE_CLC
+#if RLE_STATIC_ASSIGN
+      // static strided assignment: zero steal machinery, sentinel arrives with no round trip
+      const int tile_id = blk_id + gen * (int) gridDim.x;
+#elif !RLE_USE_CLC
       // work-steal: grab the next global tile via the atomic counter (one tile per atomic)
       int tile_id = 0;
       if (lane_id == 0)
@@ -502,7 +516,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           &full[slot_id]);
       }
       __syncwarp();
-#if USE_CLC
+#if RLE_USE_CLC
       // consume the prefetched cancel
       // this is ok since it should be fast to get next cancelled id
       if (lane_id == 0)
@@ -1192,13 +1206,13 @@ inline void persistent_rle_launch(
   {
     ++launch_gen;
   }
-#if !USE_CLC
+#if RLE_USE_CLC || RLE_STATIC_ASSIGN
+  const int blocks = num_tiles;
+#else
   cudaMemsetAsync(global_tile_counter, 0, sizeof(int), stream); // reset the work-steal counter
   int numSM = 0;
   cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0);
   const int blocks = std::min(2 * numSM, num_tiles); // persistent work-steal grid
-#else
-  const int blocks = num_tiles;
 #endif
 
   persistent_rle<<<blocks, kNumThreads, kDynSmem, stream>>>(
@@ -1207,7 +1221,7 @@ inline void persistent_rle_launch(
     d_counts,
     d_num_runs,
     tile_state,
-#if !USE_CLC
+#if !RLE_USE_CLC && !RLE_STATIC_ASSIGN
     global_tile_counter,
 #endif
     launch_gen,
