@@ -149,6 +149,10 @@ constexpr size_t kDynSmem =
 // launch_gen is needed to reuse allocations per launch
 // (this is needed to eliminate overhead of allocating the buffer. CRITICAL for perf!)
 // an aligned 64-bit access is already non-tearing, but atomic_ref doesn't hurt and has clear semantics
+// TODO(templates pass): make TilePartialStateT a struct wrapping the u64 with launch_gen() /
+// run_count() / open_len() accessors -- call sites become packed_words[i].launch_gen() (the
+// "from what" rides on the receiver, so the extract_* function names shrink away); fold in when
+// the RLE_*_T macros become template parameters.
 using TilePartialStateT = u64;
 
 __device__ __forceinline__ unsigned extract_launch_gen_from_tile_partial_state(TilePartialStateT w)
