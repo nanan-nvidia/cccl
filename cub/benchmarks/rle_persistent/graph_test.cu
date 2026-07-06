@@ -1,11 +1,11 @@
 // CUDA-graph capture/replay test for the CUB-shaped persistent RLE entry.
 // Captures ONE encode call, replays it 4x on the same temp storage: every replay must produce
 // correct results (device-side gen bumps per replay; stale states from prior replays never match).
-#include "rle_dispatch.cuh"
-
 #include <cstdio>
 #include <random>
 #include <vector>
+
+#include "rle_dispatch.cuh"
 
 int main()
 {
@@ -13,17 +13,23 @@ int main()
   std::vector<KeyT> h((size_t) n);
   std::mt19937 rng(9);
   std::uniform_int_distribution<int> seg(1, 8), kd(0, 1000000);
-  long long i = 0;
-  int prev = -1;
+  long long i           = 0;
+  int prev              = -1;
   long long expect_runs = 0;
   while (i < n)
   {
     int v = kd(rng);
-    if (v == prev) v = (v + 1) % 1000001;
+    if (v == prev)
+    {
+      v = (v + 1) % 1000001;
+    }
     prev = v;
     ++expect_runs;
     long long e = std::min<long long>(i + seg(rng), n);
-    for (; i < e; ++i) h[(size_t) i] = KeyT(v);
+    for (; i < e; ++i)
+    {
+      h[(size_t) i] = KeyT(v);
+    }
   }
   KeyT *dk, *du;
   LenT* dc;

@@ -3,8 +3,9 @@
 // heartbeat buffer and barrier arrive-counters (RLE_HEARTBEAT=1 builds).
 // Site codes: 1=load-empty 2=comp-full 3=comp-posfree 4=poll-seq 5=store-computed 6=store-staged
 // 7=store-flushwait 8=store-prefixed 9=bk-computed 10=bk-prefixed 12=load-clc 13=comp-pubfanin
-#include "persistent_rle.cu"
-
+// NOTE: the RLE_HEARTBEAT instrumentation this runner dumps lives in the ARCHIVED debug kernel
+// (~/rle_wip/rbpipe_wip/persistent_rle_rbpipe_hb.cu); against the production kernel this runner
+// still works as a plain watchdog (hang detector), it just prints an empty heartbeat table.
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -13,12 +14,15 @@
 #include <thread>
 #include <vector>
 
-static std::vector<int> gen_keys(int n, int max_seg, unsigned seed)
+#include "rle_dispatch.cuh"
+
+static std::vector<KeyT> gen_keys(long long n, int max_seg, unsigned seed)
 {
-  std::vector<int> k(n);
+  std::vector<KeyT> k((size_t) n);
   std::mt19937 rng(seed);
   std::uniform_int_distribution<int> seg(1, max_seg), kd(0, 1000000);
-  int i = 0, prev = -1;
+  long long i = 0;
+  int prev    = -1;
   while (i < n)
   {
     int run = seg(rng), v = kd(rng);
@@ -26,11 +30,11 @@ static std::vector<int> gen_keys(int n, int max_seg, unsigned seed)
     {
       v = (v + 1) % 1000001;
     }
-    prev  = v;
-    int e = std::min(i + run, n);
+    prev        = v;
+    long long e = std::min<long long>(i + run, n);
     for (; i < e; ++i)
     {
-      k[i] = v;
+      k[i] = KeyT(v);
     }
   }
   return k;
@@ -40,19 +44,32 @@ static const char* site_name(unsigned s)
 {
   switch (s)
   {
-    case 1:  return "load-empty";
-    case 2:  return "comp-full";
-    case 3:  return "comp-posfree";
-    case 4:  return "poll-seq";
-    case 5:  return "store-computed";
-    case 6:  return "store-staged";
-    case 7:  return "store-FLUSHWAIT";
-    case 8:  return "store-prefixed";
-    case 9:  return "bk-computed";
-    case 10: return "bk-prefixed";
-    case 12: return "load-clc";
-    case 13: return "comp-pubfanin";
-    default: return "?";
+    case 1:
+      return "load-empty";
+    case 2:
+      return "comp-full";
+    case 3:
+      return "comp-posfree";
+    case 4:
+      return "poll-seq";
+    case 5:
+      return "store-computed";
+    case 6:
+      return "store-staged";
+    case 7:
+      return "store-FLUSHWAIT";
+    case 8:
+      return "store-prefixed";
+    case 9:
+      return "bk-computed";
+    case 10:
+      return "bk-prefixed";
+    case 12:
+      return "load-clc";
+    case 13:
+      return "comp-pubfanin";
+    default:
+      return "?";
   }
 }
 
@@ -128,14 +145,20 @@ static void dump_state(volatile unsigned* hb_h, volatile unsigned* hbc_h)
   std::printf("  per-warp [computed-pass gen | last empty-arrive gen@site]:\n");
   for (int w = 10; w < 19; ++w)
   {
-    const int cp    = (int) hbc_h[min_blk * 64 + 40 + (w - 10) * 2] - 1;
+    const int cp     = (int) hbc_h[min_blk * 64 + 40 + (w - 10) * 2] - 1;
     const unsigned e = hbc_h[min_blk * 64 + 41 + (w - 10) * 2];
     std::printf("    w%-2d: computed-pass %3d | arrive %3d @%s (launch tag %u)\n",
-                w, cp, (int) ((e >> 4) & 0x3ffffff) - 1, ev_name[e & 7u], e >> 30);
+                w,
+                cp,
+                (int) ((e >> 4) & 0x3ffffff) - 1,
+                ev_name[e & 7u],
+                e >> 30);
   }
   std::printf("  store-sentinel: tile_id=%d at gen %d | load-sentinel: tile_id=%d at gen %d\n",
-              (int) hbc_h[min_blk * 64 + 60], (int) hbc_h[min_blk * 64 + 61] - 1,
-              (int) hbc_h[min_blk * 64 + 62], (int) hbc_h[min_blk * 64 + 63] - 1);
+              (int) hbc_h[min_blk * 64 + 60],
+              (int) hbc_h[min_blk * 64 + 61] - 1,
+              (int) hbc_h[min_blk * 64 + 62],
+              (int) hbc_h[min_blk * 64 + 63] - 1);
   std::fflush(stdout);
 }
 
@@ -143,18 +166,21 @@ int main(int argc, char** argv)
 {
   const int max_seg  = (argc > 1) ? atoi(argv[1]) : 64;
   const int launches = (argc > 2) ? atoi(argv[2]) : 200;
-  const int n = 1 << 28, ntiles = (1 << 28) / kTileSize;
-  auto h = gen_keys(n, max_seg, 1u);
-  int *dk, *du, *dc, *dn, *dctr;
-  u64* dts;
-  cudaMalloc(&dk, sizeof(int) * (size_t) n);
-  cudaMemcpy(dk, h.data(), sizeof(int) * (size_t) n, cudaMemcpyHostToDevice);
-  cudaMalloc(&du, sizeof(int) * (size_t) n);
-  cudaMalloc(&dc, sizeof(int) * (size_t) n);
-  cudaMalloc(&dn, sizeof(int));
-  cudaMalloc(&dts, sizeof(u64) * ntiles);
-  cudaMemset(dts, 0, sizeof(u64) * ntiles);
-  cudaMalloc(&dctr, sizeof(int));
+  const long long n  = 1 << 28;
+  auto h             = gen_keys(n, max_seg, 1u);
+  KeyT *dk, *du;
+  LenT* dc;
+  NumRunsT* dn;
+  void* dtemp;
+  size_t tempb = 0;
+  cudaMalloc(&dk, sizeof(KeyT) * (size_t) n);
+  cudaMemcpy(dk, h.data(), sizeof(KeyT) * (size_t) n, cudaMemcpyHostToDevice);
+  cudaMalloc(&du, sizeof(KeyT) * (size_t) n);
+  cudaMalloc(&dc, sizeof(LenT) * (size_t) n);
+  cudaMalloc(&dn, sizeof(NumRunsT));
+  persistent_rle_encode(nullptr, tempb, dk, du, dc, dn, (OffT) n);
+  cudaMalloc(&dtemp, tempb);
+  cudaMemset(dtemp, 0xAB, tempb);
 
   volatile unsigned *hb_h, *hbc_h;
   unsigned *hb_d, *hbc_d;
@@ -174,7 +200,7 @@ int main(int argc, char** argv)
   {
     memset((void*) hb_h, 0, 2048 * 32 * sizeof(unsigned));
     memset((void*) hbc_h, 0, 2048 * 64 * sizeof(unsigned));
-    persistent_rle_launch(dk, du, dc, dn, dts, dctr, n, ntiles, 0);
+    persistent_rle_encode(dtemp, tempb, dk, du, dc, dn, (OffT) n, 0);
     cudaEventRecord(done, 0);
     auto t0 = std::chrono::steady_clock::now();
     while (cudaEventQuery(done) == cudaErrorNotReady)
@@ -196,7 +222,7 @@ int main(int argc, char** argv)
     }
     if (i % 25 == 0)
     {
-      cudaMemcpy(&R, dn, sizeof(int), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&R, dn, sizeof(NumRunsT), cudaMemcpyDeviceToHost);
       std::printf("launch %d ok (R=%d)\n", i, R);
       std::fflush(stdout);
     }

@@ -2,8 +2,6 @@
 // Covers: single tile, partial tail tiles, dense (seg=1), mid, long runs spanning many tiles
 // (head-free tiles + cross-tile open-run closing), and the full bench size.
 // d_keys is allocated padded to a tile multiple, matching the kernel's input contract.
-#include "rle_dispatch.cuh"
-
 #include <cub/device/device_run_length_encode.cuh>
 
 #include <cstdio>
@@ -11,15 +9,17 @@
 #include <random>
 #include <vector>
 
-#define CHECK_CUDA(call)                                                                    \
-  do                                                                                        \
-  {                                                                                         \
-    cudaError_t e_ = (call);                                                                \
-    if (e_ != cudaSuccess)                                                                  \
-    {                                                                                       \
-      std::printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__);  \
-      std::exit(2);                                                                         \
-    }                                                                                       \
+#include "rle_dispatch.cuh"
+
+#define CHECK_CUDA(call)                                                                   \
+  do                                                                                       \
+  {                                                                                        \
+    cudaError_t e_ = (call);                                                               \
+    if (e_ != cudaSuccess)                                                                 \
+    {                                                                                      \
+      std::printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); \
+      std::exit(2);                                                                        \
+    }                                                                                      \
   } while (0)
 
 // segment values drawn as ints then cast to KeyT; adjacency-distinctness is enforced POST-cast so
@@ -39,7 +39,7 @@ static std::vector<KeyT> gen_keys(long long n, int max_seg, unsigned seed)
     {
       v = KeyT(kd(rng));
     }
-    prev  = v;
+    prev        = v;
     long long e = std::min<long long>(i + run, n);
     for (; i < e; ++i)
     {
@@ -64,7 +64,7 @@ static double dbg(T v)
 
 static bool run_case(long long n, int max_seg, unsigned seed, bool sampled = false)
 {
-  const size_t pad       = (size_t) n; // EXACT allocation: the bounded-TMA tail must never over-read
+  const size_t pad = (size_t) n; // EXACT allocation: the bounded-TMA tail must never over-read
   auto h           = gen_keys(n, max_seg, seed);
 
   KeyT *dk{}, *du{};
@@ -153,7 +153,12 @@ static bool run_case(long long n, int max_seg, unsigned seed, bool sampled = fal
       {
         std::printf(
           "  round %d run %lld: got (u=%g,c=%lld) ref (u=%g,c=%lld)\n",
-          round, i, dbg(got_u[i]), (long long) got_c[i], dbg(ref_u[i]), (long long) ref_c[i]);
+          round,
+          i,
+          dbg(got_u[i]),
+          (long long) got_c[i],
+          dbg(ref_u[i]),
+          (long long) ref_c[i]);
         ok = false;
         ++shown;
       }
