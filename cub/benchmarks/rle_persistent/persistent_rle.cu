@@ -1,7 +1,9 @@
 // Standalone persistent-block RLE-encode kernel for Blackwell (B200). Impl only -- see
 // persistent_rle_bench.cu for the official-nvbench comparison vs cub::DeviceRunLengthEncode.
 // Keys/lengths/num_runs typed via RLE_KEY_T / RLE_LEN_T / RLE_NUM_RUNS_T (one TU per combo).
-// NO include guard: rle_dispatch.cuh includes this file twice (big + small tile namespaces).
+// TODO(templates): replace the RLE_*_T type macros (and the K_* policy macros' type-derived
+// defaults) with template parameters on the kernel + a policy struct, CUB-style; the -D flags
+// then collapse to explicit instantiations in the bench/verify TUs.
 
 #include <cuda/atomic>
 #include <cuda/ptx>
@@ -12,12 +14,7 @@
 
 #include <cuda_runtime_api.h>
 
-// RLE_NS: namespace for this instantiation -- the file can be included TWICE in one TU (with
-// different K_IPT etc. between includes) to build a big-tile + small-tile pair for size dispatch.
-#ifndef RLE_NS
-#  define RLE_NS rle_impl
-#endif
-namespace RLE_NS
+namespace rle_impl
 {
 namespace ptx = cuda::ptx;
 using u64     = cuda::std::uint64_t;
@@ -1171,4 +1168,4 @@ inline void persistent_rle_launch(
   persistent_rle<<<blocks, kNumThreads, kDynSmem, stream>>>(
     d_keys, d_unique, d_counts, d_num_runs, tile_state, d_launch_gen, num_items, num_tiles);
 }
-} // namespace RLE_NS
+} // namespace rle_impl

@@ -9,9 +9,7 @@
 
 #include <algorithm>
 
-#define RLE_NS rle_impl
 #include "persistent_rle.cu"
-#undef RLE_NS
 
 using KeyT     = rle_impl::KeyT;
 using LenT     = rle_impl::LenT;
