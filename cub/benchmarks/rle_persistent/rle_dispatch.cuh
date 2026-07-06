@@ -36,7 +36,6 @@ inline long long rle_state_tiles(long long n)
 // The init kernel bumps the generation when the header matches (allocate-once-call-many pays a
 // tiny kernel, cheaper than stock CUB per-call state init) and clears states exactly once
 // otherwise -- including after the same allocation was used by the stock path (magic mismatch).
-// RLE_STATE32 builds additionally re-clear at every 15-call tag-cycle restart (see state_tag).
 // All state is device-side: graph-capturable, no host statics.
 struct RleTempHeader
 {
@@ -47,10 +46,9 @@ struct RleTempHeader
 inline constexpr unsigned long long kRleTempMagic = 0x524c455f54454d50ull; // "RLE_TEMP"
 
 // SINGLE block: the clear/bump decision must be uniform across all clearing threads, and a multi-
-// block grid cannot read the header while block 0 rewrites it without a race (harmless for the
-// 64-bit almost-never-wraps tag, fatal for the 15-call cycle: a torn decision = a partial clear).
-// One block stages the decision through smem and __syncthreads. Clears are rare (once per
-// allocation; every 15th call under RLE_STATE32) and small (4-8B/tile), so one SM suffices.
+// block grid cannot read the header while block 0 rewrites it without a race. One block stages the
+// decision through smem and __syncthreads. Clears are rare (once per allocation) and small
+// (8B/tile), so one SM suffices.
 __global__ void rle_init_states(RleTempHeader* hdr, StateT* states, long long n_states)
 {
   __shared__ unsigned s_gen;
@@ -60,11 +58,7 @@ __global__ void rle_init_states(RleTempHeader* hdr, StateT* states, long long n_
     const bool fresh = (hdr->magic != kRleTempMagic) || (hdr->launch_gen >= 0xfffffff0u);
     const unsigned g = fresh ? 1u : hdr->launch_gen + 1u;
     s_gen            = g;
-#if RLE_STATE32
-    s_clear = fresh || ((g - 1u) % 15u == 0u); // tag cycle restarts at this call
-#else
-    s_clear = fresh;
-#endif
+    s_clear          = fresh;
   }
   __syncthreads();
   if (s_clear)

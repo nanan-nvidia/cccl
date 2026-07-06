@@ -146,71 +146,38 @@ constexpr size_t kDynSmem =
 
 // tile_partial_states: one word per tile; a word is "published" iff its embedded tag matches this
 // launch -- stale words from prior launches read as unpublished, so no per-launch state memset.
-// Champion layout (RLE_STATE32=0): u64 [launch_gen:32][open_len:16][run_count:16]; tag = the full
+// Layout: u64 [launch_gen:32][open_len:16][run_count:16]; tag = the full
 // 32-bit launch_gen, array zeroed once per allocation (launch_gen starts at 1, zero never matches).
-// A/B layout (RLE_STATE32=1): u32 [tag:4][open_len:14][run_count:14]; run_count/open_len are
-// tile-bounded (<= kTileSize) so 14 bits hold them; the 4-bit tag cycles 1..15 and the init kernel
-// re-clears the array at every cycle start, so live tags never collide (0 stays "unpublished").
-// Either width is a single aligned access (non-tearing); atomic_ref makes the semantics explicit.
-#ifndef RLE_STATE32
-#  define RLE_STATE32 0 // 1 = 32-bit tile states (poll-traffic A/B); 0 = champion 64-bit
-#endif
-#ifndef RLE_POLL_VEC
-#  define RLE_POLL_VEC 0 // 1 = uint4 poll walk over 32-bit states (requires RLE_STATE32)
-#endif
-static_assert(!RLE_POLL_VEC || RLE_STATE32, "RLE_POLL_VEC needs RLE_STATE32");
-#if RLE_STATE32
-using StateT = unsigned;
-static_assert(kTileSize <= 0x3fff, "32-bit states: 14-bit open/count fields");
-#else
+// (A/B 2026-07-06: a 32-bit [tag:4|open:14|count:14] layout measured DEAD -- dense -7pts, and the
+// uint4 poll walk over it -13pts long; see git 353b6ad for the arms. The word stays 64-bit.)
+// The aligned 64-bit access is a single non-tearing word; atomic_ref makes the semantics explicit.
 using StateT = u64;
-#endif
 
 // tag stored in / compared against a state word for launch generation `launch_gen`
 __device__ __forceinline__ unsigned state_tag(unsigned launch_gen)
 {
-#if RLE_STATE32
-  return (launch_gen - 1u) % 15u + 1u; // 1..15; init clears states when a cycle restarts
-#else
   return launch_gen;
-#endif
 }
 
 __device__ __forceinline__ unsigned state_word_tag(StateT w)
 {
-#if RLE_STATE32
-  return w >> 28;
-#else
   return (unsigned) (w >> 32);
-#endif
 }
 
 __device__ __forceinline__ int state_word_count(StateT w)
 {
-#if RLE_STATE32
-  return (int) (w & 0x3fffu);
-#else
   return (int) (w & 0xffffu);
-#endif
 }
 
 __device__ __forceinline__ int state_word_open(StateT w)
 {
-#if RLE_STATE32
-  return (int) ((w >> 14) & 0x3fffu);
-#else
   return (int) ((w >> 16) & 0xffffu);
-#endif
 }
 
 __device__ __forceinline__ void
 publish_state(StateT* tile_state_arr, int tile_idx, unsigned launch_tag, int run_count, int open_len)
 {
-#if RLE_STATE32
-  StateT w = (launch_tag << 28) | ((unsigned) open_len << 14) | (unsigned) run_count;
-#else
   StateT w = ((u64) launch_tag << 32) | ((u64) (unsigned) open_len << 16) | (u64) (unsigned) run_count;
-#endif
   cuda::atomic_ref<StateT, cuda::thread_scope_device> a(tile_state_arr[tile_idx]);
   a.store(w, cuda::memory_order_relaxed);
 }
@@ -321,16 +288,7 @@ __device__ __forceinline__ void poll_and_fold(
   {
     const int remain = tile_id - last_seen_tile_id;
     // # of tiles to fold this iteration
-    int chunk = remain < 32 * kPollMlp ? remain : 32 * kPollMlp;
-#if RLE_POLL_VEC
-    // realign: a short scalar head round brings last_seen to a 4-tile boundary so every later
-    // round's lane_base is uint4-aligned (chunks of 32*kPollMlp preserve the alignment)
-    const int mis = (int) ((unsigned) last_seen_tile_id & 3u);
-    if (mis != 0)
-    {
-      chunk = remain < (4 - mis) ? remain : (4 - mis);
-    }
-#endif
+    const int chunk = remain < 32 * kPollMlp ? remain : 32 * kPollMlp;
     // lane l owns the contiguous tiles
     // [last_seen_tile_id + l*kPollMlp, last_seen_tile_id + l*kPollMlp + kPollMlp)
     // clamped to `chunk`
@@ -342,19 +300,6 @@ __device__ __forceinline__ void poll_and_fold(
     // warp spins on a frontier straggler, the (up to 127) already-valid states must NOT be re-fetched
     // from L2 every spin iteration.
     StateT packed_words[kPollMlp] = {}; // tag 0 never matches (launch tags >= 1) => starts "missing"
-#if RLE_POLL_VEC
-    static_assert(kPollMlp == 4, "vector poll walk assumes one uint4 per lane");
-    if (lane_tile_count == kPollMlp)
-    {
-      // one LDG.128 fetches the lane's 4 states; .cg keeps it L2-coherent. Words are individually
-      // atomic inside the 16B transaction; any not-yet-published word is re-loaded by the spin below.
-      const uint4 v   = __ldcg(reinterpret_cast<const uint4*>(tile_partial_states + lane_base));
-      packed_words[0] = v.x;
-      packed_words[1] = v.y;
-      packed_words[2] = v.z;
-      packed_words[3] = v.w;
-    }
-#endif
     bool ready;
     do
     {
