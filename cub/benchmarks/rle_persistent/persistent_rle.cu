@@ -94,7 +94,10 @@ constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in f
 // from the staged warp run count, so no mode flag is exchanged. Collects the measured peel-write
 // conflict prize (v33: +0.4..+1.3 at seg4-16) and deletes staging work + pos_free coupling at mid.
 #ifndef RLE_FW_THRESH
-#  define RLE_FW_THRESH 48 // decode crossover ~32-64 runs/warp-tile; 64/96 regress seg32
+// re-swept 2026-07-06 after the nxt-ffs decode cheapening: 64 = +1.4 BWUtil pts at seg32, flat
+// elsewhere (v33's "64/96 regress seg32" verdict predates cheap decode). 96 loses seg32 by -4.4
+// (drags 65-96-run warp-tiles onto the run-scaling decode), 128 also craters seg16 (-12.6).
+#  define RLE_FW_THRESH 64
 #endif
 // RLE_REGBUF: prefix-decoupled drain. Warp-tiles with run count <= RLE_REGBUF decode+gather into
 // REGISTERS before the prefixed wait (only the output ADDRESS needs the prefix), then release the
