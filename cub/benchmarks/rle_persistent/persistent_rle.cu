@@ -144,13 +144,11 @@ constexpr int kSlotStride = kTileSize + kSlotPad;
 constexpr size_t kDynSmem =
   (size_t) kStages * kSlotStride * sizeof(KeyT) + (size_t) kPosStages * kTileSize * sizeof(short);
 
-// tile_partial_states: one word per tile; a word is "published" iff its embedded tag matches this
-// launch -- stale words from prior launches read as unpublished, so no per-launch state memset.
-// Layout: u64 [launch_gen:32][open_len:16][run_count:16]; tag = the full
-// 32-bit launch_gen, array zeroed once per allocation (launch_gen starts at 1, zero never matches).
-// (A/B 2026-07-06: a 32-bit [tag:4|open:14|count:14] layout measured DEAD -- dense -7pts, and the
-// uint4 poll walk over it -13pts long; see git 353b6ad for the arms. The word stays 64-bit.)
-// The aligned 64-bit access is a single non-tearing word; atomic_ref makes the semantics explicit.
+// tile_partial_states: one word per tile 
+// Layout: u64 [launch_gen:32][open_len:16][run_count:16]
+// launch_gen is needed to reuse allocations per launch (to eliminate overhead of allocating the buffer)
+
+// an aligned 64-bit access is already non-tearing, but atomic_ref doesn't hurt and has clear semantics
 using TilePartialStateT = u64;
 
 __device__ __forceinline__ unsigned state_word_tag(TilePartialStateT w)
