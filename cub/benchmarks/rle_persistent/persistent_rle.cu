@@ -144,24 +144,24 @@ constexpr int kSlotStride = kTileSize + kSlotPad;
 constexpr size_t kDynSmem =
   (size_t) kStages * kSlotStride * sizeof(KeyT) + (size_t) kPosStages * kTileSize * sizeof(short);
 
-// tile_partial_states: one word per tile 
+// tile_partial_states: one word per tile
 // Layout: u64 [launch_gen:32][open_len:16][run_count:16]
-// launch_gen is needed to reuse allocations per launch (to eliminate overhead of allocating the buffer)
-
+// launch_gen is needed to reuse allocations per launch
+// (this is needed to eliminate overhead of allocating the buffer. CRITICAL for perf!)
 // an aligned 64-bit access is already non-tearing, but atomic_ref doesn't hurt and has clear semantics
 using TilePartialStateT = u64;
 
-__device__ __forceinline__ unsigned state_word_tag(TilePartialStateT w)
+__device__ __forceinline__ unsigned extract_launch_gen_from_tile_partial_state(TilePartialStateT w)
 {
   return (unsigned) (w >> 32);
 }
 
-__device__ __forceinline__ int state_word_count(TilePartialStateT w)
+__device__ __forceinline__ int extract_run_count_from_tile_partial_state(TilePartialStateT w)
 {
   return (int) (w & 0xffffu);
 }
 
-__device__ __forceinline__ int state_word_open(TilePartialStateT w)
+__device__ __forceinline__ int extract_open_len_from_tile_partial_state(TilePartialStateT w)
 {
   return (int) ((w >> 16) & 0xffffu);
 }
@@ -299,10 +299,10 @@ __device__ __forceinline__ void poll_and_fold(
 #pragma unroll
       for (int i = 0; i < kPollMlp; ++i)
       {
-        if (i < lane_tile_count && state_word_tag(packed_words[i]) != launch_gen)
+        if (i < lane_tile_count && extract_launch_gen_from_tile_partial_state(packed_words[i]) != launch_gen)
         {
           packed_words[i] = load_state(tile_partial_states, lane_base + i);
-          if (state_word_tag(packed_words[i]) != launch_gen)
+          if (extract_launch_gen_from_tile_partial_state(packed_words[i]) != launch_gen)
           {
             ready = false;
           }
@@ -316,8 +316,8 @@ __device__ __forceinline__ void poll_and_fold(
     {
       if (i < lane_tile_count)
       {
-        const int tile_run_count   = state_word_count(packed_words[i]);
-        const int tile_open_length = state_word_open(packed_words[i]);
+        const int tile_run_count   = extract_run_count_from_tile_partial_state(packed_words[i]);
+        const int tile_open_length = extract_open_len_from_tile_partial_state(packed_words[i]);
         lane_run_count             = lane_run_count + tile_run_count;
         lane_open_length           = (tile_run_count > 0) ? tile_open_length : (lane_open_length + tile_open_length);
       }
