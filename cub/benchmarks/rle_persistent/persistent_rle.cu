@@ -372,9 +372,9 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   extern __shared__ char smem_raw[]; // 16B-aligned; KeyT alignment <= 16 for all supported types
   KeyT* const tile_buf    = (KeyT*) smem_raw;
   short* const staged_pos = (short*) (tile_buf + (size_t) kStages * kSlotStride);
-  __shared__ int tile_id_ring[kStages]; // which global tile each ring slot holds (LOAD gets it with try_cancel)
+  __shared__ int tile_id_buf[kStages]; // which global tile each ring slot holds (LOAD gets it with try_cancel)
   __shared__ int warp_run_counts[kStages][kNumCompWarps]; // per compute warp run counts
-  __shared__ unsigned flag_ring[kStages][kNumCompWarps * 32]; // staged head-flag words (flag-word path)
+  __shared__ unsigned head_flag_buf[kStages][kNumCompWarps * 32]; // staged head-flag words (flag-word path)
   __shared__ int warp_first_heads[kStages][kNumCompWarps]; // per compute warp first head idx (-1 if none)
   __shared__ int warp_last_heads[kStages][kNumCompWarps]; // per compute warp last head idx (-1 if none)
   // POLL -> STORE handoff: [open_len_prefix:32][run_count_prefix:32] packed, one access per side
@@ -400,7 +400,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   // COMPUTE warp w --staged_wt[w]--> STORE: per-warp-tile handoff, so store warps drain a warp-tile
   // as soon as ITS positions are staged instead of waiting for all 8 compute warps (warp 0 is always
   // last -- it does the publish fan-in first). The shared metadata store also needs (run counts,
-  // first/last heads, tile_id_ring) is covered by `computed`.
+  // first/last heads, tile_id_buf) is covered by `computed`.
   __shared__ u64 staged_wt[kStages][kNumCompWarps];
 
   // try_cancel writes a 16-byte response into clc_resp + completes clc_bar's tx.
@@ -463,7 +463,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       }
       if (lane_id == 0)
       {
-        tile_id_ring[slot_id] = tile_id;
+        tile_id_buf[slot_id] = tile_id;
       }
       if (tile_id >= num_tiles)
       {
@@ -544,7 +544,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       while (!ptx::mbarrier_try_wait_parity(&full[slot_id], (unsigned) (slot_gen & 1)))
       {
       }
-      const int tile_id = tile_id_ring[slot_id];
+      const int tile_id = tile_id_buf[slot_id];
       if (tile_id >= num_tiles)
       {
         if (lane_id == 0)
@@ -642,7 +642,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       const bool stage_flags = (local_run_count < RLE_FW_THRESH);
       if (stage_flags)
       {
-        flag_ring[slot_id][compute_warp_id * 32 + lane_id] = my_flags;
+        head_flag_buf[slot_id][compute_warp_id * 32 + lane_id] = my_flags;
       }
       else
       {
@@ -710,7 +710,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       while (!ptx::mbarrier_try_wait_parity(&full[slot_id], (unsigned) (slot_gen & 1)))
       {
       }
-      const int tile_id = tile_id_ring[slot_id];
+      const int tile_id = tile_id_buf[slot_id];
       if (tile_id >= num_tiles)
       {
         if (lane_id == 0)
@@ -752,7 +752,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       while (!ptx::mbarrier_try_wait_parity(&computed[slot_id], (unsigned) ((pipeline_gen / kStages) & 1)))
       {
       }
-      const int tile_id = tile_id_ring[slot_id];
+      const int tile_id = tile_id_buf[slot_id];
       if (tile_id >= num_tiles)
       {
         if (lane_id == 0)
@@ -810,7 +810,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         {
           // rank-select decode from staged flag words. All shuffles run warp-uniformly (uniform
           // trip counts, no shfl inside predicated paths) -- the cnt-shfl lesson.
-          const unsigned my_word = flag_ring[slot_id][warp_tile_id * 32 + lane_id];
+          const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
           const int my_pc        = __popc(my_word);
           int incl               = my_pc;
 #pragma unroll
@@ -919,7 +919,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           if (warp_tile_run_count < RLE_FW_THRESH)
           {
             // rank-select decode (same as the classic flag-word path, but into registers)
-            const unsigned my_word = flag_ring[slot_id][warp_tile_id * 32 + lane_id];
+            const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
             const int my_pc        = __popc(my_word);
             int incl               = my_pc;
 #pragma unroll
@@ -1073,7 +1073,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       while (!ptx::mbarrier_try_wait_parity(&computed[slot_id], (unsigned) ((pipeline_gen / kStages) & 1)))
       {
       }
-      const int tile_id = tile_id_ring[slot_id];
+      const int tile_id = tile_id_buf[slot_id];
       if (tile_id >= num_tiles)
       {
         if (lane_id == 0)
