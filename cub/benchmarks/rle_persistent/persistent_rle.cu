@@ -1,16 +1,9 @@
-// Standalone persistent-block RLE-encode kernel for Blackwell (B200). Impl only -- see
-// persistent_rle_bench.cu for the official-nvbench comparison vs cub::DeviceRunLengthEncode.
-// Keys/lengths/num_runs typed via RLE_KEY_T / RLE_LEN_T / RLE_NUM_RUNS_T (one TU per combo).
-// TODO(templates): replace the RLE_*_T type macros (and the K_* policy macros' type-derived
-// defaults) with template parameters on the kernel + a policy struct, CUB-style; the -D flags
-// then collapse to explicit instantiations in the bench/verify TUs.
-
 #include <cuda/atomic>
 #include <cuda/ptx>
-#include <cuda/std/complex> // complex32 key instantiations
+#include <cuda/std/complex>
 #include <cuda/std/cstdint>
 
-#include <algorithm> // std::min (host launcher)
+#include <algorithm>
 
 #include <cuda_runtime_api.h>
 
@@ -94,10 +87,6 @@ constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in f
 // 4 gains less at dense and costs 1.3-1.5pt at seg8-16; 0 = no unroll. NOTE this knob's verdict
 // FLIPPED twice as the surrounding design changed -- re-sweep it after any store-path change.
 
-#ifndef RLE_POLL_ORACLE
-#  define RLE_POLL_ORACLE 0 // 1 = WRONG RESULTS: free-prefix ceiling probe (skips the poll fold)
-#endif
-
 // head-flag words (one conflict-free STS.32 per lane; no scan, no peel, no pos-ring use) and the
 // drain rank-selects head positions from them (5-shfl binary search + branchless nth-set-bit, pure
 // registers, no LDS in the run loop). Dense warp-tiles keep the champion peel+positions path:
@@ -132,6 +121,8 @@ __device__ __forceinline__ int swizzle_xor_stride32(int x)
 // CLC = 1 => use shiny new blackwell feature (UGETNEXTWORKID)
 // CLC = 0 => use atomics for work stealing
 // no perf difference observed on blackwell
+// the atomics path is temporarily removed since I want to focus on blackwell perf first
+// i.e. we fry one fish at a time :)
 
 constexpr int kWarpTileSize = 32 * kIPT;
 constexpr int kTileSize     = kNumCompWarps * kWarpTileSize;
@@ -142,6 +133,7 @@ constexpr unsigned kFullMask     = 0xffffffffu;
 constexpr int poll_warp_id       = 1 + kNumCompWarps;
 constexpr int store_warp_id      = poll_warp_id + 1;
 constexpr int bookkeeper_warp_id = store_warp_id + kNumStoreWarps;
+
 // for each input tile, we need to store the keys and in-tile positions
 // for in tile position we can just do U16 since tile size is never bigger than 2^16.
 // each key slot carries kSlotPad extra leading elements: the TMA over-fetches one 16B chunk to
@@ -701,26 +693,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         break;
       }
       OffT curr_prefix_run_count, curr_prefix_open_length;
-#if RLE_POLL_ORACLE
-      // CEILING PROBE ONLY -- WRONG RESULTS. Skips the cross-tile fold to measure the free-prefix
-      // ceiling. v2: fake prefixes SPREAD like real ones (tile_id x tile-0's run count, read once)
-      // so output writes distribute realistically -- the prefix=0 version contaminated run-heavy
-      // regimes with cross-SM same-address write contention.
-      if (last_seen_prefix_run_count == 0) // reused as the cached per-tile estimate (probe-only)
-      {
-        u64 s0 = 0;
-        do
-        {
-          s0 = load_state(tile_partial_states, 0);
-        } while ((unsigned) (s0 >> 32) != launch_gen);
-        last_seen_prefix_run_count = (OffT) ((s0 & 0xffffu) | 1); // >=1 so we don't re-poll
-      }
-      const long long est_pref = (long long) tile_id * (long long) last_seen_prefix_run_count;
-      curr_prefix_run_count    = (est_pref < 0x40000000ll) ? (OffT) est_pref : (OffT) 0x40000000;
-      curr_prefix_open_length  = 0;
-      last_seen_tile_id        = tile_id;
-      (void) last_seen_prefix_open_length;
-#else
       poll_and_fold(
         tile_partial_states,
         launch_gen,
@@ -731,7 +703,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         lane_id,
         curr_prefix_run_count,
         curr_prefix_open_length);
-#endif
       // no wait needed before overwriting the prefix slot: STORE(pipeline_gen-kStages) arrives `empty` as its
       // LAST act, LOAD cannot arm `full` for this pipeline_gen until it passed that same `empty` phase, and we
       // already passed `full` above -- so a drain-wait here could provably never spin.
