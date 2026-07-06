@@ -106,11 +106,17 @@ static bool run_case(long long n, int max_seg, unsigned seed, bool sampled = fal
     CHECK_CUDA(cudaMemcpy(ref_c2.data(), dc + tail0, sizeof(LenT) * win, cudaMemcpyDeviceToHost));
   }
 
-  // ours -- two launches on the SAME (never re-cleared) tile_state array: round 1 exercises the
-  // zeroed-at-alloc path, round 2 exercises gen-tag invalidation of round 1's stale states.
+  // ours -- repeated launches on the SAME (never re-cleared) tile_state array: round 1 exercises
+  // the zeroed-at-alloc path, round 2 exercises gen-tag invalidation of round 1's stale states.
+  // RLE_STATE32 builds run enough rounds to cross the 15-call tag-cycle re-clear (the wrap path).
   // outputs are poisoned before each round so stale data can't mask a missing write.
+#if RLE_STATE32
+  constexpr int kVerifyRounds = 17;
+#else
+  constexpr int kVerifyRounds = 2;
+#endif
   bool ok = true;
-  for (int round = 0; round < 2; ++round)
+  for (int round = 0; round < kVerifyRounds; ++round)
   {
     CHECK_CUDA(cudaMemset(du, 0xEE, sizeof(KeyT) * (size_t) n));
     CHECK_CUDA(cudaMemset(dc, 0xEE, sizeof(LenT) * (size_t) n));
