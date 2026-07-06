@@ -231,12 +231,14 @@ __device__ __forceinline__ OffT prefix_open_len(P p)
   }
 }
 
-// position of the rank-th (0-indexed) set bit of flag_mask; branchless popc bisect.
-// Requires popc(flag_mask) > rank.
-// (__fns(flag_mask, 0, rank+1) computes the same thing but has NO hardware op on sm_100a: the
-// emulation is a branching loop, +272 SASS / +17 BRA across the inlined drain copies. MEASURED
-// on B200 i32^3 2^28: -7.6 BWUtil pts at seg64, -1.7/-2.0 at seg128/256, flat off the flag-word
-// path -- A/B 2026-07-06, keep the bisect.)
+// position of the n-th set bit of flag_mask
+// requires popc(flag_mask) > rank.
+// __fns(flag_mask, 0, rank+1) computes the same thing but has NO hardware op on sm_100a and is slower
+#ifndef RLE_NXT_FFS
+// 1 = derive run j+1's head as the next set bit ABOVE run j's bit (mask + __ffs, ~4 ops) instead
+// of a second full rank query (~15 ops). A/B knob.
+#  define RLE_NXT_FFS 0
+#endif
 __device__ __forceinline__ int nth_set_bit(unsigned flag_mask, int rank)
 {
   // each step: if the wanted bit is not among the low half's set bits, skip that half entirely
@@ -854,9 +856,16 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             const unsigned mw     = __shfl_sync(kFullMask, my_word, w);
             const int nxt_after_w = __shfl_sync(kFullMask, nxt_min, (w + 1) & 31);
             const int pcw         = __popc(mw);
-            const int local_pos   = w * 32 + nth_set_bit(mw, (j < pcw) ? j : 0);
+            const int local_bit   = nth_set_bit(mw, (j < pcw) ? j : 0);
+            const int local_pos   = w * 32 + local_bit;
+#if RLE_NXT_FFS
+            // rank j+1's bit = next set bit above rank j's bit; ~1u << local_bit masks bits <= local_bit
+            // (well-defined for local_bit 0..31). j+1 < pcw guarantees a higher bit exists when used.
+            const int in_word_nxt = w * 32 + __ffs(mw & (~1u << local_bit)) - 1;
+#else
             const int in_word_nxt = w * 32 + nth_set_bit(mw, (j + 1 < pcw) ? (j + 1) : 0);
-            const int next_local  = (j + 1 < pcw) ? in_word_nxt : nxt_after_w;
+#endif
+            const int next_local = (j + 1 < pcw) ? in_word_nxt : nxt_after_w;
             if (run_idx < run_end)
             {
               const int head_pos        = warp_tile_offset + local_pos;
@@ -960,8 +969,13 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               const unsigned mw     = __shfl_sync(kFullMask, my_word, w);
               const int nxt_after_w = __shfl_sync(kFullMask, nxt_min, (w + 1) & 31);
               const int pcw         = __popc(mw);
-              const int local_pos   = w * 32 + nth_set_bit(mw, (j < pcw) ? j : 0);
+              const int local_bit   = nth_set_bit(mw, (j < pcw) ? j : 0);
+              const int local_pos   = w * 32 + local_bit;
+#if RLE_NXT_FFS
+              const int in_word_nxt = w * 32 + __ffs(mw & (~1u << local_bit)) - 1;
+#else
               const int in_word_nxt = w * 32 + nth_set_bit(mw, (j + 1 < pcw) ? (j + 1) : 0);
+#endif
               // inactive lanes (run_idx >= run_end) decode garbage positions up to wt_offset+1023,
               // which is out of the key window whenever the warp-tile is under 1024 elements (any
               // key type over 4B, or debug kIPT<32) -- predicate the read, keep the shuffles above
