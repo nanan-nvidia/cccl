@@ -31,7 +31,7 @@ inline long long rle_state_tiles(long long n)
 #endif
 
 // ---- temp-storage protocol -------------------------------------------------------------------
-// persistent path: [ header: u64 magic | u32 gen | u32 rsvd ][ u64 tile states ... ]
+// persistent path: [ header: u64 magic | u32 launch_gen | u32 rsvd ][ u64 tile states ... ]
 // The init kernel bumps the generation when the header matches (allocate-once-call-many pays a
 // tiny kernel, cheaper than stock CUB per-call state init) and clears states exactly once
 // otherwise -- including after the same allocation was used by the stock path (magic mismatch).
@@ -39,14 +39,14 @@ inline long long rle_state_tiles(long long n)
 struct RleTempHeader
 {
   unsigned long long magic;
-  unsigned gen;
+  unsigned launch_gen;
   unsigned rsvd;
 };
 inline constexpr unsigned long long kRleTempMagic = 0x524c455f54454d50ull; // "RLE_TEMP"
 
 __global__ void rle_init_states(RleTempHeader* hdr, u64* states, long long n_states)
 {
-  const bool fresh = (hdr->magic != kRleTempMagic) || (hdr->gen >= 0xfffffff0u);
+  const bool fresh = (hdr->magic != kRleTempMagic) || (hdr->launch_gen >= 0xfffffff0u);
   if (fresh)
   {
     const long long stride = (long long) gridDim.x * blockDim.x;
@@ -56,13 +56,13 @@ __global__ void rle_init_states(RleTempHeader* hdr, u64* states, long long n_sta
     }
     if (blockIdx.x == 0 && threadIdx.x == 0)
     {
-      hdr->magic = kRleTempMagic;
-      hdr->gen   = 1; // stale zeroed words carry gen 0 and never match gen >= 1
+      hdr->magic      = kRleTempMagic;
+      hdr->launch_gen = 1; // stale zeroed words carry launch_gen 0 and never match launch_gen >= 1
     }
   }
   else if (blockIdx.x == 0 && threadIdx.x == 0)
   {
-    hdr->gen = hdr->gen + 1;
+    hdr->launch_gen = hdr->launch_gen + 1;
   }
 }
 
@@ -102,6 +102,6 @@ inline cudaError_t persistent_rle_encode(
   u64* states = (u64*) (hdr + 1);
   rle_init_states<<<128, 256, 0, stream>>>(hdr, states, tiles);
   rle_impl::persistent_rle_launch(
-    d_keys, d_unique, d_counts, d_num_runs, states, &hdr->gen, num_items, (int) tiles, stream);
+    d_keys, d_unique, d_counts, d_num_runs, states, &hdr->launch_gen, num_items, (int) tiles, stream);
   return cudaGetLastError();
 }
