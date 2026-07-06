@@ -26,11 +26,10 @@ inline long long rle_state_tiles(long long n)
   return (n + kTileSize - 1) / kTileSize;
 }
 
-// tile count below which stock CUB runs. 512 tiles (= 2^22 elements at 4B keys) is conservative:
-// the measured loss band tops out near 128 tiles and the persistent win at 2048 tiles is 1.3x+.
-// The boundary sweep (N = 2^20..2^24) places this precisely.
+// tile count below which stock CUB runs. Boundary sweep (v55): 512 tiles still shows one sub-par
+// cell (2^22 seg2 = 0.97x); 1024 tiles is clean -- parity below (stock == stock), >=1.17x above.
 #ifndef RLE_STOCK_TILES
-#  define RLE_STOCK_TILES 512
+#  define RLE_STOCK_TILES 1024
 #endif
 
 // ---- temp-storage protocol -------------------------------------------------------------------
