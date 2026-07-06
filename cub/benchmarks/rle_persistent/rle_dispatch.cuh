@@ -11,12 +11,12 @@
 
 #include "persistent_rle.cu"
 
-using KeyT     = rle_impl::KeyT;
-using LenT     = rle_impl::LenT;
-using NumRunsT = rle_impl::NumRunsT;
-using OffT     = rle_impl::OffT;
-using u64      = rle_impl::u64;
-using TilePartialStateT   = rle_impl::TilePartialStateT;
+using KeyT              = rle_impl::KeyT;
+using LenT              = rle_impl::LenT;
+using NumRunsT          = rle_impl::NumRunsT;
+using OffT              = rle_impl::OffT;
+using u64               = rle_impl::u64;
+using TilePartialStateT = rle_impl::TilePartialStateT;
 
 constexpr int kTileSize = rle_impl::kTileSize;
 
@@ -90,8 +90,9 @@ inline cudaError_t persistent_rle_encode(
   // size query must cover BOTH paths (the same allocation may serve either across calls)
   size_t cub_bytes = 0;
   cub::DeviceRunLengthEncode::Encode(nullptr, cub_bytes, d_keys, d_unique, d_counts, d_num_runs, num_items, stream);
-  const size_t pers_bytes = sizeof(RleTempHeader) + (size_t) rle_state_tiles((long long) num_items) * sizeof(TilePartialStateT);
-  const size_t required   = std::max(cub_bytes, pers_bytes);
+  const size_t pers_bytes =
+    sizeof(RleTempHeader) + (size_t) rle_state_tiles((long long) num_items) * sizeof(TilePartialStateT);
+  const size_t required = std::max(cub_bytes, pers_bytes);
   if (d_temp_storage == nullptr)
   {
     temp_storage_bytes = required;
@@ -107,7 +108,7 @@ inline cudaError_t persistent_rle_encode(
     return cub::DeviceRunLengthEncode::Encode(
       d_temp_storage, temp_storage_bytes, d_keys, d_unique, d_counts, d_num_runs, num_items, stream);
   }
-  auto* hdr      = (RleTempHeader*) d_temp_storage;
+  auto* hdr                 = (RleTempHeader*) d_temp_storage;
   TilePartialStateT* states = (TilePartialStateT*) (hdr + 1);
   rle_init_states<<<1, 256, 0, stream>>>(hdr, states, tiles);
   rle_impl::persistent_rle_launch(
