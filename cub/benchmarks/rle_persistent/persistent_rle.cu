@@ -153,12 +153,6 @@ constexpr size_t kDynSmem =
 // The aligned 64-bit access is a single non-tearing word; atomic_ref makes the semantics explicit.
 using StateT = u64;
 
-// tag stored in / compared against a state word for launch generation `launch_gen`
-__device__ __forceinline__ unsigned state_tag(unsigned launch_gen)
-{
-  return launch_gen;
-}
-
 __device__ __forceinline__ unsigned state_word_tag(StateT w)
 {
   return (unsigned) (w >> 32);
@@ -175,9 +169,9 @@ __device__ __forceinline__ int state_word_open(StateT w)
 }
 
 __device__ __forceinline__ void
-publish_state(StateT* tile_state_arr, int tile_idx, unsigned launch_tag, int run_count, int open_len)
+publish_state(StateT* tile_state_arr, int tile_idx, unsigned launch_gen, int run_count, int open_len)
 {
-  StateT w = ((u64) launch_tag << 32) | ((u64) (unsigned) open_len << 16) | (u64) (unsigned) run_count;
+  StateT w = ((u64) launch_gen << 32) | ((u64) (unsigned) open_len << 16) | (u64) (unsigned) run_count;
   cuda::atomic_ref<StateT, cuda::thread_scope_device> a(tile_state_arr[tile_idx]);
   a.store(w, cuda::memory_order_relaxed);
 }
@@ -275,7 +269,7 @@ __device__ __forceinline__ int nth_set_bit(unsigned m, int n)
 
 __device__ __forceinline__ void poll_and_fold(
   StateT* tile_partial_states,
-  unsigned launch_tag,
+  unsigned launch_gen,
   int tile_id,
   int& last_seen_tile_id,
   OffT& last_seen_prefix_run_count,
@@ -307,10 +301,10 @@ __device__ __forceinline__ void poll_and_fold(
 #pragma unroll
       for (int i = 0; i < kPollMlp; ++i)
       {
-        if (i < lane_tile_count && state_word_tag(packed_words[i]) != launch_tag)
+        if (i < lane_tile_count && state_word_tag(packed_words[i]) != launch_gen)
         {
           packed_words[i] = load_state(tile_partial_states, lane_base + i);
-          if (state_word_tag(packed_words[i]) != launch_tag)
+          if (state_word_tag(packed_words[i]) != launch_gen)
           {
             ready = false;
           }
@@ -409,7 +403,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   const int lane_id         = thr_id & 31;
   const int blk_id          = blockIdx.x;
   const unsigned launch_gen = __ldg(d_launch_gen); // written by the init kernel, stream-ordered
-  const unsigned launch_tag = state_tag(launch_gen); // what published state words carry this launch
 
   if (thr_id == 0)
   {
@@ -632,7 +625,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           {
             const int open_len = (run_count > 0) ? (tile_len - last_head_idx) : tile_len;
             // CRITICAL: publish as soon as possible, this is why we calculate head_flags first
-            publish_state(tile_partial_states, tile_id, launch_tag, run_count, open_len);
+            publish_state(tile_partial_states, tile_id, launch_gen, run_count, open_len);
           }
         }
       }
@@ -720,7 +713,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       OffT curr_prefix_run_count, curr_prefix_open_length;
       poll_and_fold(
         tile_partial_states,
-        launch_tag,
+        launch_gen,
         tile_id,
         last_seen_tile_id,
         last_seen_prefix_run_count,
