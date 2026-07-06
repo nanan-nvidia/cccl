@@ -43,6 +43,8 @@ static_assert(sizeof(OffT) == 4 || sizeof(OffT) == 8, "OffT: int or long long");
 // <= 16), and the key ring is carved from the 16B-aligned dynamic smem base. Exotic key types
 // (CUB accepts any trivially-copyable size via its untuned generic policy) must be routed to
 // stock cub::Encode by the dispatch shell instead of instantiating this kernel.
+// TODO(templates pass): these two asserts move inside the templated kernel body -- they are
+// per-instantiation constraints on the KeyT template parameter, not TU-scope facts.
 static_assert(16 % sizeof(KeyT) == 0, "KeyT size must be a power of two <= 16 (TMA quantum / kSlotPad math)");
 static_assert(alignof(KeyT) <= 16, "KeyT alignment must fit the 16B-aligned dynamic smem carve");
 
