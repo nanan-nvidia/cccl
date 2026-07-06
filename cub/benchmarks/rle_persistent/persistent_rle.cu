@@ -233,9 +233,9 @@ __device__ __forceinline__ OffT prefix_open_len(P p)
 
 // position of the rank-th (0-indexed) set bit of flag_mask; branchless popc bisect.
 // Requires popc(flag_mask) > rank.
-// TODO(perf): evaluate the __fns() intrinsic (PTX fns.b32) as a one-call replacement -- MEASURE
-// first: this sits in the drain rank-select inner loop (flag-word path), and fns is emulated on
-// some archs.
+// (__fns(flag_mask, 0, rank+1) computes the same thing but has NO hardware op on sm_100a: the
+// emulation is a branching loop, +272 SASS instructions / +17 BRA across the inlined drain
+// copies vs this branchless 15-op sequence -- checked 2026-07-06, keep the bisect.)
 __device__ __forceinline__ int nth_set_bit(unsigned flag_mask, int rank)
 {
   // each step: if the wanted bit is not among the low half's set bits, skip that half entirely
