@@ -187,6 +187,9 @@ __device__ __forceinline__ TilePartialStateT load_state(TilePartialStateT* tile_
 }
 
 // what is going to be the type of the prefix (run_count, open_len)?
+// TODO(templates pass): replace ulonglong2 with a named alignas(16) struct { run_count, open_len }
+// -- keeps the single STS.128/LDS.128 access, kills the meaningless .x/.y members, and the
+// pack/unpack helpers collapse into the struct (same treatment as TilePartialStateT).
 using PrefixT = cuda::std::conditional_t<(sizeof(OffT) > 4), ulonglong2, u64>;
 
 // how do we pack them? if P is 32 bit, we compact them into 1 word. Otherwise, 2 words!
@@ -229,6 +232,11 @@ __device__ __forceinline__ OffT prefix_open_len(P p)
 }
 
 // position of the n-th (0-indexed) set bit of m; branchless popc bisect. Requires popc(m) > n.
+// TODO(readability): rename the single-letter locals (m = flag mask, n = remaining rank, c = set
+// bits in the current half, pos = bit position) and fold the 16/8/4/2 steps into one unrolled
+// loop over the halving widths. Also evaluate the __fns() intrinsic (PTX fns.b32) as a one-call
+// replacement -- MEASURE first: this sits in the drain rank-select inner loop (flag-word path),
+// and fns is emulated on some archs.
 __device__ __forceinline__ int nth_set_bit(unsigned m, int n)
 {
   int pos = 0;
