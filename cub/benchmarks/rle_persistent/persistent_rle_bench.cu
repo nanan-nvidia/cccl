@@ -111,7 +111,7 @@ void teardown(Bufs& b)
 void add_counters(nvbench::state& s, const Bufs& b)
 {
   s.add_element_count(b.n);
-  s.add_global_memory_reads<KeyT>(b.n, "keys"); // minimal RLE traffic, identical charge for both impls
+  s.add_global_memory_reads<KeyT>(b.n, "keys");
   s.add_global_memory_writes<KeyT>(b.R, "unique");
   s.add_global_memory_writes<LenT>(b.R, "counts");
 }
@@ -158,7 +158,7 @@ static void cub_rle_bench(nvbench::state& state)
 
 using axis = std::vector<nvbench::int64_t>;
 static axis kSegs{1, 2, 4, 8, 16, 32, 64, 128, 256, 4096, 1048576};
-static axis kN{1 << 16, 1 << 20, 1 << 24, 1 << 28};
+static axis kN{1 << 16, 1 << 20, 1 << 21, 1 << 22, 1 << 23, 1 << 24, 1 << 28};
 // huge axis: only meaningful on wide-offset builds (narrow builds skip at runtime)
 static axis kNHuge{1ll << 32};
 static axis kSegsHuge{2, 16, 256, 1048576};
