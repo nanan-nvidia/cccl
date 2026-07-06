@@ -39,6 +39,12 @@ using LenT     = RLE_LEN_T;
 using NumRunsT = RLE_NUM_RUNS_T;
 using OffT     = RLE_OFFSET_T;
 static_assert(sizeof(OffT) == 4 || sizeof(OffT) == 8, "OffT: int or long long");
+// KeyT envelope: kSlotPad = 16/sizeof(KeyT) needs the size to DIVIDE the 16B TMA quantum (pow2
+// <= 16), and the key ring is carved from the 16B-aligned dynamic smem base. Exotic key types
+// (CUB accepts any trivially-copyable size via its untuned generic policy) must be routed to
+// stock cub::Encode by the dispatch shell instead of instantiating this kernel.
+static_assert(16 % sizeof(KeyT) == 0, "KeyT size must be a power of two <= 16 (TMA quantum / kSlotPad math)");
+static_assert(alignof(KeyT) <= 16, "KeyT alignment must fit the 16B-aligned dynamic smem carve");
 
 #ifndef K_IPT
 // size-class tile policy: the tile is capped at 8192 ELEMENTS by the ballot design (32 chunks x
@@ -240,9 +246,7 @@ __device__ __forceinline__ OffT prefix_open_len(P p)
 __device__ __forceinline__ int nth_set_bit(unsigned flag_mask, int rank)
 {
   // each step: if the wanted bit is not among the low half's set bits, skip that half entirely
-  // (drop its set bits from the rank, add its width to the position). Written as explicit
-  // 16/8/4/2 steps, NOT a folded loop: the loop form emits 16 extra SASS instructions (ptxas
-  // flips predicated adds to SELs) and this is the drain rank-select inner loop.
+  // this is manually unrolled to reduce the count of generated SASS instructions
   int bit_position         = 0;
   int set_bits_in_low_half = __popc(flag_mask & 0xffffu);
   if (rank >= set_bits_in_low_half)
@@ -301,11 +305,8 @@ __device__ __forceinline__ void poll_and_fold(
     const int lane_base = last_seen_tile_id + lane_id * kPollMlp;
     int lane_tile_count = chunk - lane_id * kPollMlp;
     lane_tile_count     = lane_tile_count < 0 ? 0 : (lane_tile_count > kPollMlp ? kPollMlp : lane_tile_count);
-    // MLP: issue all kPollMlp loads up front, then spin until this lane's owned tiles are all published.
-    // published words are immutable within a launch, so RE-load only the still-missing ones: while the
-    // warp spins on a frontier straggler, the (up to 127) already-valid states must NOT be re-fetched
-    // from L2 every spin iteration.
-    TilePartialStateT packed_words[kPollMlp] = {}; // tag 0 never matches (launch tags >= 1) => starts "missing"
+    // issue all kPollMlp loads up front, then spin until this lane's owned tiles are all published (MLP)
+    TilePartialStateT packed_words[kPollMlp] = {}; // must zero initialize
     bool ready;
     do
     {
@@ -336,13 +337,7 @@ __device__ __forceinline__ void poll_and_fold(
         lane_open_length           = (tile_run_count > 0) ? tile_open_length : (lane_open_length + tile_open_length);
       }
     }
-    // cross lane fold over 32 lane aggregates -- only the chunk TOTAL is needed, so no scan:
-    // total run count is a plain sum; total open length follows the fold's absorbing rule: any run
-    // resets the open count, so it's the sum of lane opens from the LAST run-bearing lane onward
-    // (that lane's own open already sits after its last run), or the sum of all opens if no lane
-    // has a run. lanes beyond lane_tile_count hold (0,0) and contribute nothing.
-    // (a 15-shfl segmented inclusive scan whose lane-31 value was the only consumed result used to
-    // sit here; ballot+redux measured 1.6-6.9% faster end-to-end at seg>=64)
+    // cross lane fold over 32 lane aggregates
     const int chunk_run_count      = __reduce_add_sync(kFullMask, lane_run_count);
     const unsigned lanes_with_runs = __ballot_sync(kFullMask, lane_run_count > 0);
     const int last_run_lane        = lanes_with_runs ? (31 - __clz(lanes_with_runs)) : 0;
@@ -366,7 +361,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   LenT* __restrict__ d_counts,
   NumRunsT* __restrict__ d_num_runs,
   TilePartialStateT* __restrict__ tile_partial_states,
-  const unsigned* __restrict__ d_launch_gen, // device-side call generation (graph-safe, no host state)
+  const unsigned* __restrict__ d_launch_gen,
   OffT num_items,
   int num_tiles)
 {
