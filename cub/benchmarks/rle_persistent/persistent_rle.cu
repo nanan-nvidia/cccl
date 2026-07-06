@@ -231,48 +231,51 @@ __device__ __forceinline__ OffT prefix_open_len(P p)
   }
 }
 
-// position of the n-th (0-indexed) set bit of m; branchless popc bisect. Requires popc(m) > n.
-// TODO(readability): rename the single-letter locals (m = flag mask, n = remaining rank, c = set
-// bits in the current half, pos = bit position) and fold the 16/8/4/2 steps into one unrolled
-// loop over the halving widths. Also evaluate the __fns() intrinsic (PTX fns.b32) as a one-call
-// replacement -- MEASURE first: this sits in the drain rank-select inner loop (flag-word path),
-// and fns is emulated on some archs.
-__device__ __forceinline__ int nth_set_bit(unsigned m, int n)
+// position of the rank-th (0-indexed) set bit of flag_mask; branchless popc bisect.
+// Requires popc(flag_mask) > rank.
+// TODO(perf): evaluate the __fns() intrinsic (PTX fns.b32) as a one-call replacement -- MEASURE
+// first: this sits in the drain rank-select inner loop (flag-word path), and fns is emulated on
+// some archs.
+__device__ __forceinline__ int nth_set_bit(unsigned flag_mask, int rank)
 {
-  int pos = 0;
-  int c   = __popc(m & 0xffffu);
-  if (n >= c)
+  // each step: if the wanted bit is not among the low half's set bits, skip that half entirely
+  // (drop its set bits from the rank, add its width to the position). Written as explicit
+  // 16/8/4/2 steps, NOT a folded loop: the loop form emits 16 extra SASS instructions (ptxas
+  // flips predicated adds to SELs) and this is the drain rank-select inner loop.
+  int bit_position         = 0;
+  int set_bits_in_low_half = __popc(flag_mask & 0xffffu);
+  if (rank >= set_bits_in_low_half)
   {
-    n -= c;
-    pos += 16;
-    m >>= 16;
+    rank -= set_bits_in_low_half;
+    bit_position += 16;
+    flag_mask >>= 16;
   }
-  c = __popc(m & 0xffu);
-  if (n >= c)
+  set_bits_in_low_half = __popc(flag_mask & 0xffu);
+  if (rank >= set_bits_in_low_half)
   {
-    n -= c;
-    pos += 8;
-    m >>= 8;
+    rank -= set_bits_in_low_half;
+    bit_position += 8;
+    flag_mask >>= 8;
   }
-  c = __popc(m & 0xfu);
-  if (n >= c)
+  set_bits_in_low_half = __popc(flag_mask & 0xfu);
+  if (rank >= set_bits_in_low_half)
   {
-    n -= c;
-    pos += 4;
-    m >>= 4;
+    rank -= set_bits_in_low_half;
+    bit_position += 4;
+    flag_mask >>= 4;
   }
-  c = __popc(m & 0x3u);
-  if (n >= c)
+  set_bits_in_low_half = __popc(flag_mask & 0x3u);
+  if (rank >= set_bits_in_low_half)
   {
-    n -= c;
-    pos += 2;
-    m >>= 2;
+    rank -= set_bits_in_low_half;
+    bit_position += 2;
+    flag_mask >>= 2;
   }
-  if (n >= (int) (m & 1u))
+  if (rank >= (int) (flag_mask & 1u))
   {
-    pos += 1;
+    bit_position += 1;
   }
-  return pos;
+  return bit_position;
 }
 
 __device__ __forceinline__ void poll_and_fold(
@@ -795,98 +798,96 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       // Per run: gather its key from the run's head position -> d_unique, and write its length -> d_counts
       // (= next run's head pos - this run's head pos).
       // The warp tile's last run spans into the next warp-tile, so its length is fixed up separately.
-      auto drain =
-        [&](OffT curr_prefix_run_count,
-            int warp_tile_id,
-            int warp_tile_run_base,
-            int warp_tile_run_count,
-            int run_begin,
-            int run_end) {
-          // global run index of this warp-tile's run 0 = tile's exclusive prefix + this warp-tile's base within the
-          // tile
-          const OffT global_run_base = curr_prefix_run_count + warp_tile_run_base;
-          const int warp_tile_offset = warp_tile_id * kWarpTileSize; // this warp-tile's base in the staged arrays
-          if (warp_tile_run_count < RLE_FW_THRESH)
+      auto drain = [&](OffT curr_prefix_run_count,
+                       int warp_tile_id,
+                       int warp_tile_run_base,
+                       int warp_tile_run_count,
+                       int run_begin,
+                       int run_end) {
+        // global run index of this warp-tile's run 0 = tile's exclusive prefix + this warp-tile's base within the
+        // tile
+        const OffT global_run_base = curr_prefix_run_count + warp_tile_run_base;
+        const int warp_tile_offset = warp_tile_id * kWarpTileSize; // this warp-tile's base in the staged arrays
+        if (warp_tile_run_count < RLE_FW_THRESH)
+        {
+          // rank-select decode from staged flag words. All shuffles run warp-uniformly (uniform
+          // trip counts, no shfl inside predicated paths) -- the cnt-shfl lesson.
+          const unsigned my_word = flag_ring[slot_id][warp_tile_id * 32 + lane_id];
+          const int my_pc        = __popc(my_word);
+          int incl               = my_pc;
+#pragma unroll
+          for (int o = 1; o < 32; o <<= 1)
           {
-            // rank-select decode from staged flag words. All shuffles run warp-uniformly (uniform
-            // trip counts, no shfl inside predicated paths) -- the cnt-shfl lesson.
-            const unsigned my_word = flag_ring[slot_id][warp_tile_id * 32 + lane_id];
-            const int my_pc        = __popc(my_word);
-            int incl               = my_pc;
-#pragma unroll
-            for (int o = 1; o < 32; o <<= 1)
+            const int p = __shfl_up_sync(kFullMask, incl, o);
+            if (lane_id >= o)
             {
-              const int p = __shfl_up_sync(kFullMask, incl, o);
-              if (lane_id >= o)
-              {
-                incl += p;
-              }
+              incl += p;
             }
-            const int word_excl = incl - my_pc; // lane w: # of runs before word w
-            // suffix-min of per-word first-head positions: lane w -> first head in words >= w
-            int nxt_min = my_pc ? (lane_id * 32 + __ffs(my_word) - 1) : 0x7fffffff;
-#pragma unroll
-            for (int o = 1; o < 32; o <<= 1)
-            {
-              const int c = __shfl_down_sync(kFullMask, nxt_min, o);
-              nxt_min     = min(nxt_min, (lane_id + o < 32) ? c : 0x7fffffff);
-            }
-            const int niter = (run_end - run_begin + 31) >> 5;
-            for (int it = 0; it < niter; ++it)
-            {
-              const int run_idx = run_begin + it * 32 + lane_id;
-              // largest w with word_excl(w) <= run_idx (word_excl non-decreasing, excl(0)=0)
-              int w = 0;
-#pragma unroll
-              for (int step = 16; step; step >>= 1)
-              {
-                const int cand = w + step;
-                const int e    = __shfl_sync(kFullMask, word_excl, cand & 31);
-                if (cand < 32 && e <= run_idx)
-                {
-                  w = cand;
-                }
-              }
-              const int j           = run_idx - __shfl_sync(kFullMask, word_excl, w);
-              const unsigned mw     = __shfl_sync(kFullMask, my_word, w);
-              const int nxt_after_w = __shfl_sync(kFullMask, nxt_min, (w + 1) & 31);
-              const int pcw         = __popc(mw);
-              const int local_pos   = w * 32 + nth_set_bit(mw, (j < pcw) ? j : 0);
-              const int in_word_nxt = w * 32 + nth_set_bit(mw, (j + 1 < pcw) ? (j + 1) : 0);
-              const int next_local  = (j + 1 < pcw) ? in_word_nxt : nxt_after_w;
-              if (run_idx < run_end)
-              {
-                const int head_pos        = warp_tile_offset + local_pos;
-                const OffT global_run_idx = global_run_base + run_idx;
-                d_unique[global_run_idx]  = tile_keys[head_pos];
-                if (run_idx + 1 < warp_tile_run_count)
-                {
-                  d_counts[global_run_idx] = next_local - local_pos;
-                }
-              }
-            }
-            return;
           }
+          const int word_excl = incl - my_pc; // lane w: # of runs before word w
+          // suffix-min of per-word first-head positions: lane w -> first head in words >= w
+          int nxt_min = my_pc ? (lane_id * 32 + __ffs(my_word) - 1) : 0x7fffffff;
+#pragma unroll
+          for (int o = 1; o < 32; o <<= 1)
+          {
+            const int c = __shfl_down_sync(kFullMask, nxt_min, o);
+            nxt_min     = min(nxt_min, (lane_id + o < 32) ? c : 0x7fffffff);
+          }
+          const int niter = (run_end - run_begin + 31) >> 5;
+          for (int it = 0; it < niter; ++it)
+          {
+            const int run_idx = run_begin + it * 32 + lane_id;
+            // largest w with word_excl(w) <= run_idx (word_excl non-decreasing, excl(0)=0)
+            int w = 0;
+#pragma unroll
+            for (int step = 16; step; step >>= 1)
+            {
+              const int cand = w + step;
+              const int e    = __shfl_sync(kFullMask, word_excl, cand & 31);
+              if (cand < 32 && e <= run_idx)
+              {
+                w = cand;
+              }
+            }
+            const int j           = run_idx - __shfl_sync(kFullMask, word_excl, w);
+            const unsigned mw     = __shfl_sync(kFullMask, my_word, w);
+            const int nxt_after_w = __shfl_sync(kFullMask, nxt_min, (w + 1) & 31);
+            const int pcw         = __popc(mw);
+            const int local_pos   = w * 32 + nth_set_bit(mw, (j < pcw) ? j : 0);
+            const int in_word_nxt = w * 32 + nth_set_bit(mw, (j + 1 < pcw) ? (j + 1) : 0);
+            const int next_local  = (j + 1 < pcw) ? in_word_nxt : nxt_after_w;
+            if (run_idx < run_end)
+            {
+              const int head_pos        = warp_tile_offset + local_pos;
+              const OffT global_run_idx = global_run_base + run_idx;
+              d_unique[global_run_idx]  = tile_keys[head_pos];
+              if (run_idx + 1 < warp_tile_run_count)
+              {
+                d_counts[global_run_idx] = next_local - local_pos;
+              }
+            }
+          }
+          return;
+        }
 #pragma unroll 2
-          for (int run_idx = run_begin + lane_id; run_idx < run_end; run_idx += 32)
-          {
-            const OffT global_run_idx = global_run_base + run_idx;
-            const int head_pos        = (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx)];
-            // PROBE: WARP-LOCAL stride-1 gather address of identical cost (WRONG results); pos loads
-            // unchanged. Warp-local matters: v32's tile-local fake collapsed all store warps onto the
-            // same words and cost -4pt dense by itself. At seg1 this fake == the real pattern exactly
-            // (every element is a head), so the dense delta doubles as the probe's sanity check.
+        for (int run_idx = run_begin + lane_id; run_idx < run_end; run_idx += 32)
+        {
+          const OffT global_run_idx = global_run_base + run_idx;
+          const int head_pos        = (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx)];
+          // PROBE: WARP-LOCAL stride-1 gather address of identical cost (WRONG results); pos loads
+          // unchanged. Warp-local matters: v32's tile-local fake collapsed all store warps onto the
+          // same words and cost -4pt dense by itself. At seg1 this fake == the real pattern exactly
+          // (every element is a head), so the dense delta doubles as the probe's sanity check.
 
-            d_unique[global_run_idx] = tile_keys[head_pos]; // gather the run's key at its head position
-            if (run_idx + 1 < warp_tile_run_count)
-            {
-              // within-warp delta (next head - this head); the last run is fixed separately
-              const int run_length =
-                (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)] - head_pos;
-              d_counts[global_run_idx] = run_length;
-            }
+          d_unique[global_run_idx] = tile_keys[head_pos]; // gather the run's key at its head position
+          if (run_idx + 1 < warp_tile_run_count)
+          {
+            // within-warp delta (next head - this head); the last run is fixed separately
+            const int run_length = (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)] - head_pos;
+            d_counts[global_run_idx] = run_length;
           }
-        };
+        }
+      };
       if constexpr (kNumStoreWarps >= kNumCompWarps)
       {
         // if we have more store warps, each warptile is split between store warps
