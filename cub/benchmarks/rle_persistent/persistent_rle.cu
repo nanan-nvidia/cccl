@@ -135,17 +135,6 @@ __device__ __forceinline__ int swizzle_xor_stride32(int x)
 // CLC = 1 => use shiny new blackwell feature (UGETNEXTWORKID)
 // CLC = 0 => use atomics for work stealing
 // no perf difference observed on blackwell
-// RLE_STATIC_ASSIGN: strided-static tile assignment (tile = blockIdx + gen*gridDim) -- NO work
-// stealing. For grids with ~1 tile/block the steal machinery is pure exit latency: the CLC
-// try_cancel response round-trip sits between the last TMA and the sentinel that lets every warp
-// finish. Meant for the small/mid dispatch instantiations.
-#ifndef RLE_STATIC_ASSIGN
-#  define RLE_STATIC_ASSIGN 0
-#endif
-#ifdef RLE_USE_CLC
-#  undef RLE_USE_CLC
-#endif
-#define RLE_USE_CLC (!RLE_STATIC_ASSIGN) // CLC work-stealing unless statically assigned
 
 constexpr int kWarpTileSize = 32 * kIPT;
 constexpr int kTileSize     = kNumCompWarps * kWarpTileSize;
@@ -398,11 +387,9 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   // first/last heads, tile_seq) is covered by `computed`.
   __shared__ u64 staged_wt[kStages][kNumCompWarps];
 
-#if RLE_USE_CLC
   // try_cancel writes a 16-byte response into clc_resp + completes clc_bar's tx.
   __shared__ __align__(16) uint4 clc_resp;
   __shared__ u64 clc_bar;
-#endif
 
   const int thr_id          = threadIdx.x;
   const int warp_id         = thr_id >> 5;
@@ -428,9 +415,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       ptx::mbarrier_init(&pos_free[p], kNumStoreWarps);
     }
 
-#if RLE_USE_CLC
     ptx::mbarrier_init(&clc_bar, 1); // 1 arrival
-#endif
   }
   // normal smem writes (e.g. mbarrier_init) go through the generic proxy
   // the TMA operations access shared memory through the async proxy. these are separate visibility domains,
@@ -441,7 +426,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   // if you are load
   if (warp_id == 0)
   {
-#if RLE_USE_CLC
     // CLC tile assignment: gen0 tile = this CTA's launch id (blockIdx.x)
     int tile_id = blk_id;
     if (lane_id == 0)
@@ -450,7 +434,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &clc_bar, 16);
       ptx::clusterlaunchcontrol_try_cancel(&clc_resp, &clc_bar);
     }
-#endif
     for (int gen = 0;; ++gen)
     {
       const int slot_id  = gen % kStages; // which slot is this?
@@ -462,10 +445,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         {
         }
       }
-#if RLE_STATIC_ASSIGN
-      // static strided assignment: zero steal machinery, sentinel arrives with no round trip
-      const int tile_id = blk_id + gen * (int) gridDim.x;
-#endif
       if (lane_id == 0)
       {
         tile_seq[slot_id] = tile_id;
@@ -515,7 +494,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         }
       }
       __syncwarp();
-#if RLE_USE_CLC
       // consume the prefetched cancel
       // this is ok since it should be fast to get next cancelled id
       if (lane_id == 0)
@@ -536,7 +514,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         tile_id = nxt;
       }
       tile_id = __shfl_sync(kFullMask, tile_id, 0);
-#endif
     }
   }
   // if you are compute
