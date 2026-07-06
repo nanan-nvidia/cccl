@@ -16,7 +16,7 @@ using LenT     = rle_impl::LenT;
 using NumRunsT = rle_impl::NumRunsT;
 using OffT     = rle_impl::OffT;
 using u64      = rle_impl::u64;
-using StateT   = rle_impl::StateT;
+using TilePartialStateT   = rle_impl::TilePartialStateT;
 
 constexpr int kTileSize = rle_impl::kTileSize;
 
@@ -32,7 +32,7 @@ inline long long rle_state_tiles(long long n)
 #endif
 
 // ---- temp-storage protocol -------------------------------------------------------------------
-// persistent path: [ header: u64 magic | u32 launch_gen | u32 rsvd ][ StateT tile states ... ]
+// persistent path: [ header: u64 magic | u32 launch_gen | u32 rsvd ][ TilePartialStateT tile states ... ]
 // The init kernel bumps the generation when the header matches (allocate-once-call-many pays a
 // tiny kernel, cheaper than stock CUB per-call state init) and clears states exactly once
 // otherwise -- including after the same allocation was used by the stock path (magic mismatch).
@@ -49,7 +49,7 @@ inline constexpr unsigned long long kRleTempMagic = 0x524c455f54454d50ull; // "R
 // block grid cannot read the header while block 0 rewrites it without a race. One block stages the
 // decision through smem and __syncthreads. Clears are rare (once per allocation) and small
 // (8B/tile), so one SM suffices.
-__global__ void rle_init_states(RleTempHeader* hdr, StateT* states, long long n_states)
+__global__ void rle_init_states(RleTempHeader* hdr, TilePartialStateT* states, long long n_states)
 {
   __shared__ unsigned s_gen;
   __shared__ bool s_clear;
@@ -90,7 +90,7 @@ inline cudaError_t persistent_rle_encode(
   // size query must cover BOTH paths (the same allocation may serve either across calls)
   size_t cub_bytes = 0;
   cub::DeviceRunLengthEncode::Encode(nullptr, cub_bytes, d_keys, d_unique, d_counts, d_num_runs, num_items, stream);
-  const size_t pers_bytes = sizeof(RleTempHeader) + (size_t) rle_state_tiles((long long) num_items) * sizeof(StateT);
+  const size_t pers_bytes = sizeof(RleTempHeader) + (size_t) rle_state_tiles((long long) num_items) * sizeof(TilePartialStateT);
   const size_t required   = std::max(cub_bytes, pers_bytes);
   if (d_temp_storage == nullptr)
   {
@@ -108,7 +108,7 @@ inline cudaError_t persistent_rle_encode(
       d_temp_storage, temp_storage_bytes, d_keys, d_unique, d_counts, d_num_runs, num_items, stream);
   }
   auto* hdr      = (RleTempHeader*) d_temp_storage;
-  StateT* states = (StateT*) (hdr + 1);
+  TilePartialStateT* states = (TilePartialStateT*) (hdr + 1);
   rle_init_states<<<1, 256, 0, stream>>>(hdr, states, tiles);
   rle_impl::persistent_rle_launch(
     d_keys, d_unique, d_counts, d_num_runs, states, &hdr->launch_gen, num_items, (int) tiles, stream);

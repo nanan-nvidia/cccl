@@ -119,9 +119,8 @@ __device__ __forceinline__ int swizzle_xor_stride32(int x)
 }
 
 // CLC = 1 => use shiny new blackwell feature (UGETNEXTWORKID)
-// CLC = 0 => use atomics for work stealing
-// no perf difference observed on blackwell
-// the atomics path is temporarily removed since I want to focus on blackwell perf first
+// CLC = 0 => use atomics for work stealing. no perf difference observed on blackwell
+// The CLC knob removed since I want to focus on blackwell perf first
 // i.e. we fry one fish at a time :)
 
 constexpr int kWarpTileSize = 32 * kIPT;
@@ -135,10 +134,11 @@ constexpr int store_warp_id      = poll_warp_id + 1;
 constexpr int bookkeeper_warp_id = store_warp_id + kNumStoreWarps;
 
 // for each input tile, we need to store the keys and in-tile positions
-// for in tile position we can just do U16 since tile size is never bigger than 2^16.
-// each key slot carries kSlotPad extra leading elements: the TMA over-fetches one 16B chunk to
-// the left, so slot[0..kSlotPad-1] hold the previous tile's last keys and element 0's predecessor
-// is slot[kSlotPad-1] -- no separate (blocking) LDG of the previous tile's last key needed.
+// for in tile position we can just do unsigned int16 since tile size is never bigger than 2^16
+// each key slot carries kSlotPad extra leading elements
+// we overcopy one 16B chunk to the left, this does two things at once:
+// 1. no need for aligned address
+// 2. we get the last tiles boundary element
 constexpr int kSlotPad    = 16 / sizeof(KeyT); // elements; 16 bytes = cp_async_bulk quantum
 constexpr int kSlotStride = kTileSize + kSlotPad;
 constexpr size_t kDynSmem =
@@ -151,35 +151,35 @@ constexpr size_t kDynSmem =
 // (A/B 2026-07-06: a 32-bit [tag:4|open:14|count:14] layout measured DEAD -- dense -7pts, and the
 // uint4 poll walk over it -13pts long; see git 353b6ad for the arms. The word stays 64-bit.)
 // The aligned 64-bit access is a single non-tearing word; atomic_ref makes the semantics explicit.
-using StateT = u64;
+using TilePartialStateT = u64;
 
-__device__ __forceinline__ unsigned state_word_tag(StateT w)
+__device__ __forceinline__ unsigned state_word_tag(TilePartialStateT w)
 {
   return (unsigned) (w >> 32);
 }
 
-__device__ __forceinline__ int state_word_count(StateT w)
+__device__ __forceinline__ int state_word_count(TilePartialStateT w)
 {
   return (int) (w & 0xffffu);
 }
 
-__device__ __forceinline__ int state_word_open(StateT w)
+__device__ __forceinline__ int state_word_open(TilePartialStateT w)
 {
   return (int) ((w >> 16) & 0xffffu);
 }
 
 __device__ __forceinline__ void
-publish_state(StateT* tile_state_arr, int tile_idx, unsigned launch_gen, int run_count, int open_len)
+publish_state(TilePartialStateT* tile_state_arr, int tile_idx, unsigned launch_gen, int run_count, int open_len)
 {
-  StateT w = ((u64) launch_gen << 32) | ((u64) (unsigned) open_len << 16) | (u64) (unsigned) run_count;
-  cuda::atomic_ref<StateT, cuda::thread_scope_device> a(tile_state_arr[tile_idx]);
+  TilePartialStateT w = ((u64) launch_gen << 32) | ((u64) (unsigned) open_len << 16) | (u64) (unsigned) run_count;
+  cuda::atomic_ref<TilePartialStateT, cuda::thread_scope_device> a(tile_state_arr[tile_idx]);
   a.store(w, cuda::memory_order_relaxed);
 }
 
 // non-blocking single load of the raw packed word (tag may not match yet)
-__device__ __forceinline__ StateT load_state(StateT* tile_state_arr, int tile_idx)
+__device__ __forceinline__ TilePartialStateT load_state(TilePartialStateT* tile_state_arr, int tile_idx)
 {
-  cuda::atomic_ref<StateT, cuda::thread_scope_device> a(tile_state_arr[tile_idx]);
+  cuda::atomic_ref<TilePartialStateT, cuda::thread_scope_device> a(tile_state_arr[tile_idx]);
   return a.load(cuda::memory_order_relaxed);
 }
 
@@ -268,7 +268,7 @@ __device__ __forceinline__ int nth_set_bit(unsigned m, int n)
 }
 
 __device__ __forceinline__ void poll_and_fold(
-  StateT* tile_partial_states,
+  TilePartialStateT* tile_partial_states,
   unsigned launch_gen,
   int tile_id,
   int& last_seen_tile_id,
@@ -293,7 +293,7 @@ __device__ __forceinline__ void poll_and_fold(
     // published words are immutable within a launch, so RE-load only the still-missing ones: while the
     // warp spins on a frontier straggler, the (up to 127) already-valid states must NOT be re-fetched
     // from L2 every spin iteration.
-    StateT packed_words[kPollMlp] = {}; // tag 0 never matches (launch tags >= 1) => starts "missing"
+    TilePartialStateT packed_words[kPollMlp] = {}; // tag 0 never matches (launch tags >= 1) => starts "missing"
     bool ready;
     do
     {
@@ -353,7 +353,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   KeyT* __restrict__ d_unique,
   LenT* __restrict__ d_counts,
   NumRunsT* __restrict__ d_num_runs,
-  StateT* __restrict__ tile_partial_states,
+  TilePartialStateT* __restrict__ tile_partial_states,
   const unsigned* __restrict__ d_launch_gen, // device-side call generation (graph-safe, no host state)
   OffT num_items,
   int num_tiles)
@@ -1140,7 +1140,7 @@ inline void persistent_rle_launch(
   KeyT* d_unique,
   LenT* d_counts,
   NumRunsT* d_num_runs,
-  StateT* tile_state,
+  TilePartialStateT* tile_state,
   const unsigned* d_launch_gen,
   OffT num_items,
   int num_tiles,
