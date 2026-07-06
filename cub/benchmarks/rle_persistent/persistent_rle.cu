@@ -234,8 +234,9 @@ __device__ __forceinline__ OffT prefix_open_len(P p)
 // position of the rank-th (0-indexed) set bit of flag_mask; branchless popc bisect.
 // Requires popc(flag_mask) > rank.
 // (__fns(flag_mask, 0, rank+1) computes the same thing but has NO hardware op on sm_100a: the
-// emulation is a branching loop, +272 SASS instructions / +17 BRA across the inlined drain
-// copies vs this branchless 15-op sequence -- checked 2026-07-06, keep the bisect.)
+// emulation is a branching loop, +272 SASS / +17 BRA across the inlined drain copies. MEASURED
+// on B200 i32^3 2^28: -7.6 BWUtil pts at seg64, -1.7/-2.0 at seg128/256, flat off the flag-word
+// path -- A/B 2026-07-06, keep the bisect.)
 __device__ __forceinline__ int nth_set_bit(unsigned flag_mask, int rank)
 {
   // each step: if the wanted bit is not among the low half's set bits, skip that half entirely
