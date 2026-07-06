@@ -33,11 +33,8 @@
 #ifndef RLE_MID_IPT
 #  define RLE_MID_IPT 32 // mid tile = kNumCompWarps * 32 * this
 #endif
-#ifndef RLE_MID_STATIC
-#  define RLE_MID_STATIC 1
-#endif
 #undef RLE_STATIC_ASSIGN
-#define RLE_STATIC_ASSIGN RLE_MID_STATIC
+#define RLE_STATIC_ASSIGN 1 // ~1 tile/block band: steal machinery is pure exit latency
 #define K_IPT             RLE_MID_IPT
 #define K_STAGES          RLE_MID_STAGES
 #define K_POS_STAGES      RLE_MID_STAGES
@@ -123,7 +120,6 @@ inline void persistent_rle_dispatch_launch(
   NumRunsT* d_num_runs,
   u64* d_tile_states,
   const unsigned* d_launch_gen,
-  int* d_tile_counter,
   OffT num_items,
   cudaStream_t stream)
 {
@@ -132,27 +128,18 @@ inline void persistent_rle_dispatch_launch(
   {
     const int small_tiles = (int) ((num_items + rle_small::kTileSize - 1) / rle_small::kTileSize);
     rle_small::persistent_rle_launch(
-      d_keys,
-      d_unique,
-      d_counts,
-      d_num_runs,
-      d_tile_states,
-      d_launch_gen,
-      d_tile_counter,
-      num_items,
-      small_tiles,
-      stream);
+      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_launch_gen, num_items, small_tiles, stream);
   }
   else if (big_tiles < RLE_DISPATCH_MID_TILES)
   {
     const int mid_tiles = (int) ((num_items + rle_mid::kTileSize - 1) / rle_mid::kTileSize);
     rle_mid::persistent_rle_launch(
-      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_launch_gen, d_tile_counter, num_items, mid_tiles, stream);
+      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_launch_gen, num_items, mid_tiles, stream);
   }
   else
   {
     rle_big::persistent_rle_launch(
-      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_launch_gen, d_tile_counter, num_items, big_tiles, stream);
+      d_keys, d_unique, d_counts, d_num_runs, d_tile_states, d_launch_gen, num_items, big_tiles, stream);
   }
 }
 
@@ -182,7 +169,6 @@ inline cudaError_t persistent_rle_encode(
   u64* states              = (u64*) (hdr + 1);
   const long long n_states = rle_state_tiles((long long) num_items);
   rle_init_states<<<128, 256, 0, stream>>>(hdr, states, n_states);
-  persistent_rle_dispatch_launch(
-    d_keys, d_unique, d_counts, d_num_runs, states, &hdr->gen, /*d_tile_counter=*/nullptr, num_items, stream);
+  persistent_rle_dispatch_launch(d_keys, d_unique, d_counts, d_num_runs, states, &hdr->gen, num_items, stream);
   return cudaGetLastError();
 }

@@ -101,16 +101,12 @@ constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in f
 #  define RLE_POLL_ORACLE 0 // 1 = WRONG RESULTS: free-prefix ceiling probe (skips the poll fold)
 #endif
 
-// RLE_FLAGWORD: adaptive staging. Warp-tiles with run count < RLE_FW_THRESH stage their 32 raw
 // head-flag words (one conflict-free STS.32 per lane; no scan, no peel, no pos-ring use) and the
 // drain rank-selects head positions from them (5-shfl binary search + branchless nth-set-bit, pure
 // registers, no LDS in the run loop). Dense warp-tiles keep the champion peel+positions path:
 // decode cost scales with runs, the staging saving doesn't. Both sides derive the SAME predicate
 // from the staged warp run count, so no mode flag is exchanged. Collects the measured peel-write
 // conflict prize (v33: +0.4..+1.3 at seg4-16) and deletes staging work + pos_free coupling at mid.
-#ifndef RLE_FLAGWORD
-#  define RLE_FLAGWORD 1 // champion since v35: strictly >= s5p3 at all 11 regimes
-#endif
 #ifndef RLE_FW_THRESH
 #  define RLE_FW_THRESH 48 // decode crossover ~32-64 runs/warp-tile; 64/96 regress seg32
 #endif
@@ -121,11 +117,11 @@ constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in f
 // downstream orders on it. Early `empty` breaks the old "poll never overwrites a live
 // prefix_packed" ordering proof; prefix_packed is double-buffered by slot-cycle parity instead
 // (program order proves safety). 0 = off. Buffer = RLE_REGBUF/32 int pairs per lane (registers).
-#ifndef RLE_REGBUF
-#  define RLE_REGBUF 256 // champion since v40: +0.8..+2.0 across seg8-256 for -0.3 dense/1M
-#endif
 // buffered drain only pays when the drain is long enough for early slot-release to matter;
 // near-empty warp-tiles (long segs) stay classic to avoid pure reshape overhead
+#ifndef RLE_REGBUF
+#  define RLE_REGBUF 256 // register-buffer cap (runs/warp-tile), champion since v40
+#endif
 #ifndef RLE_RB_MIN
 #  define RLE_RB_MIN 8
 #endif
@@ -149,10 +145,7 @@ __device__ __forceinline__ int swizzle_xor_stride32(int x)
 #ifdef RLE_USE_CLC
 #  undef RLE_USE_CLC
 #endif
-#define RLE_USE_CLC (USE_CLC && !RLE_STATIC_ASSIGN)
-#ifndef USE_CLC
-#  define USE_CLC 1
-#endif
+#define RLE_USE_CLC (!RLE_STATIC_ASSIGN) // CLC work-stealing unless statically assigned
 
 constexpr int kWarpTileSize = 32 * kIPT;
 constexpr int kTileSize     = kNumCompWarps * kWarpTileSize;
@@ -365,9 +358,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   LenT* __restrict__ d_counts,
   NumRunsT* __restrict__ d_num_runs,
   u64* __restrict__ tile_partial_states,
-#if !RLE_USE_CLC && !RLE_STATIC_ASSIGN
-  int* __restrict__ global_tile_counter, // global work steal counter when there is no CLC
-#endif
   const unsigned* __restrict__ d_launch_gen, // device-side call generation (graph-safe, no host state)
   OffT num_items,
   int num_tiles)
@@ -379,9 +369,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   short* const staged_pos = (short*) (tile_buf + (size_t) kStages * kSlotStride);
   __shared__ int tile_seq[kStages]; // which global tile each ring slot holds (LOAD gets it with try_cancel)
   __shared__ int warp_run_counts[kStages][kNumCompWarps]; // per compute warp run counts
-#if RLE_FLAGWORD
   __shared__ unsigned flag_ring[kStages][kNumCompWarps * 32]; // staged head-flag words (fw path)
-#endif
   __shared__ int warp_first_heads[kStages][kNumCompWarps]; // per compute warp first head idx (-1 if none)
   __shared__ int warp_last_heads[kStages][kNumCompWarps]; // per compute warp last head idx (-1 if none)
   // POLL -> STORE handoff: [open_len_prefix:32][run_count_prefix:32] packed, one access per side
@@ -390,7 +378,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   // store warp reads gen g's half before its gen g+kStages empty-arrive, which gates the load
   // that gates poll's next write to that half). No consumed-barrier -- v38's pfx_free put the
   // store wake-up latency inside the POLL's serial loop and cost -2..-5pt at seg128+.
-  __shared__ PrefixT prefix_packed[kStages][RLE_REGBUF ? 2 : 1];
+  __shared__ PrefixT prefix_packed[kStages][2];
   // STORE --pos_free--> COMPUTE staging (only when kPosStages < kStages): all store warps arrive
   // after their drain finished READING a pos slot; compute waits before re-staging into it
   __shared__ u64 pos_free[kPosStages];
@@ -477,14 +465,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
 #if RLE_STATIC_ASSIGN
       // static strided assignment: zero steal machinery, sentinel arrives with no round trip
       const int tile_id = blk_id + gen * (int) gridDim.x;
-#elif !RLE_USE_CLC
-      // work-steal: grab the next global tile via the atomic counter (one tile per atomic)
-      int tile_id = 0;
-      if (lane_id == 0)
-      {
-        tile_id = atomicAdd(global_tile_counter, 1);
-      }
-      tile_id = __shfl_sync(kFullMask, tile_id, 0);
 #endif
       if (lane_id == 0)
       {
@@ -666,14 +646,12 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         }
       }
       // now we start to calculate head positions
-#if RLE_FLAGWORD
       const bool stage_flags = (local_run_count < RLE_FW_THRESH);
       if (stage_flags)
       {
         flag_ring[slot_id][compute_warp_id * 32 + lane_id] = my_flags;
       }
       else
-#endif
       {
         if constexpr (kPosStages < kStages)
         {
@@ -784,8 +762,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       // already passed `full` above -- so a drain-wait here could provably never spin.
       if (lane_id == 0)
       {
-        prefix_packed[slot_id][RLE_REGBUF ? (slot_gen & 1) : 0] =
-          pack_prefix(curr_prefix_run_count, curr_prefix_open_length);
+        prefix_packed[slot_id][slot_gen & 1] = pack_prefix(curr_prefix_run_count, curr_prefix_open_length);
         ptx::mbarrier_arrive(&prefixed[slot_id]); // prefix ready, store may proceed! (2/2)
       }
     }
@@ -840,7 +817,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         while (!ptx::mbarrier_try_wait_parity(&prefixed[slot_id], (unsigned) ((gen / kStages) & 1)))
         {
         }
-        return prefix_cnt(prefix_packed[slot_id][RLE_REGBUF ? ((gen / kStages) & 1) : 0]);
+        return prefix_cnt(prefix_packed[slot_id][(gen / kStages) & 1]);
       };
       // Drain runs [run_begin, run_end) of warp-tile `warp_tile_id`'s staged output into the global arrays.
       // Per run: gather its key from the run's head position -> d_unique, and write its length -> d_counts
@@ -857,7 +834,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           // tile
           const OffT global_run_base = curr_prefix_run_count + warp_tile_run_base;
           const int warp_tile_offset = warp_tile_id * kWarpTileSize; // this warp-tile's base in the staged arrays
-#if RLE_FLAGWORD
           if (warp_tile_run_count < RLE_FW_THRESH)
           {
             // rank-select decode from staged flag words. All shuffles run warp-uniformly (uniform
@@ -865,7 +841,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             const unsigned my_word = flag_ring[slot_id][warp_tile_id * 32 + lane_id];
             const int my_pc        = __popc(my_word);
             int incl               = my_pc;
-#  pragma unroll
+#pragma unroll
             for (int o = 1; o < 32; o <<= 1)
             {
               const int p = __shfl_up_sync(kFullMask, incl, o);
@@ -877,7 +853,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             const int word_excl = incl - my_pc; // lane w: # of runs before word w
             // suffix-min of per-word first-head positions: lane w -> first head in words >= w
             int nxt_min = my_pc ? (lane_id * 32 + __ffs(my_word) - 1) : 0x7fffffff;
-#  pragma unroll
+#pragma unroll
             for (int o = 1; o < 32; o <<= 1)
             {
               const int c = __shfl_down_sync(kFullMask, nxt_min, o);
@@ -889,7 +865,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               const int run_idx = run_begin + it * 32 + lane_id;
               // largest w with word_excl(w) <= run_idx (word_excl non-decreasing, excl(0)=0)
               int w = 0;
-#  pragma unroll
+#pragma unroll
               for (int step = 16; step; step >>= 1)
               {
                 const int cand = w + step;
@@ -919,7 +895,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             }
             return;
           }
-#endif
 #pragma unroll 2
           for (int run_idx = run_begin + lane_id; run_idx < run_end; run_idx += 32)
           {
@@ -947,7 +922,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         const int sub                        = store_warp_idx % kStoreWarpsPerWarpTile;
         const int warp_tile_run_count        = __shfl_sync(kFullMask, wt_count_ln, warp_tile_id);
         const int warp_tile_run_base         = __shfl_sync(kFullMask, wt_base_ln, warp_tile_id);
-#if RLE_REGBUF
         if (warp_tile_run_count >= RLE_RB_MIN
             && warp_tile_run_count <= ((sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64)))
         {
@@ -964,14 +938,13 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           int buf_cnt[kBufPerLane];
           const int warp_tile_offset = warp_tile_id * kWarpTileSize;
           const int niter            = (run_end - run_begin + 31) >> 5;
-#  if RLE_FLAGWORD
           if (warp_tile_run_count < RLE_FW_THRESH)
           {
             // rank-select decode (same as the classic fw path, but into registers)
             const unsigned my_word = flag_ring[slot_id][warp_tile_id * 32 + lane_id];
             const int my_pc        = __popc(my_word);
             int incl               = my_pc;
-#    pragma unroll
+#pragma unroll
             for (int o = 1; o < 32; o <<= 1)
             {
               const int p = __shfl_up_sync(kFullMask, incl, o);
@@ -982,13 +955,13 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             }
             const int word_excl = incl - my_pc;
             int nxt_min         = my_pc ? (lane_id * 32 + __ffs(my_word) - 1) : 0x7fffffff;
-#    pragma unroll
+#pragma unroll
             for (int o = 1; o < 32; o <<= 1)
             {
               const int c = __shfl_down_sync(kFullMask, nxt_min, o);
               nxt_min     = min(nxt_min, (lane_id + o < 32) ? c : 0x7fffffff);
             }
-#    pragma unroll
+#pragma unroll
             for (int it = 0; it < kBufPerLane; ++it)
             {
               if (it >= niter)
@@ -997,7 +970,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               }
               const int run_idx = run_begin + it * 32 + lane_id;
               int w             = 0;
-#    pragma unroll
+#pragma unroll
               for (int step = 16; step; step >>= 1)
               {
                 const int cand = w + step;
@@ -1022,9 +995,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             }
           }
           else
-#  endif
           {
-#  pragma unroll
+#pragma unroll
             for (int it = 0; it < kBufPerLane; ++it)
             {
               if (it >= niter)
@@ -1050,7 +1022,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             ptx::mbarrier_arrive(&empty[slot_id]); // key reads done too: outputs live in registers
           }
           const OffT global_run_base = wait_prefixed_and_read() + warp_tile_run_base;
-#  pragma unroll
+#pragma unroll
           for (int it = 0; it < kBufPerLane; ++it)
           {
             if (it >= niter)
@@ -1070,7 +1042,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           }
           continue; // pos_free/empty already arrived for this gen
         }
-#endif
         // classic path -- champion order: prefixed wait, then staged_wt, then drain
         const OffT curr_prefix_run_count = wait_prefixed_and_read();
         // wait for staged_wt (3/3): only THIS warp-tile's positions -- not the other 7 compute warps
@@ -1150,7 +1121,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       while (!ptx::mbarrier_try_wait_parity(&prefixed[slot_id], (unsigned) ((gen / kStages) & 1)))
       {
       }
-      const PrefixT packed_prefix        = prefix_packed[slot_id][RLE_REGBUF ? ((gen / kStages) & 1) : 0];
+      const PrefixT packed_prefix        = prefix_packed[slot_id][(gen / kStages) & 1];
       const OffT curr_prefix_run_count   = prefix_cnt(packed_prefix);
       const OffT curr_prefix_open_length = prefix_open(packed_prefix);
       // per-warp-tile boundary: a warp-tile's last run is closed by the next nonempty warp-tile's
@@ -1204,7 +1175,6 @@ inline void persistent_rle_launch(
   NumRunsT* d_num_runs,
   u64* tile_state,
   const unsigned* d_launch_gen,
-  [[maybe_unused]] int* global_tile_counter,
   OffT num_items,
   int num_tiles,
   cudaStream_t stream)
@@ -1219,26 +1189,9 @@ inline void persistent_rle_launch(
   // no per-launch clear of tile_state: states are generation-tagged (see publish_state) and the
   // generation lives in DEVICE memory (see the init kernel in rle_dispatch.cuh) -- no host-side
   // state, so calls are CUDA-graph-capturable and thread-safe per temp-storage allocation.
-#if RLE_USE_CLC || RLE_STATIC_ASSIGN
   const int blocks = num_tiles;
-#else
-  cudaMemsetAsync(global_tile_counter, 0, sizeof(int), stream); // reset the work-steal counter
-  int numSM = 0;
-  cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0);
-  const int blocks = std::min(2 * numSM, num_tiles); // persistent work-steal grid
-#endif
 
   persistent_rle<<<blocks, kNumThreads, kDynSmem, stream>>>(
-    d_keys,
-    d_unique,
-    d_counts,
-    d_num_runs,
-    tile_state,
-#if !RLE_USE_CLC && !RLE_STATIC_ASSIGN
-    global_tile_counter,
-#endif
-    d_launch_gen,
-    num_items,
-    num_tiles);
+    d_keys, d_unique, d_counts, d_num_runs, tile_state, d_launch_gen, num_items, num_tiles);
 }
 } // namespace RLE_NS
