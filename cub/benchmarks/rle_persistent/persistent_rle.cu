@@ -873,8 +873,9 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             if (run_idx + 1 < warp_tile_run_count)
             {
               // within-warp delta (next head - this head); the last run is fixed separately
-              const int run_len = (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)] - head_pos;
-              d_counts[global_run_idx] = run_len;
+              const int run_length =
+                (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)] - head_pos;
+              d_counts[global_run_idx] = run_length;
             }
           }
         };
