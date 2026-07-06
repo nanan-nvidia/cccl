@@ -178,35 +178,33 @@ publish_state(TilePartialStateT* tile_state_arr, int tile_idx, unsigned launch_g
   a.store(w, cuda::memory_order_relaxed);
 }
 
-// non-blocking single load of the raw packed word (tag may not match yet)
+// return the state (even if not yet publish for this launch, caller checks it)
+// we do not want to spin here
 __device__ __forceinline__ TilePartialStateT load_state(TilePartialStateT* tile_state_arr, int tile_idx)
 {
   cuda::atomic_ref<TilePartialStateT, cuda::thread_scope_device> a(tile_state_arr[tile_idx]);
   return a.load(cuda::memory_order_relaxed);
 }
 
-// Computes the exclusive prefix of the tile_id, i.e. the aggregate over tiles [0, tile_id)
-// we do this by keeping the prefixes of the last generation and poll the partial states in
-// [last_seen_tile_id, tile_id) and fold it with the aggregate we held
-// folded-prefix carrier: packed u64 [open:32|count:32] for 4B offsets (bit-identical to the
-// tuned champion), a 16B pair for wide offsets. Written by POLL lane 0, read after the prefixed
-// mbarrier (acquire), so the two 8B halves of the wide form need no extra ordering.
+// what is going to be the type of the prefix (run_count, open_len)?
 using PrefixT = cuda::std::conditional_t<(sizeof(OffT) > 4), ulonglong2, u64>;
-// templates so `if constexpr` genuinely discards the other representation's branch
+
+// how do we pack them? if P is 32 bit, we compact them into 1 word. Otherwise, 2 words!
 template <class P = PrefixT>
-__device__ __forceinline__ P pack_prefix(OffT cnt, OffT open)
+__device__ __forceinline__ P pack_prefix(OffT run_count, OffT open_len)
 {
   if constexpr (sizeof(OffT) > 4)
   {
-    return P{(u64) cnt, (u64) open};
+    return P{(u64) run_count, (u64) open_len};
   }
   else
   {
-    return ((u64) (unsigned) open << 32) | (unsigned) cnt;
+    return ((u64) (unsigned) open_len << 32) | (unsigned) run_count;
   }
 }
+
 template <class P>
-__device__ __forceinline__ OffT prefix_cnt(P p)
+__device__ __forceinline__ OffT prefix_run_count(P p)
 {
   if constexpr (sizeof(OffT) > 4)
   {
@@ -218,7 +216,7 @@ __device__ __forceinline__ OffT prefix_cnt(P p)
   }
 }
 template <class P>
-__device__ __forceinline__ OffT prefix_open(P p)
+__device__ __forceinline__ OffT prefix_open_len(P p)
 {
   if constexpr (sizeof(OffT) > 4)
   {
@@ -783,7 +781,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         while (!ptx::mbarrier_try_wait_parity(&prefixed[slot_id], (unsigned) ((pipeline_gen / kStages) & 1)))
         {
         }
-        return prefix_cnt(prefix_packed[slot_id][(pipeline_gen / kStages) & 1]);
+        return prefix_run_count(prefix_packed[slot_id][(pipeline_gen / kStages) & 1]);
       };
       // Drain runs [run_begin, run_end) of warp-tile `warp_tile_id`'s staged output into the global arrays.
       // Per run: gather its key from the run's head position -> d_unique, and write its length -> d_counts
@@ -875,8 +873,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             if (run_idx + 1 < warp_tile_run_count)
             {
               // within-warp delta (next head - this head); the last run is fixed separately
-              const int cnt = (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)] - head_pos;
-              d_counts[global_run_idx] = cnt;
+              const int run_len = (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)] - head_pos;
+              d_counts[global_run_idx] = run_len;
             }
           }
         };
@@ -1091,8 +1089,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       {
       }
       const PrefixT packed_prefix        = prefix_packed[slot_id][(pipeline_gen / kStages) & 1];
-      const OffT curr_prefix_run_count   = prefix_cnt(packed_prefix);
-      const OffT curr_prefix_open_length = prefix_open(packed_prefix);
+      const OffT curr_prefix_run_count   = prefix_run_count(packed_prefix);
+      const OffT curr_prefix_open_length = prefix_open_len(packed_prefix);
       // per-warp-tile boundary: a warp-tile's last run is closed by the next nonempty warp-tile's
       // first head. lane L handles warp-tile L.
       if (lane_id < kNumCompWarps && wt_count_ln > 0)
