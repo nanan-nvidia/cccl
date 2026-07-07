@@ -751,8 +751,12 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       // store warps and compute warps are decoupled
       // storeW>=cw -> multiple store warps split one compute warp's runs;
       // storeW<cw -> each store warp drains cw/storeW whole regions. One must divide the other.
-      static_assert(kNumStoreWarps % kNumCompWarps == 0 || kNumCompWarps % kNumStoreWarps == 0,
-                    "They must divide (either direction)");
+      // fewer store warps than compute warps has no winning regime: store warps are gather/STG
+      // MLP and warp slots are not scarce at 1 block/SM -- the old walk-multiple-warp-tiles
+      // branch was never part of any champion (deleted 2026-07-06, recover from git if a
+      // 2-blocks/SM world ever makes warps scarce).
+      static_assert(kNumStoreWarps >= kNumCompWarps && kNumStoreWarps % kNumCompWarps == 0,
+                    "store warps: a whole multiple of compute warps");
       // per-warp-tile run bases (lane i owns warp-tile i's count/base) and done BEFORE the wait on prefixed so they
       // overlap
       const int lane_warp_tile_run_count = (lane_id < kNumCompWarps) ? warp_run_counts[slot_id][lane_id] : 0;
@@ -822,36 +826,50 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             lane_first_head_from_word =
               min(lane_first_head_from_word, (lane_id + offset < 32) ? shuffled_first_head : 0x7fffffff);
           }
+          // now, lane i holds the next head in [i, 32). we precalculate this in parallel
           // the warp process 32 runs per round ceil((run_end-run_begin)/32)
+          // now each lane is assigned RUNs
           const int num_rounds = (run_end - run_begin + 31) >> 5;
           for (int it = 0; it < num_rounds; ++it)
           {
             const int run_idx = run_begin + it * 32 + lane_id;
-            // largest flag_word_idx with runs_before <= run_idx (runs_before is non-decreasing, runs_before(0) = 0)
+            // first question: which head_flag word contains my run's (run_idx) head?
+            // lane_runs_before_word's row i = number of heads in words [0, i)
+            // the word containing run_dex is then the largest i with runs_before(i) that is <= j
+            // we do binary search over the distributed lane_runs_before_word table held across the warp
             int flag_word_idx = 0;
 #pragma unroll
             for (int step = 16; step; step >>= 1)
             {
-              const int candidate_word_idx    = flag_word_idx + step;
+              // propose candidate
+              const int candidate_word_idx = flag_word_idx + step;
+              // read the i'th row
               const int candidate_runs_before = __shfl_sync(kFullMask, lane_runs_before_word, candidate_word_idx & 31);
               if (candidate_word_idx < 32 && candidate_runs_before <= run_idx)
               {
                 flag_word_idx = candidate_word_idx;
               }
             }
+            // the lane knows the index of the word containing its head
+            // now we need to convert it to the element position
+            // where is my head in the word?
             const int run_rank_in_word = run_idx - __shfl_sync(kFullMask, lane_runs_before_word, flag_word_idx);
-            const unsigned flag_word   = __shfl_sync(kFullMask, lane_head_flag_word, flag_word_idx);
+            // get the actual word
+            const unsigned flag_word = __shfl_sync(kFullMask, lane_head_flag_word, flag_word_idx);
+            // where's the first head in any word after mine?
             const int first_head_after_word =
               __shfl_sync(kFullMask, lane_first_head_from_word, (flag_word_idx + 1) & 31);
+            // how many heads my word has?
             const int flag_word_run_count = __popc(flag_word);
+            // position of my head inside the word
             const int head_bit_in_word =
               nth_set_bit(flag_word, (run_rank_in_word < flag_word_run_count) ? run_rank_in_word : 0);
             const int head_pos_in_warp_tile = flag_word_idx * 32 + head_bit_in_word;
-            // rank run_rank_in_word+1's bit = next set bit above rank run_rank_in_word's bit -- no second rank query
-            // (measured B200 2026-07-06: +1.3 BWUtil pts seg64, +0.9/+0.7 seg128/256, flat elsewhere). ~1u <<
-            // head_bit_in_word masks bits <= head_bit_in_word (well-defined for head_bit_in_word 0..31);
-            // run_rank_in_word+1 < flag_word_run_count guarantees a higher bit exists whenever the value is consumed.
+            // where does my run end?
+            // try find the position of next head in word
             const int next_head_in_word = flag_word_idx * 32 + __ffs(flag_word & (~1u << head_bit_in_word)) - 1;
+            // does my word contain a head after mine? if not, next_head_in_word is garbage, and we use
+            // first_head_after_word
             const int next_head_pos =
               (run_rank_in_word + 1 < flag_word_run_count) ? next_head_in_word : first_head_after_word;
             if (run_idx < run_end)
@@ -886,124 +904,55 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           }
         }
       };
-      if constexpr (kNumStoreWarps >= kNumCompWarps)
+      // if we have more store warps, each warptile is split between store warps
+      constexpr int kStoreWarpsPerWarpTile = kNumStoreWarps / kNumCompWarps;
+      const int warp_tile_id               = store_warp_idx / kStoreWarpsPerWarpTile;
+      const int sub                        = store_warp_idx % kStoreWarpsPerWarpTile;
+      const int warp_tile_run_count        = __shfl_sync(kFullMask, lane_warp_tile_run_count, warp_tile_id);
+      const int runs_before_warp_tile      = __shfl_sync(kFullMask, lane_runs_before_warp_tile, warp_tile_id);
+      if (warp_tile_run_count >= RLE_RB_MIN
+          && warp_tile_run_count <= ((sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64)))
       {
-        // if we have more store warps, each warptile is split between store warps
-        constexpr int kStoreWarpsPerWarpTile = kNumStoreWarps / kNumCompWarps;
-        const int warp_tile_id               = store_warp_idx / kStoreWarpsPerWarpTile;
-        const int sub                        = store_warp_idx % kStoreWarpsPerWarpTile;
-        const int warp_tile_run_count        = __shfl_sync(kFullMask, lane_warp_tile_run_count, warp_tile_id);
-        const int runs_before_warp_tile      = __shfl_sync(kFullMask, lane_runs_before_warp_tile, warp_tile_id);
-        if (warp_tile_run_count >= RLE_RB_MIN
-            && warp_tile_run_count <= ((sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64)))
+        const int run_begin = (int) ((long) warp_tile_run_count * sub / kStoreWarpsPerWarpTile);
+        const int run_end   = (int) ((long) warp_tile_run_count * (sub + 1) / kStoreWarpsPerWarpTile);
+        // wait for staged_warp_tile (3/3) FIRST -- decode runs before the prefix exists
+        while (!ptx::mbarrier_try_wait_parity(
+          &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
         {
-          const int run_begin = (int) ((long) warp_tile_run_count * sub / kStoreWarpsPerWarpTile);
-          const int run_end   = (int) ((long) warp_tile_run_count * (sub + 1) / kStoreWarpsPerWarpTile);
-          // wait for staged_warp_tile (3/3) FIRST -- decode runs before the prefix exists
-          while (!ptx::mbarrier_try_wait_parity(
-            &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
+        }
+        // register-budget scale: big keys hold fewer buffered runs/lane (16B keys: 2 -> 8 regs)
+        constexpr int kRegBufCap  = (sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64);
+        constexpr int kBufPerLane = (kRegBufCap + 31) / 32;
+        KeyT buf_key[kBufPerLane];
+        int buf_cnt[kBufPerLane];
+        const int warp_tile_offset = warp_tile_id * kWarpTileSize;
+        const int num_rounds       = (run_end - run_begin + 31) >> 5;
+        if (warp_tile_run_count < RLE_HEAD_POS_STAGING_THRESHOLD)
+        {
+          // rank-select decode (same as the classic flag-word path, but into registers)
+          const unsigned lane_head_flag_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
+          const int lane_word_run_count      = __popc(lane_head_flag_word);
+          int lane_word_run_count_scan       = lane_word_run_count;
+#pragma unroll
+          for (int offset = 1; offset < 32; offset <<= 1)
           {
-          }
-          // register-budget scale: big keys hold fewer buffered runs/lane (16B keys: 2 -> 8 regs)
-          constexpr int kRegBufCap  = (sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64);
-          constexpr int kBufPerLane = (kRegBufCap + 31) / 32;
-          KeyT buf_key[kBufPerLane];
-          int buf_cnt[kBufPerLane];
-          const int warp_tile_offset = warp_tile_id * kWarpTileSize;
-          const int num_rounds       = (run_end - run_begin + 31) >> 5;
-          if (warp_tile_run_count < RLE_HEAD_POS_STAGING_THRESHOLD)
-          {
-            // rank-select decode (same as the classic flag-word path, but into registers)
-            const unsigned lane_head_flag_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
-            const int lane_word_run_count      = __popc(lane_head_flag_word);
-            int lane_word_run_count_scan       = lane_word_run_count;
-#pragma unroll
-            for (int offset = 1; offset < 32; offset <<= 1)
+            const int predecessor_partial = __shfl_up_sync(kFullMask, lane_word_run_count_scan, offset);
+            if (lane_id >= offset)
             {
-              const int predecessor_partial = __shfl_up_sync(kFullMask, lane_word_run_count_scan, offset);
-              if (lane_id >= offset)
-              {
-                lane_word_run_count_scan += predecessor_partial;
-              }
-            }
-            const int lane_runs_before_word = lane_word_run_count_scan - lane_word_run_count;
-            // empty words carry +infinity, the min identity (see the classic copy's note)
-            int lane_first_head_from_word =
-              lane_word_run_count ? (lane_id * 32 + __ffs(lane_head_flag_word) - 1) : 0x7fffffff;
-#pragma unroll
-            for (int offset = 1; offset < 32; offset <<= 1)
-            {
-              const int shuffled_first_head = __shfl_down_sync(kFullMask, lane_first_head_from_word, offset);
-              lane_first_head_from_word =
-                min(lane_first_head_from_word, (lane_id + offset < 32) ? shuffled_first_head : 0x7fffffff);
-            }
-#pragma unroll
-            for (int it = 0; it < kBufPerLane; ++it)
-            {
-              if (it >= num_rounds)
-              {
-                break;
-              }
-              const int run_idx = run_begin + it * 32 + lane_id;
-              int flag_word_idx = 0;
-#pragma unroll
-              for (int step = 16; step; step >>= 1)
-              {
-                const int candidate_word_idx = flag_word_idx + step;
-                const int candidate_runs_before =
-                  __shfl_sync(kFullMask, lane_runs_before_word, candidate_word_idx & 31);
-                if (candidate_word_idx < 32 && candidate_runs_before <= run_idx)
-                {
-                  flag_word_idx = candidate_word_idx;
-                }
-              }
-              const int run_rank_in_word = run_idx - __shfl_sync(kFullMask, lane_runs_before_word, flag_word_idx);
-              const unsigned flag_word   = __shfl_sync(kFullMask, lane_head_flag_word, flag_word_idx);
-              const int first_head_after_word =
-                __shfl_sync(kFullMask, lane_first_head_from_word, (flag_word_idx + 1) & 31);
-              const int flag_word_run_count = __popc(flag_word);
-              const int head_bit_in_word =
-                nth_set_bit(flag_word, (run_rank_in_word < flag_word_run_count) ? run_rank_in_word : 0);
-              const int head_pos_in_warp_tile = flag_word_idx * 32 + head_bit_in_word;
-              const int next_head_in_word     = flag_word_idx * 32 + __ffs(flag_word & (~1u << head_bit_in_word)) - 1;
-              // inactive lanes (run_idx >= run_end) decode garbage positions up to wt_offset+1023,
-              // which is out of the key window whenever the warp-tile is under 1024 elements (any
-              // key type over 4B, or debug kIPT<32) -- predicate the read, keep the shuffles above
-              // unconditional
-              buf_key[it] = (run_idx < run_end) ? tile_keys[warp_tile_offset + head_pos_in_warp_tile] : KeyT{};
-              buf_cnt[it] = ((run_rank_in_word + 1 < flag_word_run_count) ? next_head_in_word : first_head_after_word)
-                          - head_pos_in_warp_tile;
+              lane_word_run_count_scan += predecessor_partial;
             }
           }
-          else
-          {
+          const int lane_runs_before_word = lane_word_run_count_scan - lane_word_run_count;
+          // empty words carry +infinity, the min identity (see the classic copy's note)
+          int lane_first_head_from_word =
+            lane_word_run_count ? (lane_id * 32 + __ffs(lane_head_flag_word) - 1) : 0x7fffffff;
 #pragma unroll
-            for (int it = 0; it < kBufPerLane; ++it)
-            {
-              if (it >= num_rounds)
-              {
-                break;
-              }
-              const int run_idx = run_begin + it * 32 + lane_id;
-              const bool act    = run_idx < run_end;
-              // stale ring shorts can be OOB gather addresses -- clamp inactive lanes to 0
-              const int head_pos = act ? (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx)] : 0;
-              buf_key[it]        = tile_keys[head_pos];
-              buf_cnt[it]        = (act && run_idx + 1 < warp_tile_run_count)
-                                   ? (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)] - head_pos
-                                   : 0;
-            }
-          }
-          if (lane_id == 0)
+          for (int offset = 1; offset < 32; offset <<= 1)
           {
-            if constexpr (kPosBufStages < kStages)
-            {
-              ptx::mbarrier_arrive(&pos_buf_free[pipeline_gen % kPosBufStages]); // pos reads done -- BEFORE the prefix
-                                                                                 // wait
-            }
-            ptx::mbarrier_arrive(&empty[slot_id]); // key reads done too: outputs live in registers
+            const int shuffled_first_head = __shfl_down_sync(kFullMask, lane_first_head_from_word, offset);
+            lane_first_head_from_word =
+              min(lane_first_head_from_word, (lane_id + offset < 32) ? shuffled_first_head : 0x7fffffff);
           }
-          const OffT global_runs_before_warp_tile = wait_prefixed_and_read() + runs_before_warp_tile;
 #pragma unroll
           for (int it = 0; it < kBufPerLane; ++it)
           {
@@ -1012,47 +961,97 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               break;
             }
             const int run_idx = run_begin + it * 32 + lane_id;
-            if (run_idx < run_end)
+            int flag_word_idx = 0;
+#pragma unroll
+            for (int step = 16; step; step >>= 1)
             {
-              const OffT global_run_idx = global_runs_before_warp_tile + run_idx;
-              d_unique[global_run_idx]  = buf_key[it];
-              if (run_idx + 1 < warp_tile_run_count)
+              const int candidate_word_idx    = flag_word_idx + step;
+              const int candidate_runs_before = __shfl_sync(kFullMask, lane_runs_before_word, candidate_word_idx & 31);
+              if (candidate_word_idx < 32 && candidate_runs_before <= run_idx)
               {
-                d_counts[global_run_idx] = buf_cnt[it];
+                flag_word_idx = candidate_word_idx;
               }
             }
+            const int run_rank_in_word = run_idx - __shfl_sync(kFullMask, lane_runs_before_word, flag_word_idx);
+            const unsigned flag_word   = __shfl_sync(kFullMask, lane_head_flag_word, flag_word_idx);
+            const int first_head_after_word =
+              __shfl_sync(kFullMask, lane_first_head_from_word, (flag_word_idx + 1) & 31);
+            const int flag_word_run_count = __popc(flag_word);
+            const int head_bit_in_word =
+              nth_set_bit(flag_word, (run_rank_in_word < flag_word_run_count) ? run_rank_in_word : 0);
+            const int head_pos_in_warp_tile = flag_word_idx * 32 + head_bit_in_word;
+            const int next_head_in_word     = flag_word_idx * 32 + __ffs(flag_word & (~1u << head_bit_in_word)) - 1;
+            // inactive lanes (run_idx >= run_end) decode garbage positions up to wt_offset+1023,
+            // which is out of the key window whenever the warp-tile is under 1024 elements (any
+            // key type over 4B, or debug kIPT<32) -- predicate the read, keep the shuffles above
+            // unconditional
+            buf_key[it] = (run_idx < run_end) ? tile_keys[warp_tile_offset + head_pos_in_warp_tile] : KeyT{};
+            buf_cnt[it] = ((run_rank_in_word + 1 < flag_word_run_count) ? next_head_in_word : first_head_after_word)
+                        - head_pos_in_warp_tile;
           }
-          continue; // pos_buf_free/empty already arrived for this pipeline_gen
         }
-        // classic path -- champion order: prefixed wait, then staged_warp_tile, then drain
-        const OffT curr_prefix_run_count = wait_prefixed_and_read();
-        // wait for staged_warp_tile (3/3): only THIS warp-tile's positions -- not the other 7 compute warps
-        while (!ptx::mbarrier_try_wait_parity(
-          &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
+        else
         {
-        }
-        drain(curr_prefix_run_count,
-              warp_tile_id,
-              runs_before_warp_tile,
-              warp_tile_run_count,
-              (int) ((long) warp_tile_run_count * sub / kStoreWarpsPerWarpTile),
-              (int) ((long) warp_tile_run_count * (sub + 1) / kStoreWarpsPerWarpTile));
-      }
-      else
-      {
-        const OffT curr_prefix_run_count = wait_prefixed_and_read();
-        // fewer store warps than compute regions: each store warp walks whole warptiles
-        for (int warp_tile_id = store_warp_idx; warp_tile_id < kNumCompWarps; warp_tile_id += kNumStoreWarps)
-        {
-          const int warp_tile_run_count   = __shfl_sync(kFullMask, lane_warp_tile_run_count, warp_tile_id);
-          const int runs_before_warp_tile = __shfl_sync(kFullMask, lane_runs_before_warp_tile, warp_tile_id);
-          while (!ptx::mbarrier_try_wait_parity(
-            &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
+#pragma unroll
+          for (int it = 0; it < kBufPerLane; ++it)
           {
+            if (it >= num_rounds)
+            {
+              break;
+            }
+            const int run_idx = run_begin + it * 32 + lane_id;
+            const bool act    = run_idx < run_end;
+            // stale ring shorts can be OOB gather addresses -- clamp inactive lanes to 0
+            const int head_pos = act ? (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx)] : 0;
+            buf_key[it]        = tile_keys[head_pos];
+            buf_cnt[it]        = (act && run_idx + 1 < warp_tile_run_count)
+                                 ? (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)] - head_pos
+                                 : 0;
           }
-          drain(curr_prefix_run_count, warp_tile_id, runs_before_warp_tile, warp_tile_run_count, 0, warp_tile_run_count);
         }
+        if (lane_id == 0)
+        {
+          if constexpr (kPosBufStages < kStages)
+          {
+            ptx::mbarrier_arrive(&pos_buf_free[pipeline_gen % kPosBufStages]); // pos reads done -- BEFORE the prefix
+                                                                               // wait
+          }
+          ptx::mbarrier_arrive(&empty[slot_id]); // key reads done too: outputs live in registers
+        }
+        const OffT global_runs_before_warp_tile = wait_prefixed_and_read() + runs_before_warp_tile;
+#pragma unroll
+        for (int it = 0; it < kBufPerLane; ++it)
+        {
+          if (it >= num_rounds)
+          {
+            break;
+          }
+          const int run_idx = run_begin + it * 32 + lane_id;
+          if (run_idx < run_end)
+          {
+            const OffT global_run_idx = global_runs_before_warp_tile + run_idx;
+            d_unique[global_run_idx]  = buf_key[it];
+            if (run_idx + 1 < warp_tile_run_count)
+            {
+              d_counts[global_run_idx] = buf_cnt[it];
+            }
+          }
+        }
+        continue; // pos_buf_free/empty already arrived for this pipeline_gen
       }
+      // classic path -- champion order: prefixed wait, then staged_warp_tile, then drain
+      const OffT curr_prefix_run_count = wait_prefixed_and_read();
+      // wait for staged_warp_tile (3/3): only THIS warp-tile's positions -- not the other 7 compute warps
+      while (!ptx::mbarrier_try_wait_parity(
+        &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
+      {
+      }
+      drain(curr_prefix_run_count,
+            warp_tile_id,
+            runs_before_warp_tile,
+            warp_tile_run_count,
+            (int) ((long) warp_tile_run_count * sub / kStoreWarpsPerWarpTile),
+            (int) ((long) warp_tile_run_count * (sub + 1) / kStoreWarpsPerWarpTile));
       if (lane_id == 0)
       {
         if constexpr (kPosBufStages < kStages)
