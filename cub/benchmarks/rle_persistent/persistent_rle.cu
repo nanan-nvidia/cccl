@@ -779,8 +779,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         return prefix_run_count(prefix_packed[slot_id][(pipeline_gen / kStages) & 1]);
       };
       // drain writes [run_begin, run_end) of warp tile (warp_tile_id)'s staged output into the global arrays.
-      // Per run: gather its key from the run's head position -> d_unique, and write its length -> d_counts
-      // (= next run's head pos - this run's head pos).
+      // Per run: gather its key from the run's head position -> d_unique, 
+      // and write its length -> d_counts (= next run's head pos - this run's head pos).
       // The warp tile's last run spans into the next warp-tile, so its length is fixed up separately.
       auto drain = [&](OffT curr_prefix_run_count,
                        int warp_tile_id,
@@ -807,11 +807,15 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               lane_word_run_count_scan += predecessor_partial;
             }
           }
-          // lane i: # of runs starting in head-flag words [0, i), i.e. in elements [0, i*32)
+          // lane i: # of runs starting in head_flag words [0, i), i.e. in elements [0, i*32)
           const int lane_word_run_base = lane_word_run_count_scan - lane_word_run_count;
-          // suffix-min of per-word first-head positions: lane i -> first head position in flag words [i, 32)
+          // lane i -> first head position in head flag words [i, 32)
+          // if our own run_count is >0, the head is here!
+          // empty words carry +infinity, the min identity (NOT the file's -1 absent-marker: -1
+          // would win every min and poison the fold)
           int lane_first_head_from_word =
             lane_word_run_count ? (lane_id * 32 + __ffs(lane_head_flag_word) - 1) : 0x7fffffff;
+          // if not, we loop to find the next head in flag word [i, 32)
 #pragma unroll
           for (int offset = 1; offset < 32; offset <<= 1)
           {
@@ -923,6 +927,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               }
             }
             const int lane_word_run_base = lane_word_run_count_scan - lane_word_run_count;
+            // empty words carry +infinity, the min identity (see the classic copy's note)
             int lane_first_head_from_word =
               lane_word_run_count ? (lane_id * 32 + __ffs(lane_head_flag_word) - 1) : 0x7fffffff;
 #pragma unroll
