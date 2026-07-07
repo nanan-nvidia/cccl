@@ -792,8 +792,9 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         const int warp_tile_offset = warp_tile_id * kWarpTileSize;
         if (warp_tile_run_count < RLE_HEAD_POS_STAGING_THRESHOLD)
         {
-          // rank-select decode from staged flag words. All shuffles run warp-uniformly (uniform
-          // trip counts, no shfl inside predicated paths) -- the cnt-shfl lesson.
+          // the compute warp judged this warp tile too sparse to be worth the position-staging
+          // and it has decided to write only the 32 head-flag words
+          // one warp tile is 32 chunks x 32 elements so lane i owns word i
           const unsigned lane_head_flag_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
           const int lane_word_run_count      = __popc(lane_head_flag_word);
           int lane_word_run_count_scan       = lane_word_run_count;
@@ -806,8 +807,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               lane_word_run_count_scan += predecessor_partial;
             }
           }
-          const int lane_word_run_base = lane_word_run_count_scan - lane_word_run_count; // lane i: # of runs starting
-                                                                                         // in flag words [0, i)
+          // lane i: # of runs starting in head-flag words [0, i), i.e. in elements [0, i*32)
+          const int lane_word_run_base = lane_word_run_count_scan - lane_word_run_count;
           // suffix-min of per-word first-head positions: lane i -> first head position in flag words [i, 32)
           int lane_first_head_from_word =
             lane_word_run_count ? (lane_id * 32 + __ffs(lane_head_flag_word) - 1) : 0x7fffffff;
