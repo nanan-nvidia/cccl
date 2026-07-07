@@ -628,7 +628,9 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           }
         }
       }
-      // now we start to calculate head positions
+      // now we start to stage head positions per warp tile, if a warptile has enough runs
+      // (it is only worth it when we have more runs by a certain threshold per warp tile)
+      // (otherwise, it is cheaper to recalculate positions from head_flags directly)
       const bool stage_flags = (local_run_count < RLE_HEAD_POS_STAGING_THRESHOLD);
       if (stage_flags)
       {
@@ -638,8 +640,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       {
         if constexpr (kPosBufStages < kStages)
         {
-          // the pos slot is shared by pipeline_gens g, g+kPosBufStages, ...: wait for the drains of pipeline_gen
-          // g-kPosBufStages to have finished reading it (satisfied by pipeline offset in steady state)
+          // the pos slot is shared by pipeline_gens g, g+kPosBufStages, ...
+          // need to wait for it to be cleared by STORE
           if (pipeline_gen >= kPosBufStages)
           {
             while (!ptx::mbarrier_try_wait_parity(
@@ -665,9 +667,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           const int word_run_base = head_scan - __popc(my_flags);
           if (lane_id < kIPT)
           {
-            // NOTE: this peel is warp-parallel ALREADY (32 independent per-lane chains); a 4-way
-            // byte-split "ILP" variant measured 5-8pt SLOWER -- per-lane chain depth is not the
-            // binding constraint here, instruction count is. Don't touch.
             const int word_pos     = warp_tile_base + lane_id * 32; // element position of bit 0 of this word
             unsigned pending_heads = my_flags; // this word's head mask; we need to "peel" it headbit by headbit
             int run_index          = word_run_base; // run-order slot for this word's next head
@@ -680,7 +679,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             }
           }
         }
-      } // adaptive-staging else scope
+      } // stage flags
       if (lane_id == 0)
       {
         ptx::mbarrier_arrive(&staged_warp_tile[slot_id][compute_warp_id]); // this warp-tile's positions ready
@@ -705,7 +704,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       {
         if (lane_id == 0)
         {
-          ptx::mbarrier_arrive(&prefixed[slot_id]); // drain
+          ptx::mbarrier_arrive(&prefixed[slot_id]);
         }
         break;
       }
@@ -720,13 +719,12 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         lane_id,
         curr_prefix_run_count,
         curr_prefix_open_length);
-      // no wait needed before overwriting the prefix slot: STORE(pipeline_gen-kStages) arrives `empty` as its
-      // LAST act, LOAD cannot arm `full` for this pipeline_gen until it passed that same `empty` phase, and we
-      // already passed `full` above -- so a drain-wait here could provably never spin.
+      // no wait needed before overwriting the prefix slot since we can prove this is safe with double buffering
+      // (proof see above at barrier initiation)
       if (lane_id == 0)
       {
         prefix_packed[slot_id][slot_gen & 1] = pack_prefix(curr_prefix_run_count, curr_prefix_open_length);
-        ptx::mbarrier_arrive(&prefixed[slot_id]); // prefix ready, store may proceed! (2/2)
+        ptx::mbarrier_arrive(&prefixed[slot_id]); // prefix ready, store may proceed
       }
     }
   }
@@ -737,8 +735,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
     for (int pipeline_gen = 0;; ++pipeline_gen)
     {
       const int slot_id = pipeline_gen % kStages;
-      // wait for computed (1/3): all per-warp-tile metadata (run counts, first/last heads) is
-      // written before each compute warp's `computed` arrive -- positions are NOT needed yet
+      // wait for computed (1/3): all per-warp-tile metadata (run counts, first/last heads)
       while (!ptx::mbarrier_try_wait_parity(&computed[slot_id], (unsigned) ((pipeline_gen / kStages) & 1)))
       {
       }
@@ -759,18 +756,20 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       // per-warp-tile run bases: warp-parallel exclusive scan over the counts, held in REGISTERS
       // (lane i owns warp-tile i's count/base) and done BEFORE the prefixed wait so it overlaps it.
       // replaces an 8-deep serial smem load+add chain that used to run after the wait.
-      const int wt_count_ln = (lane_id < kNumCompWarps) ? warp_run_counts[slot_id][lane_id] : 0;
-      int wt_incl_ln        = wt_count_ln;
+      const int lane_warp_tile_run_count = (lane_id < kNumCompWarps) ? warp_run_counts[slot_id][lane_id] : 0;
+      int lane_warp_tile_run_count_scan  = lane_warp_tile_run_count;
 #pragma unroll
       for (int offset = 1; offset < kNumCompWarps; offset <<= 1)
       {
-        const int p = __shfl_up_sync(kFullMask, wt_incl_ln, offset);
+        const int p = __shfl_up_sync(kFullMask, lane_warp_tile_run_count_scan, offset);
         if (lane_id >= offset)
         {
-          wt_incl_ln += p;
+          lane_warp_tile_run_count_scan += p;
         }
       }
-      const int wt_base_ln  = wt_incl_ln - wt_count_ln; // lane i: warp-tile i's exclusive run base
+      const int lane_warp_tile_run_base = lane_warp_tile_run_count_scan - lane_warp_tile_run_count; // lane i: warp-tile
+                                                                                                    // i's exclusive run
+                                                                                                    // base
       const KeyT* tile_keys = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad;
       // staged positions
       const short* run_positions = pos_buf + (size_t) (pipeline_gen % kPosBufStages) * kTileSize;
@@ -887,8 +886,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         constexpr int kStoreWarpsPerWarpTile = kNumStoreWarps / kNumCompWarps;
         const int warp_tile_id               = store_warp_idx / kStoreWarpsPerWarpTile;
         const int sub                        = store_warp_idx % kStoreWarpsPerWarpTile;
-        const int warp_tile_run_count        = __shfl_sync(kFullMask, wt_count_ln, warp_tile_id);
-        const int warp_tile_run_base         = __shfl_sync(kFullMask, wt_base_ln, warp_tile_id);
+        const int warp_tile_run_count        = __shfl_sync(kFullMask, lane_warp_tile_run_count, warp_tile_id);
+        const int warp_tile_run_base         = __shfl_sync(kFullMask, lane_warp_tile_run_base, warp_tile_id);
         if (warp_tile_run_count >= RLE_RB_MIN
             && warp_tile_run_count <= ((sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64)))
         {
@@ -1032,8 +1031,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         // fewer store warps than compute regions: each store warp walks whole warptiles
         for (int warp_tile_id = store_warp_idx; warp_tile_id < kNumCompWarps; warp_tile_id += kNumStoreWarps)
         {
-          const int warp_tile_run_count = __shfl_sync(kFullMask, wt_count_ln, warp_tile_id);
-          const int warp_tile_run_base  = __shfl_sync(kFullMask, wt_base_ln, warp_tile_id);
+          const int warp_tile_run_count = __shfl_sync(kFullMask, lane_warp_tile_run_count, warp_tile_id);
+          const int warp_tile_run_base  = __shfl_sync(kFullMask, lane_warp_tile_run_base, warp_tile_id);
           while (!ptx::mbarrier_try_wait_parity(
             &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
           {
@@ -1077,20 +1076,20 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       const int tile_len = (int) min((OffT) kTileSize, num_items - (OffT) tile_id * kTileSize);
       const bool is_last = (tile_id == num_tiles - 1);
       // per-warp-tile counts/bases in registers, same scan as the store warps (lane i = warp-tile i)
-      const int wt_count_ln = (lane_id < kNumCompWarps) ? warp_run_counts[slot_id][lane_id] : 0;
-      int wt_incl_ln        = wt_count_ln;
+      const int lane_warp_tile_run_count = (lane_id < kNumCompWarps) ? warp_run_counts[slot_id][lane_id] : 0;
+      int lane_warp_tile_run_count_scan  = lane_warp_tile_run_count;
 #pragma unroll
       for (int offset = 1; offset < kNumCompWarps; offset <<= 1)
       {
-        const int p = __shfl_up_sync(kFullMask, wt_incl_ln, offset);
+        const int p = __shfl_up_sync(kFullMask, lane_warp_tile_run_count_scan, offset);
         if (lane_id >= offset)
         {
-          wt_incl_ln += p;
+          lane_warp_tile_run_count_scan += p;
         }
       }
-      const int wt_base_ln        = wt_incl_ln - wt_count_ln;
-      const int tile_total_runs   = __shfl_sync(kFullMask, wt_incl_ln, kNumCompWarps - 1);
-      const unsigned wt_runs_mask = __ballot_sync(kFullMask, wt_count_ln > 0);
+      const int lane_warp_tile_run_base = lane_warp_tile_run_count_scan - lane_warp_tile_run_count;
+      const int tile_total_runs         = __shfl_sync(kFullMask, lane_warp_tile_run_count_scan, kNumCompWarps - 1);
+      const unsigned nonempty_warp_tiles_mask = __ballot_sync(kFullMask, lane_warp_tile_run_count > 0);
       while (!ptx::mbarrier_try_wait_parity(&prefixed[slot_id], (unsigned) ((pipeline_gen / kStages) & 1)))
       {
       }
@@ -1099,10 +1098,10 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       const OffT curr_prefix_open_length = prefix_open_len(packed_prefix);
       // per-warp-tile boundary: a warp-tile's last run is closed by the next nonempty warp-tile's
       // first head. lane L handles warp-tile L.
-      if (lane_id < kNumCompWarps && wt_count_ln > 0)
+      if (lane_id < kNumCompWarps && lane_warp_tile_run_count > 0)
       {
-        const unsigned later_wts       = wt_runs_mask >> (lane_id + 1); // nonempty warp-tiles after L
-        const OffT last_run_global_idx = curr_prefix_run_count + wt_base_ln + wt_count_ln - 1;
+        const unsigned later_wts       = nonempty_warp_tiles_mask >> (lane_id + 1); // nonempty warp-tiles after L
+        const OffT last_run_global_idx = curr_prefix_run_count + lane_warp_tile_run_base + lane_warp_tile_run_count - 1;
         if (later_wts)
         {
           const int next_wt             = lane_id + 1 + __ffs(later_wts) - 1;
@@ -1118,8 +1117,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       // now we need to finish last tile's open run
       if (lane_id == 0)
       {
-        const bool any_head  = (wt_runs_mask != 0);
-        const int first_head = any_head ? warp_first_heads[slot_id][__ffs(wt_runs_mask) - 1] : -1;
+        const bool any_head  = (nonempty_warp_tiles_mask != 0);
+        const int first_head = any_head ? warp_first_heads[slot_id][__ffs(nonempty_warp_tiles_mask) - 1] : -1;
         // if our tile has a head, i.e. it stops here
         if (any_head && curr_prefix_run_count > 0)
         {
