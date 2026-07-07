@@ -122,8 +122,7 @@ constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in f
 #ifndef RLE_REG_BUF_MIN_THRESHOLD
 #  define RLE_REG_BUF_MIN_THRESHOLD 8
 #endif
-// buffered-drain run cap, scaled so the per-lane register footprint stays constant as KeyT
-// widens (cap/32 key+length pairs per lane; an 8B key costs 2 registers, a 16B key 4)
+
 constexpr int kRegBufMaxRuns = (sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64);
 
 // This is important for position staging on dense cases (16 way bank conflicts).
@@ -911,21 +910,19 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       {
         const int run_begin = (int) ((long) warp_tile_run_count * sub / kStoreWarpsPerWarpTile);
         const int run_end   = (int) ((long) warp_tile_run_count * (sub + 1) / kStoreWarpsPerWarpTile);
-        // wait for staged_warp_tile (3/3) FIRST -- decode runs before the prefix exists
+        // wait for staged_warp_tile (3/3)
         while (!ptx::mbarrier_try_wait_parity(
           &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
         {
         }
-        // clamped to 1 so RLE_REGBUF=0 (buffered drain off) still compiles: the band check above
-        // is then never true and the arrays are dead
         constexpr int kBufPerLane = ((kRegBufMaxRuns + 31) / 32 > 0) ? (kRegBufMaxRuns + 31) / 32 : 1;
         KeyT buf_key[kBufPerLane];
-        int buf_cnt[kBufPerLane];
+        int buf_run_length[kBufPerLane];
         const int warp_tile_offset = warp_tile_id * kWarpTileSize;
         const int num_rounds       = (run_end - run_begin + 31) >> 5;
         if (warp_tile_run_count < RLE_HEAD_POS_STAGING_THRESHOLD)
         {
-          // rank-select decode (same as the classic flag-word path, but into registers)
+          // this is basically the same as drain, need to refactor this so we are not copy pasting code around
           const unsigned lane_head_flag_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
           const int lane_word_run_count      = __popc(lane_head_flag_word);
           int lane_word_run_count_scan       = lane_word_run_count;
@@ -939,7 +936,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             }
           }
           const int lane_runs_before_word = lane_word_run_count_scan - lane_word_run_count;
-          // empty words carry +infinity, the min identity (see the classic copy's note)
           int lane_first_head_from_word =
             lane_word_run_count ? (lane_id * 32 + __ffs(lane_head_flag_word) - 1) : 0x7fffffff;
 #pragma unroll
@@ -977,15 +973,12 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               nth_set_bit(flag_word, (run_rank_in_word < flag_word_run_count) ? run_rank_in_word : 0);
             const int head_pos_in_warp_tile = flag_word_idx * 32 + head_bit_in_word;
             const int next_head_in_word     = flag_word_idx * 32 + __ffs(flag_word & (~1u << head_bit_in_word)) - 1;
-            // inactive lanes (run_idx >= run_end) decode garbage positions up to wt_offset+1023,
-            // which is out of the key window whenever the warp-tile is under 1024 elements (any
-            // key type over 4B, or debug kIPT<32) -- predicate the read, keep the shuffles above
-            // unconditional
             buf_key[it] = (run_idx < run_end) ? tile_keys[warp_tile_offset + head_pos_in_warp_tile] : KeyT{};
-            buf_cnt[it] = ((run_rank_in_word + 1 < flag_word_run_count) ? next_head_in_word : first_head_after_word)
-                        - head_pos_in_warp_tile;
+            buf_run_length[it] =
+              ((run_rank_in_word + 1 < flag_word_run_count) ? next_head_in_word : first_head_after_word)
+              - head_pos_in_warp_tile;
           }
-        }
+        } // if not staged
         else
         {
 #pragma unroll
@@ -995,12 +988,11 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             {
               break;
             }
-            const int run_idx = run_begin + it * 32 + lane_id;
-            const bool act    = run_idx < run_end;
-            // stale ring shorts can be OOB gather addresses -- clamp inactive lanes to 0
+            const int run_idx  = run_begin + it * 32 + lane_id;
+            const bool act     = run_idx < run_end;
             const int head_pos = act ? (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx)] : 0;
             buf_key[it]        = tile_keys[head_pos];
-            buf_cnt[it]        = (act && run_idx + 1 < warp_tile_run_count)
+            buf_run_length[it] = (act && run_idx + 1 < warp_tile_run_count)
                                  ? (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx + 1)] - head_pos
                                  : 0;
           }
@@ -1009,8 +1001,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         {
           if constexpr (kPosBufStages < kStages)
           {
-            ptx::mbarrier_arrive(&pos_buf_free[pipeline_gen % kPosBufStages]); // pos reads done -- BEFORE the prefix
-                                                                               // wait
+            ptx::mbarrier_arrive(&pos_buf_free[pipeline_gen % kPosBufStages]);
           }
           ptx::mbarrier_arrive(&empty[slot_id]); // key reads done too: outputs live in registers
         }
@@ -1029,12 +1020,12 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             d_unique[global_run_idx]  = buf_key[it];
             if (run_idx + 1 < warp_tile_run_count)
             {
-              d_counts[global_run_idx] = buf_cnt[it];
+              d_counts[global_run_idx] = buf_run_length[it];
             }
           }
         }
         continue; // pos_buf_free/empty already arrived for this pipeline_gen
-      }
+      } // reg buf
       // classic path -- champion order: prefixed wait, then staged_warp_tile, then drain
       const OffT curr_prefix_run_count = wait_prefixed_and_read();
       // wait for staged_warp_tile (3/3): only THIS warp-tile's positions -- not the other 7 compute warps
