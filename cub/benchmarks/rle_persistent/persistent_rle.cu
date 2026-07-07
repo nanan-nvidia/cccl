@@ -74,14 +74,14 @@ constexpr int kNumStoreWarps = K_STORE_WARPS; // store warps; must divide or be 
 constexpr int kStages = K_STAGES; // pipeline depth (keys ring)
 // positions ring depth: positions are written at staging and consumed by the drain ~2 pipeline_gens later,
 // so the ring can be SHALLOWER than the keys ring -- freed smem buys bigger tiles / deeper stages.
-// kPosStages < kStages adds a pos_free barrier (store drains release a pos slot for re-staging).
+// kPosBufStages < kStages adds a pos_buf_free barrier (store drains release a pos slot for re-staging).
 #ifndef K_POS_STAGES
 #  define K_POS_STAGES \
     3 // shallower than the keys ring (positions live staging->drain only);
-      // 2 strangles the depth benefit (pos_free gates staging on drains-2-back)
+      // 2 strangles the depth benefit (pos_buf_free gates staging on drains-2-back)
 #endif
-constexpr int kPosStages = K_POS_STAGES;
-static_assert(kPosStages >= 2 && kPosStages <= kStages, "positions ring: 2..kStages");
+constexpr int kPosBufStages = K_POS_STAGES;
+static_assert(kPosBufStages >= 2 && kPosBufStages <= kStages, "positions ring: 2..kStages");
 
 #ifndef K_POLL_MLP
 // 4 is measured optimal (5 and 8 both lose, 1-10%): the 2-round fold structure OVERLAPS folding the
@@ -100,7 +100,7 @@ constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in f
 // registers, no LDS in the run loop). Dense warp-tiles keep the champion peel+positions path:
 // decode cost scales with runs, the staging saving doesn't. Both sides derive the SAME predicate
 // from the staged warp run count, so no mode flag is exchanged. Collects the measured peel-write
-// conflict prize (v33: +0.4..+1.3 at seg4-16) and deletes staging work + pos_free coupling at mid.
+// conflict prize (v33: +0.4..+1.3 at seg4-16) and deletes staging work + pos_buf_free coupling at mid.
 #ifndef RLE_FW_THRESH
 // re-swept 2026-07-06 after the nxt-ffs decode cheapening: 64 = +1.4 BWUtil pts at seg32, flat
 // elsewhere (v33's "64/96 regress seg32" verdict predates cheap decode). 96 loses seg32 by -4.4
@@ -153,7 +153,7 @@ constexpr int bookkeeper_warp_id = store_warp_id + kNumStoreWarps;
 constexpr int kSlotPad    = 16 / sizeof(KeyT); // elements; 16 bytes = cp_async_bulk quantum
 constexpr int kSlotStride = kTileSize + kSlotPad;
 constexpr size_t kDynSmem =
-  (size_t) kStages * kSlotStride * sizeof(KeyT) + (size_t) kPosStages * kTileSize * sizeof(short);
+  (size_t) kStages * kSlotStride * sizeof(KeyT) + (size_t) kPosBufStages * kTileSize * sizeof(short);
 
 // tile_partial_states: one word per tile
 // Layout: u64 [launch_gen:32][open_len:16][run_count:16]
@@ -367,41 +367,42 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   OffT num_items,
   int num_tiles)
 {
-  // [kStages][kTileSize] int32 ring (input keys)
+  // [kStages][kTileSize] input keys
   // [kStages][kTileSize] int16 staged head positions
   extern __shared__ char smem_raw[]; // 16B-aligned; KeyT alignment <= 16 for all supported types
-  KeyT* const tile_buf    = (KeyT*) smem_raw;
-  short* const staged_pos = (short*) (tile_buf + (size_t) kStages * kSlotStride);
+  KeyT* const tile_buf = (KeyT*) smem_raw;
+  short* const pos_buf = (short*) (tile_buf + (size_t) kStages * kSlotStride);
   __shared__ int tile_id_buf[kStages]; // which global tile each ring slot holds (LOAD gets it with try_cancel)
   __shared__ int warp_run_counts[kStages][kNumCompWarps]; // per compute warp run counts
-  __shared__ unsigned head_flag_buf[kStages][kNumCompWarps * 32]; // staged head-flag words (flag-word path)
+  __shared__ unsigned head_flag_buf[kStages][kNumCompWarps * 32]; // staged head-flag words
   __shared__ int warp_first_heads[kStages][kNumCompWarps]; // per compute warp first head idx (-1 if none)
   __shared__ int warp_last_heads[kStages][kNumCompWarps]; // per compute warp last head idx (-1 if none)
-  // POLL -> STORE handoff: [open_len_prefix:32][run_count_prefix:32] packed, one access per side
-  // under REGBUF the prefix is double-buffered by slot-cycle parity: POLL(g+kStages) writes the
-  // OTHER half from the one STORE(g)/BOOKKEEPER(g) read, and program order proves safety (a
-  // store warp reads pipeline_gen g's half before its pipeline_gen g+kStages empty-arrive, which gates the load
-  // that gates poll's next write to that half). No consumed-barrier -- v38's pfx_free put the
-  // store wake-up latency inside the POLL's serial loop and cost -2..-5pt at seg128+.
+
+  // for POLL to pass STORE packed [open_len_prefix:32][run_count_prefix:32]
+  // we need to double buffer this because STORE will arrive empty immediately after reading the data
+  // i.e. when POLL start to write g+kStage's prefix data, STORE and BOOKKEEPER might still have not read
+  // the prefix data. therefore, we MUST to double buffer this to ensure it is safe.
+  // the proof is as follows: with double buffering, the hazard becomes when POLL for g+2*kStage start to write,
+  // could STORE and BOOKKEEPER still wait on the prefix data of g+kStage? This CANNOT happen, because for us to
+  // start loading g+2*kStage, STORE and BOOKKEEPER must have all arrived empty for g+kStage, which means they have
+  // fully processed the data for g.
   __shared__ PrefixT prefix_packed[kStages][2];
-  // STORE --pos_free--> COMPUTE staging (only when kPosStages < kStages): all store warps arrive
-  // after their drain finished READING a pos slot; compute waits before re-staging into it
-  __shared__ u64 pos_free[kPosStages];
-  // barriers (per ring slot):
+
+  // STORE --pos_buf_free--> COMPUTE staging (only when kPosBufStages < kStages; if = then it is mapped 1:1)
+  // all store warps arrive after they no longer need the data in the pos slot; compute waits before re-staging into it
+  __shared__ u64 pos_buf_free[kPosBufStages];
   // LOAD --full--> COMPUTE & POLL
   // COMPUTE(all warps) --computed--> COMPUTE warp0
   // warp0 calculates & publishes this tile's aggregate to the global
   // POLL --prefixed--> STORE
   // STORE --empty--> LOAD & POLL
-  // (an `assigned` barrier that woke POLL at TMA-issue time was measured a small pure loss once the
-  // poll spin stopped re-loading valid states -- see the bench notes; POLL waits `full` like COMPUTE)
   __shared__ u64 full[kStages];
   __shared__ u64 computed[kStages], prefixed[kStages], empty[kStages];
-  // COMPUTE warp w --staged_wt[w]--> STORE: per-warp-tile handoff, so store warps drain a warp-tile
+  // COMPUTE warp w --staged_warp_tile[w]--> STORE: per-warp-tile handoff, so store warps drain a warp-tile
   // as soon as ITS positions are staged instead of waiting for all 8 compute warps (warp 0 is always
   // last -- it does the publish fan-in first). The shared metadata store also needs (run counts,
   // first/last heads, tile_id_buf) is covered by `computed`.
-  __shared__ u64 staged_wt[kStages][kNumCompWarps];
+  __shared__ u64 staged_warp_tile[kStages][kNumCompWarps];
 
   // try_cancel writes a 16-byte response into clc_resp + completes clc_bar's tx.
   __shared__ __align__(16) uint4 clc_resp;
@@ -423,12 +424,12 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       ptx::mbarrier_init(&empty[slot_id], kNumStoreWarps + 1); // store warps + the bookkeeper
       for (int cw = 0; cw < kNumCompWarps; ++cw)
       {
-        ptx::mbarrier_init(&staged_wt[slot_id][cw], 1); // that compute warp's lane0, after its scatter
+        ptx::mbarrier_init(&staged_warp_tile[slot_id][cw], 1); // that compute warp's lane0, after its scatter
       }
     }
-    for (int p = 0; p < kPosStages; ++p)
+    for (int p = 0; p < kPosBufStages; ++p)
     {
-      ptx::mbarrier_init(&pos_free[p], kNumStoreWarps);
+      ptx::mbarrier_init(&pos_buf_free[p], kNumStoreWarps);
     }
 
     ptx::mbarrier_init(&clc_bar, 1); // 1 arrival
@@ -549,9 +550,9 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       {
         if (lane_id == 0)
         {
-          // drain: STORE waits computed + its warp-tile's staged_wt, so arrive both
+          // drain: STORE waits computed + its warp-tile's staged_warp_tile, so arrive both
           ptx::mbarrier_arrive(&computed[slot_id]);
-          ptx::mbarrier_arrive(&staged_wt[slot_id][compute_warp_id]);
+          ptx::mbarrier_arrive(&staged_warp_tile[slot_id][compute_warp_id]);
         }
         break;
       }
@@ -569,7 +570,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       // NOTE: this loop is a measured local optimum -- FOUR restructures have lost to it (shfl preds,
       // two int4 forms, and stripping the bounds/global-first predicates for full tiles at +6-21%).
       // The predicates ride free in idle issue slots; changing the loop breaks its pipelining.
-      short* const pos_dst = staged_pos + (size_t) (pipeline_gen % kPosStages) * kTileSize;
+      short* const pos_dst = pos_buf + (size_t) (pipeline_gen % kPosBufStages) * kTileSize;
       unsigned my_flags    = 0;
 #pragma unroll
       for (int iter = 0; iter < kIPT; ++iter)
@@ -646,14 +647,14 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       }
       else
       {
-        if constexpr (kPosStages < kStages)
+        if constexpr (kPosBufStages < kStages)
         {
-          // the pos slot is shared by pipeline_gens g, g+kPosStages, ...: wait for the drains of pipeline_gen
-          // g-kPosStages to have finished reading it (satisfied by pipeline offset in steady state)
-          if (pipeline_gen >= kPosStages)
+          // the pos slot is shared by pipeline_gens g, g+kPosBufStages, ...: wait for the drains of pipeline_gen
+          // g-kPosBufStages to have finished reading it (satisfied by pipeline offset in steady state)
+          if (pipeline_gen >= kPosBufStages)
           {
             while (!ptx::mbarrier_try_wait_parity(
-              &pos_free[pipeline_gen % kPosStages], (unsigned) ((pipeline_gen / kPosStages - 1) & 1)))
+              &pos_buf_free[pipeline_gen % kPosBufStages], (unsigned) ((pipeline_gen / kPosBufStages - 1) & 1)))
             {
             }
           }
@@ -693,7 +694,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       } // adaptive-staging else scope
       if (lane_id == 0)
       {
-        ptx::mbarrier_arrive(&staged_wt[slot_id][compute_warp_id]); // this warp-tile's positions ready
+        ptx::mbarrier_arrive(&staged_warp_tile[slot_id][compute_warp_id]); // this warp-tile's positions ready
       }
     }
   }
@@ -783,7 +784,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       const int wt_base_ln  = wt_incl_ln - wt_count_ln; // lane i: warp-tile i's exclusive run base
       const KeyT* tile_keys = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad;
       // staged positions
-      const short* run_positions = staged_pos + (size_t) (pipeline_gen % kPosStages) * kTileSize;
+      const short* run_positions = pos_buf + (size_t) (pipeline_gen % kPosBufStages) * kTileSize;
       // wait for prefixed (2/3); drains only need the run-count prefix (addresses) -- the
       // open-length half is bookkeeper-only
       auto wait_prefixed_and_read = [&]() {
@@ -904,9 +905,9 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         {
           const int run_begin = (int) ((long) warp_tile_run_count * sub / kStoreWarpsPerWarpTile);
           const int run_end   = (int) ((long) warp_tile_run_count * (sub + 1) / kStoreWarpsPerWarpTile);
-          // wait for staged_wt (3/3) FIRST -- decode runs before the prefix exists
+          // wait for staged_warp_tile (3/3) FIRST -- decode runs before the prefix exists
           while (!ptx::mbarrier_try_wait_parity(
-            &staged_wt[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
+            &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
           {
           }
           // register-budget scale: big keys hold fewer buffered runs/lane (16B keys: 2 -> 8 regs)
@@ -994,9 +995,10 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           }
           if (lane_id == 0)
           {
-            if constexpr (kPosStages < kStages)
+            if constexpr (kPosBufStages < kStages)
             {
-              ptx::mbarrier_arrive(&pos_free[pipeline_gen % kPosStages]); // pos reads done -- BEFORE the prefix wait
+              ptx::mbarrier_arrive(&pos_buf_free[pipeline_gen % kPosBufStages]); // pos reads done -- BEFORE the prefix
+                                                                                 // wait
             }
             ptx::mbarrier_arrive(&empty[slot_id]); // key reads done too: outputs live in registers
           }
@@ -1019,13 +1021,13 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
               }
             }
           }
-          continue; // pos_free/empty already arrived for this pipeline_gen
+          continue; // pos_buf_free/empty already arrived for this pipeline_gen
         }
-        // classic path -- champion order: prefixed wait, then staged_wt, then drain
+        // classic path -- champion order: prefixed wait, then staged_warp_tile, then drain
         const OffT curr_prefix_run_count = wait_prefixed_and_read();
-        // wait for staged_wt (3/3): only THIS warp-tile's positions -- not the other 7 compute warps
-        while (
-          !ptx::mbarrier_try_wait_parity(&staged_wt[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
+        // wait for staged_warp_tile (3/3): only THIS warp-tile's positions -- not the other 7 compute warps
+        while (!ptx::mbarrier_try_wait_parity(
+          &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
         {
         }
         drain(curr_prefix_run_count,
@@ -1044,7 +1046,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           const int warp_tile_run_count = __shfl_sync(kFullMask, wt_count_ln, warp_tile_id);
           const int warp_tile_run_base  = __shfl_sync(kFullMask, wt_base_ln, warp_tile_id);
           while (!ptx::mbarrier_try_wait_parity(
-            &staged_wt[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
+            &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
           {
           }
           drain(curr_prefix_run_count, warp_tile_id, warp_tile_run_base, warp_tile_run_count, 0, warp_tile_run_count);
@@ -1052,9 +1054,10 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       }
       if (lane_id == 0)
       {
-        if constexpr (kPosStages < kStages)
+        if constexpr (kPosBufStages < kStages)
         {
-          ptx::mbarrier_arrive(&pos_free[pipeline_gen % kPosStages]); // this warp's drain no longer reads the pos slot
+          ptx::mbarrier_arrive(&pos_buf_free[pipeline_gen % kPosBufStages]); // this warp's drain no longer reads the
+                                                                             // pos slot
         }
         // store done, load may proceed!
         ptx::mbarrier_arrive(&empty[slot_id]);
