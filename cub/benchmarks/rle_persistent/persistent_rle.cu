@@ -790,7 +790,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
                        int run_end) {
         const OffT global_run_base = curr_prefix_run_count + warp_tile_run_base;
         const int warp_tile_offset = warp_tile_id * kWarpTileSize;
-        if (warp_tile_run_count < RLE_HEAD_POS_STAGING_THRESHOLD) // if not staged
+        if (warp_tile_run_count < RLE_HEAD_POS_STAGING_THRESHOLD)
         {
           // rank-select decode from staged flag words. All shuffles run warp-uniformly (uniform
           // trip counts, no shfl inside predicated paths) -- the cnt-shfl lesson.
@@ -861,7 +861,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             }
           }
           return;
-        }
+        } // if not staged
 #pragma unroll 2
         for (int run_idx = run_begin + lane_id; run_idx < run_end; run_idx += 32)
         {
