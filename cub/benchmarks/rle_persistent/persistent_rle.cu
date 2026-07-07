@@ -767,9 +767,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           lane_warp_tile_run_count_scan += p;
         }
       }
-      const int lane_warp_tile_run_base = lane_warp_tile_run_count_scan - lane_warp_tile_run_count; // lane i: warp-tile
-                                                                                                    // i's exclusive run
-                                                                                                    // base
+      // lane i: run-count sum over warp-tiles [0, i) = where warp-tile i's runs begin within the tile
+      const int lane_warp_tile_run_base = lane_warp_tile_run_count_scan - lane_warp_tile_run_count;
       const KeyT* tile_keys = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad;
       // staged positions
       const short* run_positions = pos_buf + (size_t) (pipeline_gen % kPosBufStages) * kTileSize;
