@@ -398,10 +398,10 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   // STORE --empty--> LOAD & POLL
   __shared__ u64 full[kStages];
   __shared__ u64 computed[kStages], prefixed[kStages], empty[kStages];
-  // COMPUTE warp w --staged_warp_tile[w]--> STORE: per-warp-tile handoff, so store warps drain a warp-tile
-  // as soon as ITS positions are staged instead of waiting for all 8 compute warps (warp 0 is always
-  // last -- it does the publish fan-in first). The shared metadata store also needs (run counts,
-  // first/last heads, tile_id_buf) is covered by `computed`.
+  // COMPUTE warp w --staged_warp_tile[w]--> STORE: we arrive per warp tile handoff
+  // i.e. store warps start working to drain a warp-tile as soon as ITS positions are staged 
+  // instead of waiting for all 8 compute warps (warp 0 is always slower!!)
+  // The shared metadata store also needs (run counts, first/last heads, tile_id_buf) is covered by `computed`.
   __shared__ u64 staged_warp_tile[kStages][kNumCompWarps];
 
   // try_cancel writes a 16-byte response into clc_resp + completes clc_bar's tx.
@@ -412,8 +412,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   const int warp_id         = thr_id >> 5;
   const int lane_id         = thr_id & 31;
   const int blk_id          = blockIdx.x;
-  const unsigned launch_gen = __ldg(d_launch_gen); // written by the init kernel, stream-ordered
-
+  const unsigned launch_gen = __ldg(d_launch_gen);
   if (thr_id == 0)
   {
     for (int slot_id = 0; slot_id < kStages; ++slot_id)
@@ -475,16 +474,12 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         __syncwarp();
         break;
       }
-      // over-fetch one 16B chunk to the left: slot[0..kSlotPad-1] = previous tile's last keys,
-      // so COMPUTE reads element 0's predecessor from smem instead of a blocking LDG here.
-      // tile 0 has no predecessor and skips the over-fetch; its slot[0..kSlotPad-1] stay
-      // unread because is_global_first forces element 0's head flag.
+      // over-fetch one 16B chunk to the left, so that we get last tiles last key
+      // tile 0 has no predecessor and skips the over-fetch
       const bool first_tile = (tile_id == 0);
       const int tile_len    = (int) min((OffT) kTileSize, num_items - (OffT) tile_id * kTileSize);
-      // partial LAST tile: cp_async_bulk moves 16B multiples only, and reading past num_items
-      // would touch memory the user never allocated -- round the TMA down to the quantum and fetch
-      // the ragged tail (< 16B) with plain per-lane loads. The epilogue stores happen-before the
-      // release arrive below, so full[]'s acquire waiters see them along with the TMA bytes.
+      // partial LAST tile: we only BULK COPY to the closest 16B boundary and we LDG load the rest
+      // TODO: unaligned tile0, can we make TMA automatically zero pad?
       const int tma_elems = (tile_len == kTileSize) ? kTileSize : (tile_len & ~(kSlotPad - 1));
       if (tile_len != kTileSize)
       {
@@ -550,14 +545,13 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       {
         if (lane_id == 0)
         {
-          // drain: STORE waits computed + its warp-tile's staged_warp_tile, so arrive both
+          // STORE waits computed + its warp-tile's staged_warp_tile, so arrive both
           ptx::mbarrier_arrive(&computed[slot_id]);
           ptx::mbarrier_arrive(&staged_warp_tile[slot_id][compute_warp_id]);
         }
         break;
       }
-      // slot is ready! (under split, half-1 warps index through +2*kSlotPad so pad1 sits at loc
-      // kHalfTile-1's predecessor position; all their accesses incl. loc-1 stay in half 1 + pad1)
+      // slot is ready!
       const KeyT* key_buf = tile_buf + (size_t) slot_id * kSlotStride + kSlotPad;
       const int tile_len  = (int) min((OffT) kTileSize, num_items - (OffT) tile_id * kTileSize);
       int local_run_count = 0, warp_first_head = -1, warp_last_head = -1;
@@ -565,11 +559,6 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       // start calculating head_flags:
       // each iter is 32 consecutive elements (lane L owns loc = warp_tile_base + iter*32 + L)
       // head = (key != predecessor)
-      // __ballot makes a 32-bit head mask per iter
-      // the lane whose lane_id == iter stashes it, so after the loop lane L holds chunk L's mask
-      // NOTE: this loop is a measured local optimum -- FOUR restructures have lost to it (shfl preds,
-      // two int4 forms, and stripping the bounds/global-first predicates for full tiles at +6-21%).
-      // The predicates ride free in idle issue slots; changing the loop breaks its pipelining.
       short* const pos_dst = pos_buf + (size_t) (pipeline_gen % kPosBufStages) * kTileSize;
       unsigned my_flags    = 0;
 #pragma unroll
