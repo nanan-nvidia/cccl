@@ -122,6 +122,9 @@ constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in f
 #ifndef RLE_RB_MIN
 #  define RLE_RB_MIN 8
 #endif
+// buffered-drain run cap, scaled so the per-lane register footprint stays constant as KeyT
+// widens (cap/32 key+length pairs per lane; an 8B key costs 2 registers, a 16B key 4)
+constexpr int kRegBufMaxRuns = (sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64);
 
 // This is important for position staging on dense cases (16 way bank conflicts).
 __device__ __forceinline__ int swizzle_xor_stride32(int x)
@@ -903,8 +906,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       const int warp_tile_run_count        = __shfl_sync(kFullMask, lane_warp_tile_run_count, warp_tile_id);
       const int runs_before_warp_tile      = __shfl_sync(kFullMask, lane_runs_before_warp_tile, warp_tile_id);
 
-      if (warp_tile_run_count >= RLE_RB_MIN
-          && warp_tile_run_count <= ((sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64)))
+      if (warp_tile_run_count >= RLE_RB_MIN && warp_tile_run_count <= kRegBufMaxRuns)
       {
         const int run_begin = (int) ((long) warp_tile_run_count * sub / kStoreWarpsPerWarpTile);
         const int run_end   = (int) ((long) warp_tile_run_count * (sub + 1) / kStoreWarpsPerWarpTile);
@@ -913,11 +915,9 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
         {
         }
-        // register-budget scale: big keys hold fewer buffered runs/lane (16B keys: 2 -> 8 regs)
-        constexpr int kRegBufCap = (sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64);
         // clamped to 1 so RLE_REGBUF=0 (buffered drain off) still compiles: the band check above
         // is then never true and the arrays are dead
-        constexpr int kBufPerLane = ((kRegBufCap + 31) / 32 > 0) ? (kRegBufCap + 31) / 32 : 1;
+        constexpr int kBufPerLane = ((kRegBufMaxRuns + 31) / 32 > 0) ? (kRegBufMaxRuns + 31) / 32 : 1;
         KeyT buf_key[kBufPerLane];
         int buf_cnt[kBufPerLane];
         const int warp_tile_offset = warp_tile_id * kWarpTileSize;
