@@ -15,52 +15,20 @@ using u64     = cuda::std::uint64_t;
 template <class KeyT, int kIptOverride = 0>
 struct winner_config
 {
-  // size-class tile policy: the tile is capped at 8192 ELEMENTS by the ballot design (32 chunks x
-  // 32 lanes x kNumCompWarps warps); big keys shrink the tile to keep the 5-deep key ring inside
-  // the smem cap (8B keys: 5x4096x8=160KB; 16B: 5x2048x16=160KB; <=4B: the tuned 8192 geometry).
-  // elements/thread; tile = kNumCompWarps*kIPT*32 (small kIptOverride: local-GPU debug)
+  // IPT should br 32 (32 chunks x 32 lanes)
   static constexpr int kIPT =
     (kIptOverride != 0) ? kIptOverride : ((sizeof(KeyT) >= 16) ? 8 : (sizeof(KeyT) == 8 ? 16 : 32));
-  static constexpr int kNumCompWarps = 8; // warp-tiles stay 32*kIPT elems; cw grows the tile
-  // 8 beats 16 by +1.3 to +5 BWUtil pts everywhere except seg1 dense (-3.3) now that the drain path is
-  // cheap (v10); the old "16 balanced" verdict predates that. 16 = dense-leaning alternative.
+  static constexpr int kNumCompWarps = 8;
   static constexpr int kNumStoreWarps = 8; // store warps; must divide or be a multiple of kNumCompWarps
-  static constexpr int kStages        = 5; // pipeline depth (keys ring)
-                                    // 5 (with posRing 3) beats 4 by +0.3..+1.9pt EVERYWHERE; v17b's "5 loses"
-                                    // was a posRing-2 coupling confound. 5x keys + 3x pos = 212KB.
-  // positions ring depth: positions are written at staging and consumed by the drain ~2 pipeline_gens later,
-  // so the ring can be SHALLOWER than the keys ring -- freed smem buys bigger tiles / deeper stages.
-  // kPosBufStages < kStages adds a pos_buf_free barrier (store drains release a pos slot for re-staging).
-  static constexpr int kPosBufStages = 3; // shallower than the keys ring (positions live staging->drain only);
-                                          // 2 strangles the depth benefit (pos_buf_free gates staging on
-                                          // drains-2-back)
-  static_assert(kPosBufStages >= 2 && kPosBufStages <= kStages, "positions ring: 2..kStages");
-  // 4 is measured optimal (5 and 8 both lose, 1-10%): the 2-round fold structure OVERLAPS folding the
-  // old (long-published) tiles with the frontier tiles' publish window; a single wider round serializes
-  // the whole fold behind the youngest predecessor's publish.
+  static constexpr int kStages        = 5; // pipeline depth
+  // positions ring depth: positions are written at staging and consumed by store about 2 pipeline_gens later,
+  // so it can be SHALLOWER than the keys ring and this buys room for more kStages
+  static constexpr int kPosBufStages = 3;
+  static_assert(kPosBufStages >= 2 && kPosBufStages <= kStages, "kPosBufStages should be 2 - kStages");
   static constexpr int kPollMlp = 4; // how many loads each poll lane keeps in flight
-  // head-flag words (one conflict-free STS.32 per lane; no scan, no peel, no pos-ring use) and the
-  // drain rank-selects head positions from them (5-shfl binary search + branchless nth-set-bit, pure
-  // registers, no LDS in the run loop). Dense warp-tiles keep the champion peel+positions path:
-  // decode cost scales with runs, the staging saving doesn't. Both sides derive the SAME predicate
-  // from the staged warp run count, so no mode flag is exchanged. Collects the measured peel-write
-  // conflict prize (v33: +0.4..+1.3 at seg4-16) and deletes staging work + pos_buf_free coupling at mid.
-  // re-swept 2026-07-06 after the nxt-ffs decode cheapening: 64 = +1.4 BWUtil pts at seg32, flat
-  // elsewhere (v33's "64/96 regress seg32" verdict predates cheap decode). 96 loses seg32 by -4.4
-  // (drags 65-96-run warp-tiles onto the run-scaling decode), 128 also craters seg16 (-12.6).
+  // when should compute warps stage?
   static constexpr int kHeadPosStagingThreshold = 64;
-  // prefix-decoupled drain. Warp-tiles with run count <= kRegBufMaxRuns decode+gather into
-  // REGISTERS before the prefixed wait (only the output ADDRESS needs the prefix), then release the
-  // pos slot AND the key slot -- `empty` stops waiting on the prefix chain entirely for buffered
-  // warp-tiles; the final store burst trails the pipeline by the prefix latency and nothing
-  // downstream orders on it. Early `empty` breaks the old "poll never overwrites a live
-  // prefix_packed" ordering proof; prefix_packed is double-buffered by slot-cycle parity instead
-  // (program order proves safety).
-  // buffered drain only pays when the drain is long enough for early slot-release to matter;
-  // near-empty warp-tiles (long segs) stay classic to avoid pure reshape overhead
-  // buffered-drain run cap, scaled so the per-lane register footprint stays constant as KeyT
-  // widens (cap/32 key+length pairs per lane; an 8B key costs 2 registers, a 16B key 4)
-  // register-buffer cap (runs/warp-tile), champion since v40
+  // when should be pre calculate in registers?
   static constexpr int kRegBufMaxRuns      = (sizeof(KeyT) <= 4) ? 256 : (sizeof(KeyT) == 8 ? 128 : 64);
   static constexpr int kRegBufMinThreshold = 8;
 
@@ -75,18 +43,12 @@ struct winner_config
   // for each input tile, we need to store the keys and in-tile positions
   // for in tile position we can just do unsigned int16 since tile size is never bigger than 2^16
   // each key slot carries kSlotPad extra leading elements
-  // we overcopy one 16B chunk to the left, this does two things at once:
-  // 1. no need for aligned address
-  // 2. we get the last tiles boundary element
+  // we overcopy one 16B chunk to the left, so that we get the last tiles boundary element
   static constexpr int kSlotPad    = 16 / sizeof(KeyT); // elements; 16 bytes = cp_async_bulk quantum
   static constexpr int kSlotStride = kTileSize + kSlotPad;
   static constexpr size_t kDynSmem =
     (size_t) kStages * kSlotStride * sizeof(KeyT) + (size_t) kPosBufStages * kTileSize * sizeof(short);
 };
-
-// drain-loop unroll (gather MLP): 2 is the measured default winner (+6.5pt dense, ~flat elsewhere);
-// 4 gains less at dense and costs 1.3-1.5pt at seg8-16; 0 = no unroll. NOTE this knob's verdict
-// FLIPPED twice as the surrounding design changed -- re-sweep it after any store-path change.
 
 // This is important for position staging on dense cases (16 way bank conflicts).
 __device__ __forceinline__ int swizzle_xor_stride32(int x)
