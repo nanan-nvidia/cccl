@@ -119,8 +119,8 @@ constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in f
 #ifndef RLE_REGBUF
 #  define RLE_REGBUF 256 // register-buffer cap (runs/warp-tile), champion since v40
 #endif
-#ifndef RLE_RB_MIN
-#  define RLE_RB_MIN 8
+#ifndef RLE_REG_BUF_MIN_THRESHOLD
+#  define RLE_REG_BUF_MIN_THRESHOLD 8
 #endif
 // buffered-drain run cap, scaled so the per-lane register footprint stays constant as KeyT
 // widens (cap/32 key+length pairs per lane; an 8B key costs 2 registers, a 16B key 4)
@@ -905,8 +905,9 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       const int sub                        = store_warp_idx % kStoreWarpsPerWarpTile;
       const int warp_tile_run_count        = __shfl_sync(kFullMask, lane_warp_tile_run_count, warp_tile_id);
       const int runs_before_warp_tile      = __shfl_sync(kFullMask, lane_runs_before_warp_tile, warp_tile_id);
-
-      if (warp_tile_run_count >= RLE_RB_MIN && warp_tile_run_count <= kRegBufMaxRuns)
+      // if our register budget allows it and it is worth it, we can buffer intermidiate results in register
+      // and arrive empty early. this buys 2.5% BWUtil at the worst segments
+      if (warp_tile_run_count >= RLE_REG_BUF_MIN_THRESHOLD && warp_tile_run_count <= kRegBufMaxRuns)
       {
         const int run_begin = (int) ((long) warp_tile_run_count * sub / kStoreWarpsPerWarpTile);
         const int run_end   = (int) ((long) warp_tile_run_count * (sub + 1) / kStoreWarpsPerWarpTile);
