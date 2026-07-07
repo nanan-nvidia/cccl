@@ -101,11 +101,11 @@ constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in f
 // decode cost scales with runs, the staging saving doesn't. Both sides derive the SAME predicate
 // from the staged warp run count, so no mode flag is exchanged. Collects the measured peel-write
 // conflict prize (v33: +0.4..+1.3 at seg4-16) and deletes staging work + pos_buf_free coupling at mid.
-#ifndef RLE_FW_THRESH
+#ifndef RLE_HEAD_POS_STAGING_THRESHOLD
 // re-swept 2026-07-06 after the nxt-ffs decode cheapening: 64 = +1.4 BWUtil pts at seg32, flat
 // elsewhere (v33's "64/96 regress seg32" verdict predates cheap decode). 96 loses seg32 by -4.4
 // (drags 65-96-run warp-tiles onto the run-scaling decode), 128 also craters seg16 (-12.6).
-#  define RLE_FW_THRESH 64
+#  define RLE_HEAD_POS_STAGING_THRESHOLD 64
 #endif
 // RLE_REGBUF: prefix-decoupled drain. Warp-tiles with run count <= RLE_REGBUF decode+gather into
 // REGISTERS before the prefixed wait (only the output ADDRESS needs the prefix), then release the
@@ -399,7 +399,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   __shared__ u64 full[kStages];
   __shared__ u64 computed[kStages], prefixed[kStages], empty[kStages];
   // COMPUTE warp w --staged_warp_tile[w]--> STORE: we arrive per warp tile handoff
-  // i.e. store warps start working to drain a warp-tile as soon as ITS positions are staged 
+  // i.e. store warps start working to drain a warp-tile as soon as ITS positions are staged
   // instead of waiting for all 8 compute warps (warp 0 is always slower!!)
   // The shared metadata store also needs (run counts, first/last heads, tile_id_buf) is covered by `computed`.
   __shared__ u64 staged_warp_tile[kStages][kNumCompWarps];
@@ -566,7 +566,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       {
         const int loc             = warp_tile_base + iter * 32 + lane_id;
         const KeyT key            = (loc < tile_len) ? key_buf[loc] : KeyT{};
-        const KeyT pred           = key_buf[loc - 1]; // loc==0 reads the over-fetched slot[kSlotPad-1]
+        const KeyT pred           = key_buf[loc - 1]; // loc==0 reads the over fetched slot[kSlotPad-1]
         const int is_global_first = (tile_id == 0 && loc == 0);
         const int head            = (loc < tile_len) ? (is_global_first ? 1 : (key != pred)) : 0;
         const unsigned flags      = __ballot_sync(kFullMask, head);
@@ -606,7 +606,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         {
           // kNumCompWarps<=32 so one lane/warp fits
           // (in practice we will never have anything close to 32)
-          static_assert(kNumCompWarps <= 32, "insane...");
+          static_assert(kNumCompWarps <= 32, "kNumCompWarps must be less than 32!");
           const bool active        = lane_id < kNumCompWarps;
           const int warp_run_count = active ? warp_run_counts[slot_id][lane_id] : 0;
           const int run_count      = __reduce_add_sync(kFullMask, warp_run_count);
@@ -629,7 +629,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         }
       }
       // now we start to calculate head positions
-      const bool stage_flags = (local_run_count < RLE_FW_THRESH);
+      const bool stage_flags = (local_run_count < RLE_HEAD_POS_STAGING_THRESHOLD);
       if (stage_flags)
       {
         head_flag_buf[slot_id][compute_warp_id * 32 + lane_id] = my_flags;
@@ -796,7 +796,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         // tile
         const OffT global_run_base = curr_prefix_run_count + warp_tile_run_base;
         const int warp_tile_offset = warp_tile_id * kWarpTileSize; // this warp-tile's base in the staged arrays
-        if (warp_tile_run_count < RLE_FW_THRESH)
+        if (warp_tile_run_count < RLE_HEAD_POS_STAGING_THRESHOLD)
         {
           // rank-select decode from staged flag words. All shuffles run warp-uniformly (uniform
           // trip counts, no shfl inside predicated paths) -- the cnt-shfl lesson.
@@ -906,7 +906,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           int buf_cnt[kBufPerLane];
           const int warp_tile_offset = warp_tile_id * kWarpTileSize;
           const int niter            = (run_end - run_begin + 31) >> 5;
-          if (warp_tile_run_count < RLE_FW_THRESH)
+          if (warp_tile_run_count < RLE_HEAD_POS_STAGING_THRESHOLD)
           {
             // rank-select decode (same as the classic flag-word path, but into registers)
             const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
