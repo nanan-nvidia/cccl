@@ -11,14 +11,41 @@
 
 #include "persistent_rle.cu"
 
-using KeyT              = rle_impl::KeyT;
-using LenT              = rle_impl::LenT;
-using NumRunsT          = rle_impl::NumRunsT;
-using OffT              = rle_impl::OffT;
+// key/output types: one translation unit per instantiation (mirrors CUB's per-type bench TUs).
+// KeyT needs only operator== with CUB's equality semantics (floats: NaN breaks runs; complex:
+// componentwise). LenT is the run-length output type; run-length arithmetic is tile-local int,
+// widened at the store (valid while the longest run < 2^31, i.e. num_items < 2^31).
+#ifndef RLE_KEY_T
+#  define RLE_KEY_T int
+#endif
+#ifndef RLE_LEN_T
+#  define RLE_LEN_T int
+#endif
+// num_runs output type (CUB's OffsetT axis, via choose_signed_offset_t). Internal tile/run
+// arithmetic stays int: valid while num_items < 2^31 (the current launcher contract).
+#ifndef RLE_NUM_RUNS_T
+#  define RLE_NUM_RUNS_T int
+#endif
+// offset type (CUB's OffsetT): num_items and GLOBAL run indices/open lengths. Wide (i64) builds
+// carry the folded prefix as a 16B {count, open} pair and index outputs 64-bit -- REAL support
+// for num_items >= 2^31 (e.g. 2^32), not a widened parameter. Per-tile states are tile-bounded
+// and stay [launch_gen:32|open:16|count:16] regardless.
+#ifndef RLE_OFFSET_T
+#  define RLE_OFFSET_T int
+#endif
+#ifndef K_IPT
+#  define K_IPT 0
+#endif
+using KeyT     = RLE_KEY_T;
+using LenT     = RLE_LEN_T;
+using NumRunsT = RLE_NUM_RUNS_T;
+using OffT     = RLE_OFFSET_T;
+static_assert(sizeof(OffT) == 4 || sizeof(OffT) == 8, "OffT: int32 or int64");
+using RleConfigT        = rle_impl::winner_config<KeyT, K_IPT>;
 using u64               = rle_impl::u64;
 using TilePartialStateT = rle_impl::TilePartialStateT;
 
-constexpr int kTileSize = rle_impl::kTileSize;
+constexpr int kTileSize = RleConfigT::kTileSize;
 
 inline long long rle_state_tiles(long long n)
 {
@@ -111,7 +138,7 @@ inline cudaError_t persistent_rle_encode(
   auto* hdr                 = (RleTempHeader*) d_temp_storage;
   TilePartialStateT* states = (TilePartialStateT*) (hdr + 1);
   rle_init_states<<<1, 256, 0, stream>>>(hdr, states, tiles);
-  rle_impl::persistent_rle_launch(
+  rle_impl::persistent_rle_launch<KeyT, LenT, NumRunsT, OffT, RleConfigT>(
     d_keys, d_unique, d_counts, d_num_runs, states, &hdr->launch_gen, num_items, (int) tiles, stream);
   return cudaGetLastError();
 }

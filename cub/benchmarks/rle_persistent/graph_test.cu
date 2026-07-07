@@ -1,6 +1,3 @@
-// CUDA-graph capture/replay test for the CUB-shaped persistent RLE entry.
-// Captures ONE encode call, replays it 4x on the same temp storage: every replay must produce
-// correct results (device-side gen bumps per replay; stale states from prior replays never match).
 #include <cstdio>
 #include <random>
 #include <vector>

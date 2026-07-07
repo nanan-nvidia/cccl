@@ -12,118 +12,81 @@ namespace rle_impl
 namespace ptx = cuda::ptx;
 using u64     = cuda::std::uint64_t;
 
-// key/output types: one translation unit per instantiation (mirrors CUB's per-type bench TUs).
-// KeyT needs only operator== with CUB's equality semantics (floats: NaN breaks runs; complex:
-// componentwise). LenT is the run-length output type; run-length arithmetic is tile-local int,
-// widened at the store (valid while the longest run < 2^31, i.e. num_items < 2^31).
-#ifndef RLE_KEY_T
-#  define RLE_KEY_T int
-#endif
-#ifndef RLE_LEN_T
-#  define RLE_LEN_T int
-#endif
-// num_runs output type (CUB's OffsetT axis, via choose_signed_offset_t). Internal tile/run
-// arithmetic stays int: valid while num_items < 2^31 (the current launcher contract).
-#ifndef RLE_NUM_RUNS_T
-#  define RLE_NUM_RUNS_T int
-#endif
-// offset type (CUB's OffsetT): num_items and GLOBAL run indices/open lengths. Wide (i64) builds
-// carry the folded prefix as a 16B {count, open} pair and index outputs 64-bit -- REAL support
-// for num_items >= 2^31 (e.g. 2^32), not a widened parameter. Per-tile states are tile-bounded
-// and stay [launch_gen:32|open:16|count:16] regardless.
-#ifndef RLE_OFFSET_T
-#  define RLE_OFFSET_T int
-#endif
-using KeyT     = RLE_KEY_T;
-using LenT     = RLE_LEN_T;
-using NumRunsT = RLE_NUM_RUNS_T;
-using OffT     = RLE_OFFSET_T;
-static_assert(sizeof(OffT) == 4 || sizeof(OffT) == 8, "OffT: int or long long");
-// KeyT envelope: kSlotPad = 16/sizeof(KeyT) needs the size to DIVIDE the 16B TMA quantum (pow2
-// <= 16), and the key ring is carved from the 16B-aligned dynamic smem base. Exotic key types
-// (CUB accepts any trivially-copyable size via its untuned generic policy) must be routed to
-// stock cub::Encode by the dispatch shell instead of instantiating this kernel.
-// TODO(templates pass): these two asserts move inside the templated kernel body -- they are
-// per-instantiation constraints on the KeyT template parameter, not TU-scope facts.
-static_assert(16 % sizeof(KeyT) == 0, "KeyT size must be a power of two <= 16 (TMA quantum / kSlotPad math)");
-static_assert(alignof(KeyT) <= 16, "KeyT alignment must fit the 16B-aligned dynamic smem carve");
+template <class KeyT, int kIptOverride = 0>
+struct winner_config
+{
+  // size-class tile policy: the tile is capped at 8192 ELEMENTS by the ballot design (32 chunks x
+  // 32 lanes x kNumCompWarps warps); big keys shrink the tile to keep the 5-deep key ring inside
+  // the smem cap (8B keys: 5x4096x8=160KB; 16B: 5x2048x16=160KB; <=4B: the tuned 8192 geometry).
+  // elements/thread; tile = kNumCompWarps*kIPT*32 (small kIptOverride: local-GPU debug)
+  static constexpr int kIPT =
+    (kIptOverride != 0) ? kIptOverride : ((sizeof(KeyT) >= 16) ? 8 : (sizeof(KeyT) == 8 ? 16 : 32));
+  static constexpr int kNumCompWarps = 8; // warp-tiles stay 32*kIPT elems; cw grows the tile
+  // 8 beats 16 by +1.3 to +5 BWUtil pts everywhere except seg1 dense (-3.3) now that the drain path is
+  // cheap (v10); the old "16 balanced" verdict predates that. 16 = dense-leaning alternative.
+  static constexpr int kNumStoreWarps = 8; // store warps; must divide or be a multiple of kNumCompWarps
+  static constexpr int kStages        = 5; // pipeline depth (keys ring)
+                                    // 5 (with posRing 3) beats 4 by +0.3..+1.9pt EVERYWHERE; v17b's "5 loses"
+                                    // was a posRing-2 coupling confound. 5x keys + 3x pos = 212KB.
+  // positions ring depth: positions are written at staging and consumed by the drain ~2 pipeline_gens later,
+  // so the ring can be SHALLOWER than the keys ring -- freed smem buys bigger tiles / deeper stages.
+  // kPosBufStages < kStages adds a pos_buf_free barrier (store drains release a pos slot for re-staging).
+  static constexpr int kPosBufStages = 3; // shallower than the keys ring (positions live staging->drain only);
+                                          // 2 strangles the depth benefit (pos_buf_free gates staging on
+                                          // drains-2-back)
+  static_assert(kPosBufStages >= 2 && kPosBufStages <= kStages, "positions ring: 2..kStages");
+  // 4 is measured optimal (5 and 8 both lose, 1-10%): the 2-round fold structure OVERLAPS folding the
+  // old (long-published) tiles with the frontier tiles' publish window; a single wider round serializes
+  // the whole fold behind the youngest predecessor's publish.
+  static constexpr int kPollMlp = 4; // how many loads each poll lane keeps in flight
+  // head-flag words (one conflict-free STS.32 per lane; no scan, no peel, no pos-ring use) and the
+  // drain rank-selects head positions from them (5-shfl binary search + branchless nth-set-bit, pure
+  // registers, no LDS in the run loop). Dense warp-tiles keep the champion peel+positions path:
+  // decode cost scales with runs, the staging saving doesn't. Both sides derive the SAME predicate
+  // from the staged warp run count, so no mode flag is exchanged. Collects the measured peel-write
+  // conflict prize (v33: +0.4..+1.3 at seg4-16) and deletes staging work + pos_buf_free coupling at mid.
+  // re-swept 2026-07-06 after the nxt-ffs decode cheapening: 64 = +1.4 BWUtil pts at seg32, flat
+  // elsewhere (v33's "64/96 regress seg32" verdict predates cheap decode). 96 loses seg32 by -4.4
+  // (drags 65-96-run warp-tiles onto the run-scaling decode), 128 also craters seg16 (-12.6).
+  static constexpr int kHeadPosStagingThreshold = 64;
+  // prefix-decoupled drain. Warp-tiles with run count <= kRegBufMaxRuns decode+gather into
+  // REGISTERS before the prefixed wait (only the output ADDRESS needs the prefix), then release the
+  // pos slot AND the key slot -- `empty` stops waiting on the prefix chain entirely for buffered
+  // warp-tiles; the final store burst trails the pipeline by the prefix latency and nothing
+  // downstream orders on it. Early `empty` breaks the old "poll never overwrites a live
+  // prefix_packed" ordering proof; prefix_packed is double-buffered by slot-cycle parity instead
+  // (program order proves safety).
+  // buffered drain only pays when the drain is long enough for early slot-release to matter;
+  // near-empty warp-tiles (long segs) stay classic to avoid pure reshape overhead
+  // buffered-drain run cap, scaled so the per-lane register footprint stays constant as KeyT
+  // widens (cap/32 key+length pairs per lane; an 8B key costs 2 registers, a 16B key 4)
+  // register-buffer cap (runs/warp-tile), champion since v40
+  static constexpr int kRegBufMaxRuns      = (sizeof(KeyT) <= 4) ? 256 : (sizeof(KeyT) == 8 ? 128 : 64);
+  static constexpr int kRegBufMinThreshold = 8;
 
-#ifndef K_IPT
-// size-class tile policy: the tile is capped at 8192 ELEMENTS by the ballot design (32 chunks x
-// 32 lanes x kNumCompWarps warps); big keys shrink the tile to keep the 5-deep key ring inside
-// the smem cap (8B keys: 5x4096x8=160KB; 16B: 5x2048x16=160KB; <=4B: the tuned 8192 geometry).
-constexpr int kIPT = (sizeof(KeyT) >= 16) ? 8 : (sizeof(KeyT) == 8 ? 16 : 32);
-#else
-constexpr int kIPT = K_IPT; // elements/thread; tile = kNumCompWarps*kIPT*32 (small K_IPT: local-GPU debug)
-#endif
-#ifndef K_COMP_WARPS
-#  define K_COMP_WARPS 8
-#endif
-constexpr int kNumCompWarps = K_COMP_WARPS; // warp-tiles stay 32*kIPT elems; cw grows the tile
-#ifndef K_STORE_WARPS
-// 8 beats 16 by +1.3 to +5 BWUtil pts everywhere except seg1 dense (-3.3) now that the drain path is
-// cheap (v10); the old "16 balanced" verdict predates that. 16 = dense-leaning alternative.
-#  define K_STORE_WARPS 8
-#endif
-constexpr int kNumStoreWarps = K_STORE_WARPS; // store warps; must divide or be a multiple of kNumCompWarps
-#ifndef K_STAGES
-#  define K_STAGES \
-    5 // 5 (with posRing 3) beats 4 by +0.3..+1.9pt EVERYWHERE; v17b's "5 loses" was a
-      // posRing-2 coupling confound. 5x keys + 3x pos = 212KB.
-#endif
-constexpr int kStages = K_STAGES; // pipeline depth (keys ring)
-// positions ring depth: positions are written at staging and consumed by the drain ~2 pipeline_gens later,
-// so the ring can be SHALLOWER than the keys ring -- freed smem buys bigger tiles / deeper stages.
-// kPosBufStages < kStages adds a pos_buf_free barrier (store drains release a pos slot for re-staging).
-#ifndef K_POS_STAGES
-#  define K_POS_STAGES \
-    3 // shallower than the keys ring (positions live staging->drain only);
-      // 2 strangles the depth benefit (pos_buf_free gates staging on drains-2-back)
-#endif
-constexpr int kPosBufStages = K_POS_STAGES;
-static_assert(kPosBufStages >= 2 && kPosBufStages <= kStages, "positions ring: 2..kStages");
-
-#ifndef K_POLL_MLP
-// 4 is measured optimal (5 and 8 both lose, 1-10%): the 2-round fold structure OVERLAPS folding the
-// old (long-published) tiles with the frontier tiles' publish window; a single wider round serializes
-// the whole fold behind the youngest predecessor's publish.
-#  define K_POLL_MLP 4
-#endif
-constexpr int kPollMlp = K_POLL_MLP; // how many loads each poll lane keeps in flight
+  static constexpr int kWarpTileSize = 32 * kIPT;
+  static constexpr int kTileSize     = kNumCompWarps * kWarpTileSize;
+  static_assert(kTileSize <= 0xffff, "per-tile run_count/open_len must fit the 16-bit state-word fields");
+  static constexpr int kNumWarps          = 1 /*load*/ + kNumCompWarps + 1 /*poll*/ + kNumStoreWarps + 1 /*bookkeeper*/;
+  static constexpr int kNumThreads        = kNumWarps * 32;
+  static constexpr int poll_warp_id       = 1 + kNumCompWarps;
+  static constexpr int store_warp_id      = poll_warp_id + 1;
+  static constexpr int bookkeeper_warp_id = store_warp_id + kNumStoreWarps;
+  // for each input tile, we need to store the keys and in-tile positions
+  // for in tile position we can just do unsigned int16 since tile size is never bigger than 2^16
+  // each key slot carries kSlotPad extra leading elements
+  // we overcopy one 16B chunk to the left, this does two things at once:
+  // 1. no need for aligned address
+  // 2. we get the last tiles boundary element
+  static constexpr int kSlotPad    = 16 / sizeof(KeyT); // elements; 16 bytes = cp_async_bulk quantum
+  static constexpr int kSlotStride = kTileSize + kSlotPad;
+  static constexpr size_t kDynSmem =
+    (size_t) kStages * kSlotStride * sizeof(KeyT) + (size_t) kPosBufStages * kTileSize * sizeof(short);
+};
 
 // drain-loop unroll (gather MLP): 2 is the measured default winner (+6.5pt dense, ~flat elsewhere);
 // 4 gains less at dense and costs 1.3-1.5pt at seg8-16; 0 = no unroll. NOTE this knob's verdict
 // FLIPPED twice as the surrounding design changed -- re-sweep it after any store-path change.
-
-// head-flag words (one conflict-free STS.32 per lane; no scan, no peel, no pos-ring use) and the
-// drain rank-selects head positions from them (5-shfl binary search + branchless nth-set-bit, pure
-// registers, no LDS in the run loop). Dense warp-tiles keep the champion peel+positions path:
-// decode cost scales with runs, the staging saving doesn't. Both sides derive the SAME predicate
-// from the staged warp run count, so no mode flag is exchanged. Collects the measured peel-write
-// conflict prize (v33: +0.4..+1.3 at seg4-16) and deletes staging work + pos_buf_free coupling at mid.
-#ifndef RLE_HEAD_POS_STAGING_THRESHOLD
-// re-swept 2026-07-06 after the nxt-ffs decode cheapening: 64 = +1.4 BWUtil pts at seg32, flat
-// elsewhere (v33's "64/96 regress seg32" verdict predates cheap decode). 96 loses seg32 by -4.4
-// (drags 65-96-run warp-tiles onto the run-scaling decode), 128 also craters seg16 (-12.6).
-#  define RLE_HEAD_POS_STAGING_THRESHOLD 64
-#endif
-// RLE_REGBUF: prefix-decoupled drain. Warp-tiles with run count <= RLE_REGBUF decode+gather into
-// REGISTERS before the prefixed wait (only the output ADDRESS needs the prefix), then release the
-// pos slot AND the key slot -- `empty` stops waiting on the prefix chain entirely for buffered
-// warp-tiles; the final store burst trails the pipeline by the prefix latency and nothing
-// downstream orders on it. Early `empty` breaks the old "poll never overwrites a live
-// prefix_packed" ordering proof; prefix_packed is double-buffered by slot-cycle parity instead
-// (program order proves safety). 0 = off. Buffer = RLE_REGBUF/32 int pairs per lane (registers).
-// buffered drain only pays when the drain is long enough for early slot-release to matter;
-// near-empty warp-tiles (long segs) stay classic to avoid pure reshape overhead
-#ifndef RLE_REGBUF
-#  define RLE_REGBUF 256 // register-buffer cap (runs/warp-tile), champion since v40
-#endif
-#ifndef RLE_REG_BUF_MIN_THRESHOLD
-#  define RLE_REG_BUF_MIN_THRESHOLD 8
-#endif
-
-constexpr int kRegBufMaxRuns = (sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64);
 
 // This is important for position staging on dense cases (16 way bank conflicts).
 __device__ __forceinline__ int swizzle_xor_stride32(int x)
@@ -136,36 +99,14 @@ __device__ __forceinline__ int swizzle_xor_stride32(int x)
 // The CLC knob removed since I want to focus on blackwell perf first
 // i.e. we fry one fish at a time :)
 
-constexpr int kWarpTileSize = 32 * kIPT;
-constexpr int kTileSize     = kNumCompWarps * kWarpTileSize;
-static_assert(kTileSize <= 0xffff, "per-tile run_count/open_len must fit the 16-bit state-word fields");
-constexpr int kNumWarps          = 1 /*load*/ + kNumCompWarps + 1 /*poll*/ + kNumStoreWarps + 1 /*bookkeeper*/;
-constexpr int kNumThreads        = kNumWarps * 32;
-constexpr unsigned kFullMask     = 0xffffffffu;
-constexpr int poll_warp_id       = 1 + kNumCompWarps;
-constexpr int store_warp_id      = poll_warp_id + 1;
-constexpr int bookkeeper_warp_id = store_warp_id + kNumStoreWarps;
-
-// for each input tile, we need to store the keys and in-tile positions
-// for in tile position we can just do unsigned int16 since tile size is never bigger than 2^16
-// each key slot carries kSlotPad extra leading elements
-// we overcopy one 16B chunk to the left, this does two things at once:
-// 1. no need for aligned address
-// 2. we get the last tiles boundary element
-constexpr int kSlotPad    = 16 / sizeof(KeyT); // elements; 16 bytes = cp_async_bulk quantum
-constexpr int kSlotStride = kTileSize + kSlotPad;
-constexpr size_t kDynSmem =
-  (size_t) kStages * kSlotStride * sizeof(KeyT) + (size_t) kPosBufStages * kTileSize * sizeof(short);
+constexpr unsigned kFullMask = 0xffffffffu;
 
 // tile_partial_states: one word per tile
 // Layout: u64 [launch_gen:32][open_len:16][run_count:16]
 // launch_gen is needed to reuse allocations per launch
 // (this is needed to eliminate overhead of allocating the buffer. CRITICAL for perf!)
 // an aligned 64-bit access is already non-tearing, but atomic_ref doesn't hurt and has clear semantics
-// TODO(templates pass): make TilePartialStateT a struct wrapping the u64 with launch_gen() /
-// run_count() / open_len() accessors -- call sites become packed_words[i].launch_gen() (the
-// "from what" rides on the receiver, so the extract_* function names shrink away); fold in when
-// the RLE_*_T macros become template parameters.
+// TODO: make this a struct!!!!
 using TilePartialStateT = u64;
 
 __device__ __forceinline__ unsigned extract_launch_gen_from_tile_partial_state(TilePartialStateT w)
@@ -203,15 +144,16 @@ __device__ __forceinline__ TilePartialStateT load_state(TilePartialStateT* tile_
 // TODO(templates pass): replace ulonglong2 with a named alignas(16) struct { run_count, open_len }
 // -- keeps the single STS.128/LDS.128 access, kills the meaningless .x/.y members, and the
 // pack/unpack helpers collapse into the struct (same treatment as TilePartialStateT).
+template <class OffT>
 using PrefixT = cuda::std::conditional_t<(sizeof(OffT) > 4), ulonglong2, u64>;
 
 // how do we pack them? if P is 32 bit, we compact them into 1 word. Otherwise, 2 words!
-template <class P = PrefixT>
-__device__ __forceinline__ P pack_prefix(OffT run_count, OffT open_len)
+template <class OffT>
+__device__ __forceinline__ PrefixT<OffT> pack_prefix(OffT run_count, OffT open_len)
 {
   if constexpr (sizeof(OffT) > 4)
   {
-    return P{(u64) run_count, (u64) open_len};
+    return PrefixT<OffT>{(u64) run_count, (u64) open_len};
   }
   else
   {
@@ -219,7 +161,7 @@ __device__ __forceinline__ P pack_prefix(OffT run_count, OffT open_len)
   }
 }
 
-template <class P>
+template <class OffT, class P>
 __device__ __forceinline__ OffT prefix_run_count(P p)
 {
   if constexpr (sizeof(OffT) > 4)
@@ -231,7 +173,7 @@ __device__ __forceinline__ OffT prefix_run_count(P p)
     return (OffT) (unsigned) (p & 0xffffffffull);
   }
 }
-template <class P>
+template <class OffT, class P>
 __device__ __forceinline__ OffT prefix_open_len(P p)
 {
   if constexpr (sizeof(OffT) > 4)
@@ -287,6 +229,7 @@ __device__ __forceinline__ int nth_set_bit(unsigned flag_mask, int rank)
   return bit_position;
 }
 
+template <class Config, class OffT>
 __device__ __forceinline__ void poll_and_fold(
   TilePartialStateT* tile_partial_states,
   unsigned launch_gen,
@@ -298,6 +241,7 @@ __device__ __forceinline__ void poll_and_fold(
   OffT& curr_prefix_run_count,
   OffT& curr_prefix_open_length)
 {
+  constexpr int kPollMlp = Config::kPollMlp;
   while (last_seen_tile_id < tile_id)
   {
     const int remain = tile_id - last_seen_tile_id;
@@ -359,7 +303,8 @@ __device__ __forceinline__ void poll_and_fold(
 }
 
 // we aim for 1 block/SM since it is easier to manage resources: do not need to worry about occupancy anymore
-__launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
+template <class KeyT, class LenT, class NumRunsT, class OffT, class Config>
+__launch_bounds__(Config::kNumThreads, 1) __global__ void persistent_rle(
   const KeyT* __restrict__ d_keys,
   KeyT* __restrict__ d_unique,
   LenT* __restrict__ d_counts,
@@ -369,6 +314,28 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   OffT num_items,
   int num_tiles)
 {
+  // KeyT envelope: kSlotPad = 16/sizeof(KeyT) needs the size to DIVIDE the 16B TMA quantum (pow2
+  // <= 16), and the key ring is carved from the 16B-aligned dynamic smem base. Exotic key types
+  // (CUB accepts any trivially-copyable size via its untuned generic policy) must be routed to
+  // stock cub::Encode by the dispatch shell instead of instantiating this kernel.
+  static_assert(16 % sizeof(KeyT) == 0, "KeyT size must be a power of two <= 16");
+  static_assert(alignof(KeyT) <= 16, "Alignment <= 16");
+  constexpr int kIPT                     = Config::kIPT;
+  constexpr int kNumCompWarps            = Config::kNumCompWarps;
+  constexpr int kNumStoreWarps           = Config::kNumStoreWarps;
+  constexpr int kStages                  = Config::kStages;
+  constexpr int kPosBufStages            = Config::kPosBufStages;
+  constexpr int kHeadPosStagingThreshold = Config::kHeadPosStagingThreshold;
+  constexpr int kRegBufMinThreshold      = Config::kRegBufMinThreshold;
+  constexpr int kRegBufMaxRuns           = Config::kRegBufMaxRuns;
+  constexpr int kWarpTileSize            = Config::kWarpTileSize;
+  constexpr int kTileSize                = Config::kTileSize;
+  constexpr int kSlotPad                 = Config::kSlotPad;
+  constexpr int kSlotStride              = Config::kSlotStride;
+  constexpr int poll_warp_id             = Config::poll_warp_id;
+  constexpr int store_warp_id            = Config::store_warp_id;
+  constexpr int bookkeeper_warp_id       = Config::bookkeeper_warp_id;
+  using PrefixT                          = rle_impl::PrefixT<OffT>;
   // [kStages][kTileSize] input keys
   // [kStages][kTileSize] int16 staged head positions
   extern __shared__ char smem_raw[]; // 16B-aligned; KeyT alignment <= 16 for all supported types
@@ -633,7 +600,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       // now we start to stage head positions per warp tile, if a warptile has enough runs
       // (it is only worth it when we have more runs by a certain threshold per warp tile)
       // (otherwise, it is cheaper to recalculate positions from head_flags directly)
-      const bool stage_flags = (local_run_count < RLE_HEAD_POS_STAGING_THRESHOLD);
+      const bool stage_flags = (local_run_count < kHeadPosStagingThreshold);
       if (stage_flags)
       {
         head_flag_buf[slot_id][compute_warp_id * 32 + lane_id] = my_flags;
@@ -711,7 +678,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         break;
       }
       OffT curr_prefix_run_count, curr_prefix_open_length;
-      poll_and_fold(
+      poll_and_fold<Config>(
         tile_partial_states,
         launch_gen,
         tile_id,
@@ -777,7 +744,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         while (!ptx::mbarrier_try_wait_parity(&prefixed[slot_id], (unsigned) ((pipeline_gen / kStages) & 1)))
         {
         }
-        return prefix_run_count(prefix_packed[slot_id][(pipeline_gen / kStages) & 1]);
+        return prefix_run_count<OffT>(prefix_packed[slot_id][(pipeline_gen / kStages) & 1]);
       };
       // drain writes [run_begin, run_end) of warp tile (warp_tile_id)'s staged output into the global arrays.
       // Per run: gather its key from the run's head position -> d_unique,
@@ -792,7 +759,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
         const int warp_tile_offset              = warp_tile_id * kWarpTileSize;
         // this is a lot of code, but this buys us 2 - 3.5% BWUtil at MaxSegs 64 - 1M
-        if (warp_tile_run_count < RLE_HEAD_POS_STAGING_THRESHOLD)
+        if (warp_tile_run_count < kHeadPosStagingThreshold)
         {
           // the compute warp judged this warp tile too sparse to be worth the position-staging
           // and it has decided to write only the 32 head-flag words
@@ -906,7 +873,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       const int runs_before_warp_tile      = __shfl_sync(kFullMask, lane_runs_before_warp_tile, warp_tile_id);
       // if our register budget allows it and it is worth it, we can buffer intermidiate results in register
       // and arrive empty early. this buys 2.5% BWUtil at the worst segments
-      if (warp_tile_run_count >= RLE_REG_BUF_MIN_THRESHOLD && warp_tile_run_count <= kRegBufMaxRuns)
+      if (warp_tile_run_count >= kRegBufMinThreshold && warp_tile_run_count <= kRegBufMaxRuns)
       {
         const int run_begin = (int) ((long) warp_tile_run_count * sub / kStoreWarpsPerWarpTile);
         const int run_end   = (int) ((long) warp_tile_run_count * (sub + 1) / kStoreWarpsPerWarpTile);
@@ -920,7 +887,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         int buf_run_length[kBufPerLane];
         const int warp_tile_offset = warp_tile_id * kWarpTileSize;
         const int num_rounds       = (run_end - run_begin + 31) >> 5;
-        if (warp_tile_run_count < RLE_HEAD_POS_STAGING_THRESHOLD)
+        if (warp_tile_run_count < kHeadPosStagingThreshold)
         {
           // this is basically the same as drain, need to refactor this so we are not copy pasting code around
           const unsigned lane_head_flag_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
@@ -1003,7 +970,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           {
             ptx::mbarrier_arrive(&pos_buf_free[pipeline_gen % kPosBufStages]);
           }
-          ptx::mbarrier_arrive(&empty[slot_id]); // key reads done too: outputs live in registers
+          ptx::mbarrier_arrive(&empty[slot_id]); // with register buffers we can arrive early
         }
         const OffT global_runs_before_warp_tile = wait_prefixed_and_read() + runs_before_warp_tile;
 #pragma unroll
@@ -1024,11 +991,11 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
             }
           }
         }
-        continue; // pos_buf_free/empty already arrived for this pipeline_gen
+        continue;
       } // reg buf
-      // classic path -- champion order: prefixed wait, then staged_warp_tile, then drain
+      // if not reg buffed, we do the normal things, i.e. prefixed wait, then staged_warp_tile, then drain
       const OffT curr_prefix_run_count = wait_prefixed_and_read();
-      // wait for staged_warp_tile (3/3): only THIS warp-tile's positions -- not the other 7 compute warps
+      // wait for staged_warp_tile (3/3)
       while (!ptx::mbarrier_try_wait_parity(
         &staged_warp_tile[slot_id][warp_tile_id], (unsigned) ((pipeline_gen / kStages) & 1)))
       {
@@ -1043,18 +1010,14 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       {
         if constexpr (kPosBufStages < kStages)
         {
-          ptx::mbarrier_arrive(&pos_buf_free[pipeline_gen % kPosBufStages]); // this warp's drain no longer reads the
-                                                                             // pos slot
+          ptx::mbarrier_arrive(&pos_buf_free[pipeline_gen % kPosBufStages]);
         }
         // store done, load may proceed!
         ptx::mbarrier_arrive(&empty[slot_id]);
       }
     }
   }
-  // if you are the bookkeeper: ALL prefix-dependent boundary bookkeeping, off the store warps'
-  // drain path. IKET showed this block (350-390ns) riding the ONE store warp that gates `empty`
-  // in every regime where store binds (seg1-16); as its own warp it runs parallel to the drains
-  // and is absorbed by slack where poll binds.
+  // if you are the bookkeeper (i should rename this to boundarycloser...)
   else
   {
     for (int pipeline_gen = 0;; ++pipeline_gen)
@@ -1074,7 +1037,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       }
       const int tile_len = (int) min((OffT) kTileSize, num_items - (OffT) tile_id * kTileSize);
       const bool is_last = (tile_id == num_tiles - 1);
-      // per-warp-tile counts/bases in registers, same scan as the store warps (lane i = warp-tile i)
+      // same scan as the store warps (lane i = warp-tile i)
       const int lane_warp_tile_run_count = (lane_id < kNumCompWarps) ? warp_run_counts[slot_id][lane_id] : 0;
       int lane_warp_tile_run_count_scan  = lane_warp_tile_run_count;
 #pragma unroll
@@ -1093,8 +1056,8 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
       {
       }
       const PrefixT packed_prefix        = prefix_packed[slot_id][(pipeline_gen / kStages) & 1];
-      const OffT curr_prefix_run_count   = prefix_run_count(packed_prefix);
-      const OffT curr_prefix_open_length = prefix_open_len(packed_prefix);
+      const OffT curr_prefix_run_count   = prefix_run_count<OffT>(packed_prefix);
+      const OffT curr_prefix_open_length = prefix_open_len<OffT>(packed_prefix);
       // per-warp-tile boundary: a warp-tile's last run is closed by the next nonempty warp-tile's
       // first head. lane L handles warp-tile L.
       if (lane_id < kNumCompWarps && lane_warp_tile_run_count > 0)
@@ -1140,6 +1103,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
   }
 }
 
+template <class KeyT, class LenT, class NumRunsT, class OffT, class Config = winner_config<KeyT>>
 inline void persistent_rle_launch(
   const KeyT* d_keys,
   KeyT* d_unique,
@@ -1151,19 +1115,19 @@ inline void persistent_rle_launch(
   int num_tiles,
   cudaStream_t stream)
 {
-  // raise the dynamic-smem cap once (idempotent; kept off the per-launch path)
+  constexpr size_t kDynSmem      = Config::kDynSmem;
+  constexpr int kNumThreads      = Config::kNumThreads;
   static const bool smem_cap_set = [] {
-    cudaFuncSetAttribute(persistent_rle, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kDynSmem);
+    cudaFuncSetAttribute(
+      persistent_rle<KeyT, LenT, NumRunsT, OffT, Config>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kDynSmem);
     return true;
   }();
   (void) smem_cap_set;
 
-  // no per-launch clear of tile_state: states are generation-tagged (see publish_state) and the
-  // generation lives in DEVICE memory (see the init kernel in rle_dispatch.cuh) -- no host-side
-  // state, so calls are CUDA-graph-capturable and thread-safe per temp-storage allocation.
+  // no need for per launch clear of tile_state since they are now tagged with launch_gen
   const int blocks = num_tiles;
 
-  persistent_rle<<<blocks, kNumThreads, kDynSmem, stream>>>(
+  persistent_rle<KeyT, LenT, NumRunsT, OffT, Config><<<blocks, kNumThreads, kDynSmem, stream>>>(
     d_keys, d_unique, d_counts, d_num_runs, tile_state, d_launch_gen, num_items, num_tiles);
 }
 } // namespace rle_impl
