@@ -749,12 +749,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         break;
       }
       // store warps and compute warps are decoupled
-      // storeW>=cw -> multiple store warps split one compute warp's runs;
-      // storeW<cw -> each store warp drains cw/storeW whole regions. One must divide the other.
-      // fewer store warps than compute warps has no winning regime: store warps are gather/STG
-      // MLP and warp slots are not scarce at 1 block/SM -- the old walk-multiple-warp-tiles
-      // branch was never part of any champion (deleted 2026-07-06, recover from git if a
-      // 2-blocks/SM world ever makes warps scarce).
+      // fewer store warps than compute warps has no winning regime since warp slots are not scarce at 1 block/SM
       static_assert(kNumStoreWarps >= kNumCompWarps && kNumStoreWarps % kNumCompWarps == 0,
                     "store warps: a whole multiple of compute warps");
       // per-warp-tile run bases (lane i owns warp-tile i's count/base) and done BEFORE the wait on prefixed so they
@@ -794,6 +789,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
                        int run_end) {
         const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
         const int warp_tile_offset              = warp_tile_id * kWarpTileSize;
+        // this is a lot of code, but this buys us 2 - 3.5% BWUtil at MaxSegs 64 - 1M
         if (warp_tile_run_count < RLE_HEAD_POS_STAGING_THRESHOLD)
         {
           // the compute warp judged this warp tile too sparse to be worth the position-staging
@@ -886,16 +882,12 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           return;
         } // if not staged
 #pragma unroll 2
+        // if staged
         for (int run_idx = run_begin + lane_id; run_idx < run_end; run_idx += 32)
         {
           const OffT global_run_idx = global_runs_before_warp_tile + run_idx;
           const int head_pos        = (int) run_positions[warp_tile_offset + swizzle_xor_stride32(run_idx)];
-          // PROBE: WARP-LOCAL stride-1 gather address of identical cost (WRONG results); pos loads
-          // unchanged. Warp-local matters: v32's tile-local fake collapsed all store warps onto the
-          // same words and cost -4pt dense by itself. At seg1 this fake == the real pattern exactly
-          // (every element is a head), so the dense delta doubles as the probe's sanity check.
-
-          d_unique[global_run_idx] = tile_keys[head_pos]; // gather the run's key at its head position
+          d_unique[global_run_idx]  = tile_keys[head_pos]; // gather the run's key at its head position
           if (run_idx + 1 < warp_tile_run_count)
           {
             // within-warp delta (next head - this head); the last run is fixed separately
@@ -904,12 +896,13 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
           }
         }
       };
-      // if we have more store warps, each warptile is split between store warps
+      // since we have more store warps, each warptile is split between store warps
       constexpr int kStoreWarpsPerWarpTile = kNumStoreWarps / kNumCompWarps;
       const int warp_tile_id               = store_warp_idx / kStoreWarpsPerWarpTile;
       const int sub                        = store_warp_idx % kStoreWarpsPerWarpTile;
       const int warp_tile_run_count        = __shfl_sync(kFullMask, lane_warp_tile_run_count, warp_tile_id);
       const int runs_before_warp_tile      = __shfl_sync(kFullMask, lane_runs_before_warp_tile, warp_tile_id);
+
       if (warp_tile_run_count >= RLE_RB_MIN
           && warp_tile_run_count <= ((sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64)))
       {
@@ -921,8 +914,10 @@ __launch_bounds__(kNumThreads, 1) __global__ void persistent_rle(
         {
         }
         // register-budget scale: big keys hold fewer buffered runs/lane (16B keys: 2 -> 8 regs)
-        constexpr int kRegBufCap  = (sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64);
-        constexpr int kBufPerLane = (kRegBufCap + 31) / 32;
+        constexpr int kRegBufCap = (sizeof(KeyT) <= 4) ? RLE_REGBUF : (sizeof(KeyT) == 8 ? 128 : 64);
+        // clamped to 1 so RLE_REGBUF=0 (buffered drain off) still compiles: the band check above
+        // is then never true and the arrays are dead
+        constexpr int kBufPerLane = ((kRegBufCap + 31) / 32 > 0) ? (kRegBufCap + 31) / 32 : 1;
         KeyT buf_key[kBufPerLane];
         int buf_cnt[kBufPerLane];
         const int warp_tile_offset = warp_tile_id * kWarpTileSize;
