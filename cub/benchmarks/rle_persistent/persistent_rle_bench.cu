@@ -1,7 +1,3 @@
-// nvbench comparison vs cub::DeviceRunLengthEncode across the official encode-bench type matrix:
-// T x OffsetT x RunLengthT as literal type-axis columns, mirroring cub/benchmarks/bench/
-// run_length_encode/encode.cu (num_runs type = choose_signed_offset_t<OffsetT>, MaxSegSize
-// pow2 {2,16,256}); Elements pinned at 2^28.
 #include <cub/detail/choose_offset.cuh>
 #include <cub/device/device_run_length_encode.cuh>
 
