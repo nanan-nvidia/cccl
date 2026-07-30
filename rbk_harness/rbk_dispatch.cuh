@@ -17,6 +17,8 @@ namespace rbk_kernels = CUB_NS_QUALIFIER::detail::reduce_by_key::lookahead;
 using CountStateT = rbk_kernels::CountStateT;
 template <class ValueT, class OffT>
 using TileValueRecordT = rbk_kernels::TileValueRecordT<ValueT, OffT>;
+template <class OffT>
+using TilePrefixT = rbk_kernels::PrefixT<OffT>;
 
 // tile count below which stock CUB runs
 constexpr int kStockDispatchTiles = 1024;
@@ -94,8 +96,10 @@ inline cudaError_t persistent_rbk_encode(
   size_t cub_bytes = 0;
   cub::DeviceReduce::ReduceByKey(
     nullptr, cub_bytes, d_keys, d_unique, d_values, d_aggregates, d_num_runs, cuda::std::plus<>{}, num_items, stream);
-  const size_t pers_bytes = (size_t) rbk_state_tiles<Config>((long long) num_items)
-                          * (sizeof(CountStateT) + sizeof(TileValueRecordT<ValueT, OffT>));
+  const long long q_tiles = rbk_state_tiles<Config>((long long) num_items);
+  const size_t pers_bytes = (size_t) q_tiles
+                            * (sizeof(CountStateT) + sizeof(TileValueRecordT<ValueT, OffT>)
+                               + sizeof(TilePrefixT<OffT>) + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned));
   const size_t required   = cuda::std::max(cub_bytes, pers_bytes);
   if (d_temp_storage == nullptr)
   {
@@ -137,6 +141,8 @@ inline cudaError_t persistent_rbk_encode(
   }
   auto* count_states    = (CountStateT*) d_temp_storage;
   auto* value_records   = (TileValueRecordT<ValueT, OffT>*) (count_states + tiles);
+  auto* tile_prefixes   = (TilePrefixT<OffT>*) (value_records + tiles);
+  auto* flag_words      = (unsigned*) (tile_prefixes + tiles);
   const int init_blocks = (int) ((tiles + 255) / 256);
   // only the tagged COUNT states need clearing; the value records are plain outputs of the main
   // kernel, synchronized by the launch boundary
@@ -157,7 +163,8 @@ inline cudaError_t persistent_rbk_encode(
     d_aggregates,
     d_num_runs,
     count_states,
-    value_records,
+    flag_words,
+    tile_prefixes,
     num_items,
     (int) tiles,
     Config::kStages,
@@ -168,7 +175,18 @@ inline cudaError_t persistent_rbk_encode(
   {
     return error;
   }
-  const int cleanup_blocks = (int) ((tiles * 32 + 255) / 256); // one warp per tile
+  // PASS 2: the pipeline-free value kernel (block per tile)
+  auto* vkernel =
+    rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT>;
+  vkernel<<<(int) tiles, Config::kNumCompWarps * 32, 0, stream>>>(
+    d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles);
+  error = cudaPeekAtLastError();
+  if (error != cudaSuccess)
+  {
+    return error;
+  }
+  // PASS 3: boundary cleanup (one warp per tile with a pending cross-tile close)
+  const int cleanup_blocks = (int) ((tiles * 32 + 255) / 256);
   rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<<<cleanup_blocks, 256, 0, stream>>>(
     d_aggregates, value_records, (int) tiles);
   return cudaPeekAtLastError();
