@@ -794,7 +794,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   using PrefixT                = reduce_by_key::lookahead::PrefixT<OffT>;
   // the dense band's fused-stream crossover (runs per warp tile); below it, per-run span walks
   // are output-proportional and cheaper
-  constexpr int stream_threshold = policy.warp_tile_size() / 2;
+#ifdef RBK_STREAM_DIV
+  constexpr int stream_threshold = policy.warp_tile_size() / RBK_STREAM_DIV;
+#else
+  // B200 receipt: /4 pulls the seg4 band into the stream and costs nothing anywhere else
+  constexpr int stream_threshold = policy.warp_tile_size() / 4;
+#endif
   // [key_ring_stages][tile_size] input keys
   // [key_ring_stages][tile_size] int16 staged head positions
   extern __shared__ char smem_raw[];
@@ -1165,7 +1170,12 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   constexpr int compute_warps                = policy.compute_warps;
   constexpr int warp_tile_size               = policy.warp_tile_size();
   constexpr int tile_size                    = policy.tile_size();
-  constexpr int stream_threshold             = warp_tile_size / 2;
+#ifdef RBK_STREAM_DIV
+  constexpr int stream_threshold = warp_tile_size / RBK_STREAM_DIV;
+#else
+  // B200 receipt: /4 pulls the seg4 band into the stream and costs nothing anywhere else
+  constexpr int stream_threshold = warp_tile_size / 4;
+#endif
   __shared__ int wt_counts[compute_warps];
   __shared__ ValueT wt_leads[compute_warps];
   __shared__ ValueT wt_tails[compute_warps];
