@@ -15,8 +15,8 @@ namespace rbk_impl
 namespace rbk_kernels = CUB_NS_QUALIFIER::detail::reduce_by_key::lookahead;
 
 using CountStateT = rbk_kernels::CountStateT;
-template <class ValueT>
-using ValueStateT = rbk_kernels::ValueStateT<ValueT>;
+template <class ValueT, class OffT>
+using TileValueRecordT = rbk_kernels::TileValueRecordT<ValueT, OffT>;
 
 // tile count below which stock CUB runs
 constexpr int kStockDispatchTiles = 1024;
@@ -94,8 +94,8 @@ inline cudaError_t persistent_rbk_encode(
   size_t cub_bytes = 0;
   cub::DeviceReduce::ReduceByKey(
     nullptr, cub_bytes, d_keys, d_unique, d_values, d_aggregates, d_num_runs, cuda::std::plus<>{}, num_items, stream);
-  const size_t pers_bytes =
-    (size_t) rbk_state_tiles<Config>((long long) num_items) * (sizeof(CountStateT) + sizeof(ValueStateT<ValueT>));
+  const size_t pers_bytes = (size_t) rbk_state_tiles<Config>((long long) num_items)
+                          * (sizeof(CountStateT) + sizeof(TileValueRecordT<ValueT, OffT>));
   const size_t required   = cuda::std::max(cub_bytes, pers_bytes);
   if (d_temp_storage == nullptr)
   {
@@ -136,11 +136,12 @@ inline cudaError_t persistent_rbk_encode(
       stream);
   }
   auto* count_states    = (CountStateT*) d_temp_storage;
-  auto* value_states    = (ValueStateT<ValueT>*) (count_states + tiles);
-  const int init_blocks = (int) ((2 * tiles + 255) / 256);
-  // both state arrays are u64 words cleared to tag 0; one init pass covers them
+  auto* value_records   = (TileValueRecordT<ValueT, OffT>*) (count_states + tiles);
+  const int init_blocks = (int) ((tiles + 255) / 256);
+  // only the tagged COUNT states need clearing; the value records are plain outputs of the main
+  // kernel, synchronized by the launch boundary
   rbk_kernels::DeviceReduceByKeyLookaheadInitKernel<typename Config::Selector>
-    <<<init_blocks, 256, 0, stream>>>((::cuda::std::uint64_t*) d_temp_storage, 2 * tiles);
+    <<<init_blocks, 256, 0, stream>>>(count_states, tiles);
 
   auto* kernel = rbk_kernels::DeviceReduceByKeyLookaheadKernel<typename Config::Selector, KeyT, ValueT, NumRunsT, OffT>;
   error        = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) Config::kDynSmem);
@@ -156,12 +157,20 @@ inline cudaError_t persistent_rbk_encode(
     d_aggregates,
     d_num_runs,
     count_states,
-    value_states,
+    value_records,
     num_items,
     (int) tiles,
     Config::kStages,
     Config::kPosStages,
     /*keys_staged=*/true);
+  error = cudaPeekAtLastError();
+  if (error != cudaSuccess)
+  {
+    return error;
+  }
+  const int cleanup_blocks = (int) ((tiles * 32 + 255) / 256); // one warp per tile
+  rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<<<cleanup_blocks, 256, 0, stream>>>(
+    d_aggregates, value_records, (int) tiles);
   return cudaPeekAtLastError();
 }
 } // namespace rbk_impl
