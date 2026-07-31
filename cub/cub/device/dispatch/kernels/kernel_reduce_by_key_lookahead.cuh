@@ -466,7 +466,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT span_sum_prefetched(const ValueT* tile
 // row r IN PLACE by r makes the walk's column-step banks (e+l) mod 32 -- conflict-free with ZERO
 // extra smem, no shuffles, no padding. The walk itself stays pure FADD/FSEL + one predicated
 // store (SASS receipted branchless). MIO per warp tile ~= 96 plain smem ops; no collectives.
-template <int items_per_thread, class ValueT, class OffT>
+// batched_stores (dense band): each lane's emission ranks are CONTIGUOUS from its base, so
+// aggregates batch in a 4-register ring and flush as one 16B store per 4 runs (dense is
+// MIO/issue-throughput bound: stream = 0.47 collective ops per element vs the walk's 0.10; the
+// walk's dense blocker was serial scalar store issue -- this cuts it 4x). Alignment prologue
+// and tail are harmless idempotent double-stores, keeping the step branch-light.
+template <int items_per_thread, bool batched_stores, class ValueT, class OffT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   ValueT* __restrict__ d_aggregates,
   ValueT* __restrict__ smem_vals, // the staged tile; rows get ROTATED in place
@@ -500,13 +505,31 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   int heads_seen             = 0;
   const ValueT* const my_row = wt_base + lane_id * 32;
   ValueT* const out          = d_aggregates + gbase;
-  auto step                  = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
+  ValueT buf[4];
+  auto step = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
     const bool head      = (my_word >> e) & 1u;
     const ValueT new_ssh = head ? v : (sum_since_head + v);
     const ValueT new_pfx = (head || heads_seen > 0) ? prefix_sum : (prefix_sum + v);
     if (head && heads_seen > 0)
     {
-      out[heads_seen - 1] = sum_since_head;
+      if constexpr (batched_stores)
+      {
+        const int idx = heads_seen - 1;
+        const int g3  = (int) ((gbase + idx) & 3);
+        buf[g3]       = sum_since_head;
+        if (idx <= 2)
+        {
+          out[idx] = sum_since_head; // alignment prologue: idempotent with the vector flush
+        }
+        if (g3 == 3 && idx >= 3)
+        {
+          *(uint4*) (out + (idx - 3)) = *(const uint4*) buf; // 16B-aligned by construction
+        }
+      }
+      else
+      {
+        out[heads_seen - 1] = sum_since_head;
+      }
     }
     heads_seen += (int) head;
     sum_since_head = new_ssh;
@@ -527,6 +550,20 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
     for (int e = 0; e < valid; ++e)
     {
       step(e, my_row[(e + lane_id) & 31]);
+    }
+  }
+  if constexpr (batched_stores)
+  {
+    // last (possibly partial) group never hit a flush boundary: re-store its <=3 ranks scalar
+    const int interior = (heads_seen > 0) ? (heads_seen - 1) : 0;
+#  pragma unroll
+    for (int k = 0; k < 3; ++k)
+    {
+      const int idx = interior - 1 - k;
+      if (idx >= 0)
+      {
+        out[idx] = buf[(int) ((gbase + idx) & 3)];
+      }
     }
   }
   const bool has_head   = heads_seen > 0;
@@ -1731,7 +1768,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else if (from_smem && warp_tile_run_count < stream_threshold)
     {
-      chunk_reduce_rotated<items_per_thread>(
+      chunk_reduce_rotated<items_per_thread, false>(
         d_aggregates,
         staged_vals,
         my_word,
@@ -1744,11 +1781,36 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else if (warp_tile_run_count >= stream_threshold)
     {
-      stream_values_from_flags<items_per_thread>(
-        d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
-      const HeadFlagDecodeT dec(my_word, lane_id);
-      const RunSpanT first_run = dec.decode_run(0);
-      wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+      bool batch_ok = false;
+      if constexpr (from_smem && sizeof(ValueT) == 4)
+      {
+        batch_ok = (((size_t) d_aggregates & 15) == 0);
+      }
+      if (batch_ok)
+      {
+        if constexpr (from_smem && sizeof(ValueT) == 4)
+        {
+          chunk_reduce_rotated<items_per_thread, true>(
+            d_aggregates,
+            staged_vals,
+            my_word,
+            global_runs_before_warp_tile,
+            warp_tile_offset,
+            wt_end,
+            lane_id,
+            wt_lead,
+            wt_tail);
+        }
+      }
+      else
+      {
+        stream_values_from_flags<items_per_thread>(
+          d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
+        const HeadFlagDecodeT dec(my_word, lane_id);
+        const RunSpanT first_run = dec.decode_run(0);
+        wt_lead =
+          warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+      }
     }
     else
     {
