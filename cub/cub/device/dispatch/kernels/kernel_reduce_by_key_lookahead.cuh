@@ -1884,10 +1884,20 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else if (warp_tile_run_count >= stream_threshold)
     {
+      // pair-stream wins at mid stream densities (B200: seg2 -5.2%, seg4 -4.7%); near-all-heads
+      // tiles keep the adaptive row stream (pair dual-emission cost +15% at seg1)
+      bool paired_ok = false;
       if constexpr (from_smem && sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
       {
-        stream_values_paired<items_per_thread>(
-          d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_tail);
+        paired_ok = warp_tile_run_count < (3 * warp_tile_size) / 4;
+      }
+      if (paired_ok)
+      {
+        if constexpr (from_smem && sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+        {
+          stream_values_paired<items_per_thread>(
+            d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_tail);
+        }
       }
       else
       {
