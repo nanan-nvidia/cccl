@@ -26,10 +26,10 @@ constexpr int kStockDispatchTiles = 1024;
 template <class KeyT, class ValueT, int kIptOverride = 0, int kStagesOverride = 0>
 struct winner_config
 {
-  static constexpr int kIPT           = (kIptOverride != 0) ? kIptOverride : 32;
-  static constexpr int kNumCompWarps  = 8;
-  static constexpr int kStages        = (kStagesOverride != 0) ? kStagesOverride : 6; // key ring depth
-  static constexpr int kPosStages     = (kStages + 1) / 2;
+  static constexpr int kIPT          = (kIptOverride != 0) ? kIptOverride : 32;
+  static constexpr int kNumCompWarps = 8;
+  static constexpr int kStages       = (kStagesOverride != 0) ? kStagesOverride : 6; // key ring depth
+  static constexpr int kPosStages    = (kStages + 1) / 2;
 #ifdef K_POLL_MLP
   static constexpr int kPollMlp = K_POLL_MLP;
 #else
@@ -100,10 +100,11 @@ inline cudaError_t persistent_rbk_encode(
   cub::DeviceReduce::ReduceByKey(
     nullptr, cub_bytes, d_keys, d_unique, d_values, d_aggregates, d_num_runs, cuda::std::plus<>{}, num_items, stream);
   const long long q_tiles = rbk_state_tiles<Config>((long long) num_items);
-  const size_t pers_bytes = (size_t) q_tiles
-                            * (sizeof(CountStateT) + sizeof(TileValueRecordT<ValueT, OffT>)
-                               + sizeof(TilePrefixT<OffT>) + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned));
-  const size_t required   = cuda::std::max(cub_bytes, pers_bytes);
+  const size_t pers_bytes =
+    (size_t) q_tiles
+    * (sizeof(CountStateT) + sizeof(TileValueRecordT<ValueT, OffT>) + sizeof(TilePrefixT<OffT>)
+       + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned));
+  const size_t required = cuda::std::max(cub_bytes, pers_bytes);
   if (d_temp_storage == nullptr)
   {
     temp_storage_bytes = required;
@@ -178,11 +179,27 @@ inline cudaError_t persistent_rbk_encode(
   {
     return error;
   }
-  // PASS 2: the pipeline-free value kernel (block per tile)
-  auto* vkernel =
-    rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT>;
-  vkernel<<<(int) tiles, Config::kNumCompWarps * 32, 0, stream>>>(
-    d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles);
+  // PASS 2: values. Persistent TMA-ring kernel when the values base is 16B-aligned and the ring
+  // fits the opt-in smem; the block-per-tile kernel is the fallback (misaligned bases, small smem)
+  constexpr size_t kValDynSmem = (size_t) Config::kStages * Config::kTileSize * sizeof(ValueT);
+  if ((((size_t) d_values & 15) == 0) && (size_t) smem_optin >= kValDynSmem)
+  {
+    auto* vkernel2 =
+      rbk_kernels::DeviceReduceByKeyLookaheadValuePersistentKernel<typename Config::Selector, ValueT, OffT>;
+    error = cudaFuncSetAttribute(vkernel2, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kValDynSmem);
+    if (error != cudaSuccess)
+    {
+      return error;
+    }
+    vkernel2<<<(int) tiles, (1 + Config::kNumCompWarps) * 32, kValDynSmem, stream>>>(
+      d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles, Config::kStages);
+  }
+  else
+  {
+    auto* vkernel = rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT>;
+    vkernel<<<(int) tiles, Config::kNumCompWarps * 32, 0, stream>>>(
+      d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles);
+  }
   error = cudaPeekAtLastError();
   if (error != cudaSuccess)
   {
