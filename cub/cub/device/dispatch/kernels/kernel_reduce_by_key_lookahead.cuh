@@ -48,6 +48,7 @@ RBK_IK_RANGE(KDrain);
 RBK_IK_RANGE(VSetup);
 RBK_IK_RANGE(VEmit);
 RBK_IK_RANGE(VWaitFull);
+RBK_IK_RANGE(VStageWait);
 RBK_IK_RANGE(VBoundary);
 
 CUB_NAMESPACE_BEGIN
@@ -1630,6 +1631,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   ValueT* const staged_vals    = (ValueT*) v_smem_raw;
   unsigned* const staged_flags = (unsigned*) (v_smem_raw + (size_t) tile_size * sizeof(ValueT));
   __shared__ ::cuda::std::uint64_t staged_bar;
+#  ifdef K_VSTAGE_T
+  constexpr int stage_run_threshold = K_VSTAGE_T;
+#  else
+  constexpr int stage_run_threshold = 512;
+#  endif
   const int stage_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
   if (threadIdx.x == 0)
   {
@@ -1638,14 +1644,32 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       ptx::mbarrier_init(&staged_bar, 1);
       ptx::fence_proxy_async(ptx::space_shared);
     }
-    // fire-and-forget L2 prefetch for EVERY tile (v6b receipt); it also makes the conditional
-    // TMA stage below an L2-resident copy instead of a DRAM round trip
-    const char* vbase        = (const char*) (d_values + (size_t) tile_id * tile_size);
-    const char* vbase16      = (const char*) ((size_t) vbase & ~(size_t) 15);
-    const unsigned vpf_bytes = (unsigned) (((size_t) stage_len * sizeof(ValueT)) & ~(size_t) 15);
-    if (vpf_bytes > 0)
+    if (vals_staged && stage_run_threshold == 0)
     {
-      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vbase16), "r"(vpf_bytes) : "memory");
+      // always-stage shape: the TMA IS the fetch; issue it NOW so setup rides under the flight
+      const unsigned vbytes = (unsigned) ((size_t) stage_len * sizeof(ValueT));
+      const unsigned vspan  = (vbytes + 15u) & ~15u;
+      ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &staged_bar, vspan);
+      ptx::cp_async_bulk_ignore_oob(
+        ptx::space_shared,
+        ptx::space_global,
+        staged_vals,
+        d_values + (size_t) tile_id * tile_size,
+        vspan,
+        0u,
+        vspan - vbytes,
+        &staged_bar);
+    }
+    else
+    {
+      // routed/unstaged shapes: L2 prefetch (v6b receipt)
+      const char* vbase        = (const char*) (d_values + (size_t) tile_id * tile_size);
+      const char* vbase16      = (const char*) ((size_t) vbase & ~(size_t) 15);
+      const unsigned vpf_bytes = (unsigned) (((size_t) stage_len * sizeof(ValueT)) & ~(size_t) 15);
+      if (vpf_bytes > 0)
+      {
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vbase16), "r"(vpf_bytes) : "memory");
+      }
     }
     const char* fbase = (const char*) (d_flag_words + (size_t) tile_id * (compute_warps * 32));
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fbase),
@@ -1729,18 +1753,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         wt_tail);
     }
   };
-#  ifdef K_VSTAGE_T
-  constexpr int stage_run_threshold = K_VSTAGE_T;
-#  else
-  // B200 receipt: smem bands win at seg16 (-15%) and dense (-8%) but the serial stage hop costs
-  // +5-20% where bands are light (seg64+); the crossover sits between ~250 and ~960 runs/tile
-  constexpr int stage_run_threshold = 512;
-#  endif
   const int tile_total_runs =
     __shfl_sync(full_mask, lane_runs_before_warp_tile + lane_warp_tile_run_count, compute_warps - 1);
   if (vals_staged && tile_total_runs >= stage_run_threshold)
   {
-    if (threadIdx.x == 0)
+    if (stage_run_threshold > 0 && threadIdx.x == 0)
     {
       const unsigned vbytes = (unsigned) ((size_t) stage_len * sizeof(ValueT));
       const unsigned vspan  = (vbytes + 15u) & ~15u;
@@ -1755,7 +1772,15 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         vspan - vbytes,
         &staged_bar);
     }
+    if (ik_rec)
+    {
+      RBK_IK_BEG(VStageWait, tile_id);
+    }
     wait_parity(&staged_bar, 0);
+    if (ik_rec)
+    {
+      RBK_IK_END(VStageWait, tile_id);
+    }
     emit_bands(staged_vals, ::cuda::std::true_type{});
   }
   else
