@@ -892,6 +892,100 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
   tail_out = carry; // sum since the warp tile's last head (whole tile when head-free)
 }
 
+// PAIR-COMPRESSED STREAM (staged full tiles, 4-byte values): each lane owns elements (2l, 2l+1)
+// of a 64-element double-row -- one LDS.64, one masked scan per 64 elements instead of two full
+// row iterations. Pair algebra: a pair's carry contribution is the sum since its last head (the
+// whole pair when headless); breaks at pairs containing heads. Run ends: e0 ends iff h1 (local
+// emit when h0 starts it, incoming-close via the scan otherwise); e1 ends iff the NEXT pair
+// opens with a head (its incoming-close handles it). Ranks come from word bit positions, no
+// per-lane scans. Emission ranks and the carry are exact left-to-right sums.
+template <int items_per_thread, class ValueT, class OffT>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
+  ValueT* __restrict__ d_aggregates,
+  const ValueT* __restrict__ tile_vals, // staged smem, zero-filled past tile_len
+  unsigned my_word,
+  OffT global_runs_before_warp_tile,
+  int warp_tile_offset,
+  int lane_id,
+  ValueT& tail_out)
+{
+  static_assert(items_per_thread == 32, "the paired stream assumes 32x32 warp tiles");
+  ValueT carry{}; // sum since the last head seen so far (exact, left-to-right)
+  int word_base = 0; // heads in words before the current double-row (uniform)
+#  pragma unroll 4
+  for (int it = 0; it < items_per_thread / 2; ++it)
+  {
+    const unsigned w0 = __shfl_sync(full_mask, my_word, 2 * it);
+    const unsigned w1 = __shfl_sync(full_mask, my_word, 2 * it + 1);
+    // lane l's flag bits and elements
+    const unsigned wsel = (lane_id < 16) ? w0 : w1;
+    const int bofs      = (lane_id & 15) * 2;
+    const bool h0       = (wsel >> bofs) & 1u;
+    const bool h1       = (wsel >> (bofs + 1)) & 1u;
+    ValueT v01[2];
+    *(uint2*) v01   = *(const uint2*) (tile_vals + warp_tile_offset + it * 64 + 2 * lane_id);
+    const ValueT v0 = v01[0];
+    const ValueT v1 = v01[1];
+    // pair-local pieces
+    const ValueT pre  = h0 ? ValueT{} : v0; // before the pair's first head
+    const ValueT tail = h1 ? v1 : (h0 ? (v0 + v1) : (v0 + v1)); // since the pair's last head (whole pair if headless)
+    const bool brk    = h0 || h1;
+    // masked inclusive scan over pair tails, breaks at pairs with heads: S = sum since the last
+    // head at-or-before this pair (within this double-row)
+    const unsigned pmask  = __ballot_sync(full_mask, brk);
+    const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+    ValueT S              = tail;
+#  pragma unroll
+    for (int off = 1; off < 32; off <<= 1)
+    {
+      const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+      const ValueT from_left   = __shfl_up_sync(full_mask, S, off);
+      if constexpr (sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+      {
+        const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
+        asm volatile("{ .reg .pred p; setp.eq.u32 p, %1, 0; @p add.f32 %0, %0, %2; }"
+                     : "+f"(S)
+                     : "r"(t), "f"(from_left));
+      }
+      else
+      {
+        if (lane_id >= off && ((pmask & upto_l & ~upto_prev) == 0u))
+        {
+          S += from_left;
+        }
+      }
+    }
+    // P_in: the exact sum since the last head STRICTLY before this pair (previous pair's scan
+    // value, plus the inter-row carry when no break precedes in this double-row)
+    const ValueT S_prev   = __shfl_up_sync(full_mask, S, 1);
+    const unsigned before = pmask & ((1u << lane_id) - 1u);
+    const ValueT P_in     = ((lane_id > 0) ? S_prev : ValueT{}) + ((before == 0u) ? carry : ValueT{});
+    // ranks from word bit positions (base = heads before my element's word)
+    const int wb      = word_base + ((lane_id < 16) ? 0 : __popc(w0));
+    const int rank_e0 = wb + __popc(wsel & ((1u << bofs) - 1u)); // heads before e0 in the wt
+    // a head at e0 closes the incoming run (rank_e0 - 1); a head at e1 closes the run ending at
+    // e0 (rank_e0 + h0 - 1): fully local when it started at e0, incoming + v0 otherwise
+    if (h0 && rank_e0 >= 1)
+    {
+      d_aggregates[global_runs_before_warp_tile + rank_e0 - 1] = P_in;
+    }
+    if (h1)
+    {
+      const int r1 = rank_e0 + (h0 ? 1 : 0) - 1;
+      if (r1 >= 0)
+      {
+        d_aggregates[global_runs_before_warp_tile + r1] = h0 ? v0 : (P_in + v0);
+      }
+    }
+    // carry update: sum since the last head after this double-row = S at lane 31 (+ carry if the
+    // row had no breaks at all)
+    const ValueT S31 = __shfl_sync(full_mask, S, 31);
+    carry            = (pmask == 0u) ? (carry + S31) : S31;
+    word_base += __popc(w0) + __popc(w1);
+  }
+  tail_out = carry;
+}
+
 // warp-parallel strided sum over [begin, end) of the tile's values (lead/tail segments and the
 // long-span cooperative walks; every lane participates)
 template <class ValueT>
@@ -1790,8 +1884,16 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else if (warp_tile_run_count >= stream_threshold)
     {
-      stream_values_from_flags<items_per_thread, from_smem>(
-        d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
+      if constexpr (from_smem && sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+      {
+        stream_values_paired<items_per_thread>(
+          d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_tail);
+      }
+      else
+      {
+        stream_values_from_flags<items_per_thread, from_smem>(
+          d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
+      }
       const HeadFlagDecodeT dec(my_word, lane_id);
       const RunSpanT first_run = dec.decode_run(0);
       wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
