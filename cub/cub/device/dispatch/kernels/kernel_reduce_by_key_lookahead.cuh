@@ -436,8 +436,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT span_sum_prefetched(const ValueT* tile
 // separate lead/tail re-reads (up to a full extra pass at seg1024) were the mid-regime tax.
 template <int items_per_thread, class ValueT, class OffT>
 _CCCL_DEVICE_API __noinline__ void chunk_reduce_from_flags(
-  ValueT* d_aggregates,
-  const ValueT* tile_vals,
+  ValueT* __restrict__ d_aggregates,
+  const ValueT* __restrict__ tile_vals,
   unsigned my_word,
   OffT global_runs_before_warp_tile,
   int warp_tile_offset,
@@ -535,8 +535,8 @@ _CCCL_DEVICE_API __noinline__ void chunk_reduce_from_flags(
 // loop is the FROZEN form -- lead/tail ride separate passes, never inside it.
 template <int items_per_thread, class ValueT, class OffT>
 _CCCL_DEVICE_API __noinline__ void stream_values_from_flags(
-  ValueT* d_aggregates,
-  const ValueT* tile_vals,
+  ValueT* __restrict__ d_aggregates,
+  const ValueT* __restrict__ tile_vals,
   unsigned my_word,
   OffT global_runs_before_warp_tile,
   int warp_tile_offset,
