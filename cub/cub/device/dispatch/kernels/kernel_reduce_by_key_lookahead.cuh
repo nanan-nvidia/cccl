@@ -1685,7 +1685,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
                  : "memory");
   }
   __syncthreads(); // staged_bar init is visible to every warp past this point
-  const bool ik_rec = tile_id < 8;
+  // trace STEADY-STATE blocks, not the first wave: tiles < 8 run on an uncontended GPU and
+  // understate every range by ~1.4x (background-agent receipt: block lifetimes 11.4us steady vs
+  // 7.3 first-wave; effective concurrency 5.43/SM)
+  const bool ik_rec = tile_id >= 1024 && tile_id < 1032;
   if (ik_rec)
   {
     RBK_IK_BEG(VSetup, tile_id);
