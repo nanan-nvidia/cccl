@@ -43,6 +43,7 @@ RBK_IK_RANGE(CompFlag);
 RBK_IK_RANGE(CompPublish);
 RBK_IK_RANGE(KWaitComputed);
 RBK_IK_RANGE(KWaitPrefixed);
+RBK_IK_RANGE(KWaitStaged);
 RBK_IK_RANGE(KDrain);
 RBK_IK_RANGE(VSetup);
 RBK_IK_RANGE(VEmit);
@@ -1089,7 +1090,15 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
             {
               continue;
             }
+            if (ik_rec)
+            {
+              RBK_IK_BEG(KWaitStaged, pipeline_gen);
+            }
             wait_parity(&staged_warp_tile[slot_id][warp_tile_id], key_ring.parity);
+            if (ik_rec)
+            {
+              RBK_IK_END(KWaitStaged, pipeline_gen);
+            }
             const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
             const int warp_tile_offset              = warp_tile_id * warp_tile_size;
 #  ifdef K_DRAIN_THRESH
