@@ -325,15 +325,8 @@ clc_next_tile_id(uint4& clc_resp, ::cuda::std::uint64_t& clc_bar, int pipeline_g
 // calculate head_flags: each iter is 32 consecutive elements (lane L owns loc = warp_tile_offset + iter*32 + L)
 // head = (key != predecessor)
 template <int items_per_thread, bool clamp_tail, class KeyT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE unsigned compute_head_flags(
-  const KeyT* key_buf,
-  KeyT* compact_dst, // capped compacted run-key staging (nullptr-free: always valid, rank-capped)
-  int compact_cap,
-  int warp_tile_offset,
-  int tile_len,
-  int tile_id,
-  int lane_id,
-  int skip_elems)
+_CCCL_DEVICE_API _CCCL_FORCEINLINE unsigned
+compute_head_flags(const KeyT* key_buf, int warp_tile_offset, int tile_len, int tile_id, int lane_id, int skip_elems)
 {
   static_assert(items_per_thread <= 32, "one lane per iter requires items_per_thread<=32");
   unsigned my_flags = 0;
@@ -347,8 +340,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE unsigned compute_head_flags(
       (tile_id == 0) ? max(min(warp_tile_offset, tile_len - 1) - 1, 0) : min(warp_tile_offset, tile_len - 1) - 1;
     first_pred_idx = max(first_pred_idx, 0);
   }
-  KeyT row_carry  = key_buf[first_pred_idx];
-  int runs_so_far = 0; // running rank base for the compacted emission
+  KeyT row_carry = key_buf[first_pred_idx];
 #  pragma unroll
   for (int iter = 0; iter < items_per_thread; ++iter)
   {
@@ -374,15 +366,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE unsigned compute_head_flags(
     {
       my_flags = flags;
     }
-    // compacted run-key emission: the head lane holds the run's key RIGHT HERE -- one predicated
-    // store per run, rank capped; the key warps use the staging only when the final count fits,
-    // so an overflowing (dense) warp tile simply wastes the first compact_cap stores
-    const int rank = runs_so_far + __popc(flags & ((1u << lane_id) - 1u));
-    if (head && rank < compact_cap)
-    {
-      compact_dst[rank] = key;
-    }
-    runs_so_far += __popc(flags);
     row_carry = __shfl_sync(full_mask, key, 31);
   }
   return my_flags;
@@ -783,14 +766,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
 #  endif
   // [key_ring_stages][tile_size] input keys
   // [key_ring_stages][tile_size] int16 staged head positions
-  // compacted run-key staging: up to 256 run keys per warp tile per slot, written by compute
-  // during the flag pass (head lanes hold their key in a register at ballot time) and drained by
-  // the key warps as one load + one store per RUN. Shares the key ring's modulus and the `empty`
-  // guard -- no separate ring, no separate protocol (the old pos-ring race class stays dead).
-  constexpr int compact_cap = 256;
   extern __shared__ char smem_raw[];
-  KeyT* const tile_buf    = (KeyT*) smem_raw;
-  KeyT* const compact_buf = (KeyT*) (smem_raw + (size_t) key_ring_stages * slot_stride * sizeof(KeyT));
+  KeyT* const tile_buf = (KeyT*) smem_raw;
   __shared__ int tile_id_buf[max_key_ring_stages]; // which global tile each ring slot holds (LOAD gets it with
                                                    // try_cancel)
   __shared__ int warp_run_counts[max_key_ring_stages][compute_warps]; // per compute warp run counts
@@ -953,20 +930,19 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           {
             RBK_IK_BEG(CompFlag, pipeline_gen);
           }
-          KeyT* const compact_dst = compact_buf + ((size_t) slot_id * compute_warps + compute_warp_id) * compact_cap;
           unsigned my_flags;
           if (keys_staged)
           {
             const KeyT* key_buf = tile_buf + (size_t) slot_id * slot_stride + slot_pad;
             my_flags            = compute_head_flags<items_per_thread, false>(
-              key_buf, compact_dst, compact_cap, warp_tile_offset, tile_len, tile_id, lane_id, skip_elems);
+              key_buf, warp_tile_offset, tile_len, tile_id, lane_id, skip_elems);
           }
           else
           {
             // vvv regressed case: we load compute flags straight from global vvv
             const KeyT* key_buf = d_keys + (size_t) tile_id * tile_size;
-            my_flags            = compute_head_flags<items_per_thread, true>(
-              key_buf, compact_dst, compact_cap, warp_tile_offset, tile_len, tile_id, lane_id, 0);
+            my_flags =
+              compute_head_flags<items_per_thread, true>(key_buf, warp_tile_offset, tile_len, tile_id, lane_id, 0);
             // ^^^ regressed case ^^^
           }
           local_run_count = __reduce_add_sync(full_mask, __popc(my_flags));
@@ -1116,19 +1092,11 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
             wait_parity(&staged_warp_tile[slot_id][warp_tile_id], key_ring.parity);
             const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
             const int warp_tile_offset              = warp_tile_id * warp_tile_size;
-            if (warp_tile_run_count <= compact_cap)
+            if (warp_tile_run_count >= staging_threshold)
             {
-              // COMPACTED band (IKET receipt: KDrain 1.38us/gen flat seg4-16 = the N-proportional
-              // row sweep was the keys wall): compute staged the run keys at flag time; the drain
-              // is ONE smem load + ONE store per RUN
-              const KeyT* csrc = compact_buf + ((size_t) slot_id * compute_warps + warp_tile_id) * compact_cap;
-              for (int run_idx = lane_id; run_idx < warp_tile_run_count; run_idx += 32)
-              {
-                d_unique[global_runs_before_warp_tile + run_idx] = csrc[run_idx];
-              }
-            }
-            else
-            {
+              // row-stream band for ANY non-sparse count: the rows are SMEM reads, so the
+              // amplification at lower run counts costs LDS bandwidth, not DRAM (the flag-decode
+              // per-run gather costs ~15 shuffle ops each -- the seg16 KEYS anomaly)
               // dense band: every run's key from coalesced key rows, emitted at head lanes --
               // no position reads (kept OUT of any scan loop; this loop has no cross-row deps)
               const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
@@ -1148,6 +1116,24 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
                   const int run_idx                                = word_base + __popc(w & upto_l) - 1;
                   const int loc                                    = warp_tile_offset + iter * 32 + lane_id;
                   d_unique[global_runs_before_warp_tile + run_idx] = tile_keys[loc + key_skip];
+                }
+              }
+            }
+            else
+            {
+              // sparse band: decode head positions from the flag words. decode_run shuffles with
+              // the full mask, so every round must be executed by every lane (divergent per-lane
+              // loops around it DEADLOCK -- receipted the hard way)
+              const HeadFlagDecodeT dec(head_flag_buf[slot_id], warp_tile_id, lane_id);
+              const int rounds = (warp_tile_run_count + 31) >> 5;
+              for (int it = 0; it < rounds; ++it)
+              {
+                const int run_idx  = it * 32 + lane_id;
+                const RunSpanT run = dec.decode_run(run_idx < warp_tile_run_count ? run_idx : 0);
+                if (run_idx < warp_tile_run_count)
+                {
+                  d_unique[global_runs_before_warp_tile + run_idx] =
+                    tile_keys[warp_tile_offset + run.head_pos_in_warp_tile + key_skip];
                 }
               }
             }
