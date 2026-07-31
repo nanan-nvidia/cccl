@@ -825,20 +825,35 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
       const unsigned at_or_before = w & upto_l;
       const int my_dist           = (at_or_before != 0u) ? (lane_id - (31 - __clz(at_or_before))) : (lane_id + 1);
       const int max_dist          = __reduce_max_sync(full_mask, my_dist);
-      // static unroll with a UNIFORM skip per step: skipped steps issue no shuffle (the MIO
-      // saving), taken steps stay pipelined (the dynamic-bound loop form cost +29% at seg4)
+      // three UNIFORM paths on the bound (receipts: per-step skips cost seg1, a dynamic loop
+      // cost seg4, the fixed scan cost seg1/2 -- each form won different cells). Every path is
+      // unrolled; running extra steps is always mask-safe, so the branch only affects speed.
+      auto scan_steps = [&](int first_off, int last_off) _CCCL_FORCEINLINE_LAMBDA {
 #  pragma unroll
-      for (int off = 1; off < 32; off <<= 1)
-      {
-        if (off <= max_dist)
+        for (int off = 1; off < 32; off <<= 1)
         {
-          const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-          const ValueT from_left   = __shfl_up_sync(full_mask, incl, off);
-          if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u))
+          if (off >= first_off && off <= last_off)
           {
-            incl += from_left;
+            const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+            const ValueT from_left   = __shfl_up_sync(full_mask, incl, off);
+            if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u))
+            {
+              incl += from_left;
+            }
           }
         }
+      };
+      if (max_dist == 0)
+      {
+        // every lane is a head: incl is already its own value
+      }
+      else if (max_dist <= 3)
+      {
+        scan_steps(1, 2); // reach 3
+      }
+      else
+      {
+        scan_steps(1, 16); // the full pipelined scan
       }
       if ((w & upto_l) == 0u)
       {
