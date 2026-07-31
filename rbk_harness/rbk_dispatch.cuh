@@ -59,7 +59,10 @@ struct winner_config
     }
   };
 
-  static constexpr size_t kDynSmem = kPolicy.dyn_smem_bytes((int) sizeof(KeyT), (int) alignof(KeyT));
+  // positions are gone: the dyn smem is the keys ring only; the policy's own accounting still
+  // charges the dead pos ring (it routed the S=6 arm to stock via the opt-in gate)
+  static constexpr size_t kDynSmem =
+    (size_t) kStages * kPolicy.slot_stride((int) sizeof(KeyT), (int) alignof(KeyT)) * sizeof(KeyT);
 };
 
 template <class Config>

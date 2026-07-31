@@ -1092,7 +1092,34 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
             wait_parity(&staged_warp_tile[slot_id][warp_tile_id], key_ring.parity);
             const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
             const int warp_tile_offset              = warp_tile_id * warp_tile_size;
-            if (warp_tile_run_count >= staging_threshold)
+#  ifdef K_DRAIN_THRESH
+            constexpr int word_serial_threshold = K_DRAIN_THRESH;
+#  else
+            constexpr int word_serial_threshold = 256;
+#  endif
+            if (warp_tile_run_count >= staging_threshold && warp_tile_run_count <= word_serial_threshold)
+            {
+              // word-serial band (IKET receipt: KDrain flat 1.38us/gen at seg4-16 = the broadcast
+              // band's fixed 2-shuffles-per-word loop on the MIO pipe): each lane owns its own
+              // flag word and extracts its runs serially -- no shuffles, no sync collectives, so
+              // the divergence is safe; one smem read + one store per RUN
+              const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
+              const int my_popc      = __popc(my_word);
+              typename WarpScan<int>::TempStorage warp_scan_storage;
+              int word_scan;
+              WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
+              int rank     = word_scan - my_popc;
+              unsigned rem = my_word;
+              while (rem != 0)
+              {
+                const int bit = __ffs(rem) - 1;
+                rem &= rem - 1;
+                d_unique[global_runs_before_warp_tile + rank] =
+                  tile_keys[warp_tile_offset + lane_id * 32 + bit + key_skip];
+                ++rank;
+              }
+            }
+            else if (warp_tile_run_count >= staging_threshold)
             {
               // row-stream band for ANY non-sparse count: the rows are SMEM reads, so the
               // amplification at lower run counts costs LDS bandwidth, not DRAM (the flag-decode
