@@ -783,18 +783,15 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   __shared__ ::cuda::std::uint64_t full[max_key_ring_stages];
   __shared__ ::cuda::std::uint64_t computed[max_key_ring_stages], prefixed[max_key_ring_stages],
     empty[max_key_ring_stages];
-  // COMPUTE warp w --staged_warp_tile[w]--> STORE: we arrive per warp tile handoff
-  // i.e. store warps start working to drain a warp-tile as soon as ITS positions are staged
-  __shared__ ::cuda::std::uint64_t staged_warp_tile[max_key_ring_stages][compute_warps];
 
   // try_cancel writes a 16-byte response into clc_resp + completes clc_bar's tx.
   __shared__ __align__(16) uint4 clc_resp;
   __shared__ ::cuda::std::uint64_t clc_bar;
-  static_assert(sizeof(tile_id_buf) + sizeof(warp_run_counts) + sizeof(head_flag_buf) + sizeof(prefix_packed)
-                    + sizeof(full) + sizeof(computed) + sizeof(prefixed) + sizeof(empty) + sizeof(staged_warp_tile)
-                    + sizeof(clc_resp) + sizeof(clc_bar)
-                  <= RleLookaheadPolicy::static_smem_budget,
-                "static shared memory exceeds the budget assumed by the floor launch guarantee");
+  static_assert(
+    sizeof(tile_id_buf) + sizeof(warp_run_counts) + sizeof(head_flag_buf) + sizeof(prefix_packed) + sizeof(full)
+        + sizeof(computed) + sizeof(prefixed) + sizeof(empty) + sizeof(clc_resp) + sizeof(clc_bar)
+      <= RleLookaheadPolicy::static_smem_budget,
+    "static shared memory exceeds the budget assumed by the floor launch guarantee");
 
   const int thr_id         = threadIdx.x;
   const int lane_id        = thr_id & 31;
@@ -809,10 +806,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
       ptx::mbarrier_init(&computed[slot_id], compute_warps); // every compute warp arrives
       ptx::mbarrier_init(&prefixed[slot_id], 1);
       ptx::mbarrier_init(&empty[slot_id], key_store_warps);
-      for (int cw = 0; cw < compute_warps; ++cw)
-      {
-        ptx::mbarrier_init(&staged_warp_tile[slot_id][cw], 1); // that compute warp's lane0
-      }
     }
 
     ptx::mbarrier_init(&clc_bar, 1); // 1 arrival
@@ -824,10 +817,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   __syncthreads();
 
   constexpr warpspeed::SquadDesc squadLoad{0, 1};
-  constexpr warpspeed::SquadDesc squadCompute{1, compute_warps};
+  constexpr warpspeed::SquadDesc squadCompute{1, compute_warps + key_store_warps};
   constexpr warpspeed::SquadDesc squadPoll{2, 1};
-  constexpr warpspeed::SquadDesc squadKeyStore{3, key_store_warps};
-  constexpr warpspeed::SquadDesc squads[] = {squadLoad, squadCompute, squadPoll, squadKeyStore};
+  constexpr warpspeed::SquadDesc squads[] = {squadLoad, squadCompute, squadPoll};
 
   warpspeed::squadDispatch(
     warpspeed::getSpecialRegisters(), squads, [&](warpspeed::Squad squad) _CCCL_FORCEINLINE_LAMBDA {
@@ -843,6 +835,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           ptx::clusterlaunchcontrol_try_cancel(&clc_resp, &clc_bar);
         }
         RingCursorT key_ring;
+        int sentinels_sent = 0;
         for (int pipeline_gen = 0;; ++pipeline_gen, key_ring.advance(key_ring_stages))
         {
           const int slot_id = key_ring.slot; // which slot is this?
@@ -871,7 +864,13 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
               ptx::mbarrier_arrive(&full[slot_id]);
             }
             __syncwarp();
-            break;
+            // the fused squad's gen-parity groups each terminate on their OWN sentinel gen: one
+            // sentinel would leave the other group waiting full forever
+            if (++sentinels_sent == 2)
+            {
+              break;
+            }
+            continue;
           }
           // over-fetch one 16B chunk to the left, so that we get last tiles last key
           // tile 0 has no predecessor and skips the over-fetch
@@ -895,10 +894,21 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
       // if you are compute
       else if (squad == squadCompute)
       {
-        const int compute_warp_id  = squad.warpRank();
+        // FUSED compute+store: no store squad. Gen-parity groups A/B alternate pipeline gens, so
+        // one group's prefix wait + key drain overlaps the other group's flag pass; each warp
+        // publishes FIRST, then drains its own warp tile (the cross-block count chain never waits
+        // on a single store)
+        const int fused_rank       = squad.warpRank();
+        const int group            = fused_rank / compute_warps;
+        const int compute_warp_id  = fused_rank % compute_warps;
         const int warp_tile_offset = compute_warp_id * warp_tile_size;
         RingCursorT key_ring;
-        for (int pipeline_gen = 0;; ++pipeline_gen, key_ring.advance(key_ring_stages))
+        if (group != 0)
+        {
+          key_ring.advance(key_ring_stages);
+        }
+        for (int pipeline_gen = group;;
+             pipeline_gen += 2, key_ring.advance(key_ring_stages), key_ring.advance(key_ring_stages))
         {
           const int slot_id = key_ring.slot;
           const bool ik_rec = (blk_id < 8) && pipeline_gen >= 5 && pipeline_gen < 15;
@@ -914,12 +924,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           const int tile_id = tile_id_buf[slot_id];
           if (tile_id >= num_tiles)
           {
-            if (lane_id == 0)
-            {
-              // consumers wait computed + this warp-tile's staged_warp_tile, so arrive both
-              ptx::mbarrier_arrive(&computed[slot_id]);
-              ptx::mbarrier_arrive(&staged_warp_tile[slot_id][compute_warp_id]);
-            }
+            // every squad breaks on the tile check BEFORE waiting computed/prefixed, so a
+            // sentinel slot needs no arrivals
             break;
           }
           // slot is ready! compute is FLAGS-ONLY (the disaggregation design): the count chain
@@ -976,9 +982,131 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           head_flag_buf[slot_id][compute_warp_id * 32 + lane_id]                                 = my_flags;
           d_flag_words[(size_t) tile_id * (compute_warps * 32) + compute_warp_id * 32 + lane_id] = my_flags;
           __syncwarp();
+          // ---- the store half: all counts, then the prefix, then drain OWN warp tile ----
+          if (ik_rec)
+          {
+            RBK_IK_BEG(KWaitComputed, pipeline_gen);
+          }
+          wait_parity(&computed[slot_id], key_ring.parity); // no-op for the publisher, it already waited
+          if (ik_rec)
+          {
+            RBK_IK_END(KWaitComputed, pipeline_gen);
+          }
+          const auto [lane_warp_tile_run_count, lane_runs_before_warp_tile] =
+            scan_warp_tile_run_counts<compute_warps>(warp_run_counts[slot_id], lane_id);
+          if (ik_rec)
+          {
+            RBK_IK_BEG(KWaitPrefixed, pipeline_gen);
+          }
+          wait_parity(&prefixed[slot_id], key_ring.parity);
+          if (ik_rec)
+          {
+            RBK_IK_END(KWaitPrefixed, pipeline_gen);
+          }
+          if (ik_rec)
+          {
+            RBK_IK_BEG(KDrain, pipeline_gen);
+          }
+          const OffT curr_prefix_run_count = prefix_packed[slot_id].run_count();
+          const int tile_total_runs =
+            __shfl_sync(full_mask, lane_runs_before_warp_tile + lane_warp_tile_run_count, compute_warps - 1);
+          if (compute_warp_id == 0 && lane_id == 0)
+          {
+            d_tile_prefix[tile_id] = prefix_packed[slot_id];
+            if (tile_id == num_tiles - 1)
+            {
+              *d_num_runs = (NumRunsT) (curr_prefix_run_count + tile_total_runs);
+            }
+          }
+          const int warp_tile_run_count   = __shfl_sync(full_mask, lane_warp_tile_run_count, compute_warp_id);
+          const int runs_before_warp_tile = __shfl_sync(full_mask, lane_runs_before_warp_tile, compute_warp_id);
+          if (warp_tile_run_count != 0)
+          {
+            const KeyT* tile_keys                   = keys_staged ? tile_buf + (size_t) slot_id * slot_stride + slot_pad
+                                                                  : d_keys + (size_t) tile_id * tile_size;
+            const int key_skip                      = keys_staged ? skip_elems : 0;
+            const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
+#  ifdef K_DRAIN_THRESH
+            constexpr int word_serial_threshold = K_DRAIN_THRESH;
+#  else
+            constexpr int word_serial_threshold = 256;
+#  endif
+            if (warp_tile_run_count >= staging_threshold && warp_tile_run_count <= word_serial_threshold)
+            {
+              // word-serial band (IKET receipt: KDrain flat 1.38us/gen at seg4-16 = the broadcast
+              // band's fixed 2-shuffles-per-word loop on the MIO pipe): each lane owns its own
+              // flag word and extracts its runs serially -- no shuffles, no sync collectives, so
+              // the divergence is safe; one smem read + one store per RUN
+              const unsigned my_word = head_flag_buf[slot_id][compute_warp_id * 32 + lane_id];
+              const int my_popc      = __popc(my_word);
+              typename WarpScan<int>::TempStorage warp_scan_storage;
+              int word_scan;
+              WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
+              int rank     = word_scan - my_popc;
+              unsigned rem = my_word;
+              while (rem != 0)
+              {
+                const int bit = __ffs(rem) - 1;
+                rem &= rem - 1;
+                d_unique[global_runs_before_warp_tile + rank] =
+                  tile_keys[warp_tile_offset + lane_id * 32 + bit + key_skip];
+                ++rank;
+              }
+            }
+            else if (warp_tile_run_count >= staging_threshold)
+            {
+              // row-stream band for ANY non-sparse count: the rows are SMEM reads, so the
+              // amplification at lower run counts costs LDS bandwidth, not DRAM (the flag-decode
+              // per-run gather costs ~15 shuffle ops each -- the seg16 KEYS anomaly)
+              // dense band: every run's key from coalesced key rows, emitted at head lanes --
+              // no position reads (kept OUT of any scan loop; this loop has no cross-row deps)
+              const unsigned my_word = head_flag_buf[slot_id][compute_warp_id * 32 + lane_id];
+              const int my_popc      = __popc(my_word);
+              typename WarpScan<int>::TempStorage warp_scan_storage;
+              int word_scan;
+              WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
+              const int my_runs_before_word = word_scan - my_popc;
+              const unsigned upto_l         = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+#  pragma unroll
+              for (int iter = 0; iter < items_per_thread; ++iter)
+              {
+                const unsigned w    = __shfl_sync(full_mask, my_word, iter);
+                const int word_base = __shfl_sync(full_mask, my_runs_before_word, iter);
+                if ((w >> lane_id) & 1u)
+                {
+                  const int run_idx                                = word_base + __popc(w & upto_l) - 1;
+                  const int loc                                    = warp_tile_offset + iter * 32 + lane_id;
+                  d_unique[global_runs_before_warp_tile + run_idx] = tile_keys[loc + key_skip];
+                }
+              }
+            }
+            else
+            {
+              // sparse band: decode head positions from the flag words. decode_run shuffles with
+              // the full mask, so every round must be executed by every lane (divergent per-lane
+              // loops around it DEADLOCK -- receipted the hard way)
+              const HeadFlagDecodeT dec(head_flag_buf[slot_id], compute_warp_id, lane_id);
+              const int rounds = (warp_tile_run_count + 31) >> 5;
+              for (int it = 0; it < rounds; ++it)
+              {
+                const int run_idx  = it * 32 + lane_id;
+                const RunSpanT run = dec.decode_run(run_idx < warp_tile_run_count ? run_idx : 0);
+                if (run_idx < warp_tile_run_count)
+                {
+                  d_unique[global_runs_before_warp_tile + run_idx] =
+                    tile_keys[warp_tile_offset + run.head_pos_in_warp_tile + key_skip];
+                }
+              }
+            }
+          }
+          if (ik_rec)
+          {
+            RBK_IK_END(KDrain, pipeline_gen);
+          }
+          __syncwarp();
           if (lane_id == 0)
           {
-            ptx::mbarrier_arrive(&staged_warp_tile[slot_id][compute_warp_id]); // this warp-tile's flags/positions ready
+            ptx::mbarrier_arrive(&empty[slot_id]); // keys drained: the ring recycles
           }
         }
       }
@@ -1018,162 +1146,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           {
             prefix_packed[slot_id] = PrefixT::pack(curr_prefix_run_count, last_tile_with_runs);
             ptx::mbarrier_arrive(&prefixed[slot_id]); // prefix ready, key stores + value warps may proceed
-          }
-        }
-      }
-      // if you are a KEY-STORE warp: drain keys only, so the key ring recycles at key-pass speed
-      else if (squad == squadKeyStore)
-      {
-        const int key_warp_idx = squad.warpRank();
-        RingCursorT key_ring;
-        for (int pipeline_gen = 0;; ++pipeline_gen, key_ring.advance(key_ring_stages))
-        {
-          const int slot_id = key_ring.slot;
-          const bool ik_rec = (blk_id < 8) && pipeline_gen >= 5 && pipeline_gen < 15;
-          if (ik_rec)
-          {
-            RBK_IK_BEG(KWaitComputed, pipeline_gen);
-          }
-          wait_parity(&computed[slot_id], key_ring.parity);
-          if (ik_rec)
-          {
-            RBK_IK_END(KWaitComputed, pipeline_gen);
-          }
-          const int tile_id = tile_id_buf[slot_id];
-          if (tile_id >= num_tiles)
-          {
-            if (lane_id == 0)
-            {
-              ptx::mbarrier_arrive(&empty[slot_id]);
-            }
-            break;
-          }
-          const auto [lane_warp_tile_run_count, lane_runs_before_warp_tile] =
-            scan_warp_tile_run_counts<compute_warps>(warp_run_counts[slot_id], lane_id);
-          const KeyT* tile_keys =
-            keys_staged ? tile_buf + (size_t) slot_id * slot_stride + slot_pad : d_keys + (size_t) tile_id * tile_size;
-          const int key_skip = keys_staged ? skip_elems : 0;
-          if (ik_rec)
-          {
-            RBK_IK_BEG(KWaitPrefixed, pipeline_gen);
-          }
-          wait_parity(&prefixed[slot_id], key_ring.parity);
-          if (ik_rec)
-          {
-            RBK_IK_END(KWaitPrefixed, pipeline_gen);
-          }
-          if (ik_rec)
-          {
-            RBK_IK_BEG(KDrain, pipeline_gen);
-          }
-          const OffT curr_prefix_run_count = prefix_packed[slot_id].run_count();
-          // the count-side epilogue (total run count) rides with the key squad -- it is pure
-          // count data and must not wait for any value work
-          const int tile_total_runs =
-            __shfl_sync(full_mask, lane_runs_before_warp_tile + lane_warp_tile_run_count, compute_warps - 1);
-          if (key_warp_idx == 0 && lane_id == 0)
-          {
-            // the packed word carries the run prefix AND the last headed tile: everything the
-            // value pass + cleanup need; neither runs any lookahead of its own
-            d_tile_prefix[tile_id] = prefix_packed[slot_id];
-            if (tile_id == num_tiles - 1)
-            {
-              *d_num_runs = (NumRunsT) (curr_prefix_run_count + tile_total_runs);
-            }
-          }
-          for (int warp_tile_id = key_warp_idx; warp_tile_id < compute_warps; warp_tile_id += key_store_warps)
-          {
-            const int warp_tile_run_count   = __shfl_sync(full_mask, lane_warp_tile_run_count, warp_tile_id);
-            const int runs_before_warp_tile = __shfl_sync(full_mask, lane_runs_before_warp_tile, warp_tile_id);
-            if (warp_tile_run_count == 0)
-            {
-              continue;
-            }
-            wait_parity(&staged_warp_tile[slot_id][warp_tile_id], key_ring.parity);
-            const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
-            const int warp_tile_offset              = warp_tile_id * warp_tile_size;
-#  ifdef K_DRAIN_THRESH
-            constexpr int word_serial_threshold = K_DRAIN_THRESH;
-#  else
-            constexpr int word_serial_threshold = 256;
-#  endif
-            if (warp_tile_run_count >= staging_threshold && warp_tile_run_count <= word_serial_threshold)
-            {
-              // word-serial band (IKET receipt: KDrain flat 1.38us/gen at seg4-16 = the broadcast
-              // band's fixed 2-shuffles-per-word loop on the MIO pipe): each lane owns its own
-              // flag word and extracts its runs serially -- no shuffles, no sync collectives, so
-              // the divergence is safe; one smem read + one store per RUN
-              const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
-              const int my_popc      = __popc(my_word);
-              typename WarpScan<int>::TempStorage warp_scan_storage;
-              int word_scan;
-              WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
-              int rank     = word_scan - my_popc;
-              unsigned rem = my_word;
-              while (rem != 0)
-              {
-                const int bit = __ffs(rem) - 1;
-                rem &= rem - 1;
-                d_unique[global_runs_before_warp_tile + rank] =
-                  tile_keys[warp_tile_offset + lane_id * 32 + bit + key_skip];
-                ++rank;
-              }
-            }
-            else if (warp_tile_run_count >= staging_threshold)
-            {
-              // row-stream band for ANY non-sparse count: the rows are SMEM reads, so the
-              // amplification at lower run counts costs LDS bandwidth, not DRAM (the flag-decode
-              // per-run gather costs ~15 shuffle ops each -- the seg16 KEYS anomaly)
-              // dense band: every run's key from coalesced key rows, emitted at head lanes --
-              // no position reads (kept OUT of any scan loop; this loop has no cross-row deps)
-              const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
-              const int my_popc      = __popc(my_word);
-              typename WarpScan<int>::TempStorage warp_scan_storage;
-              int word_scan;
-              WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
-              const int my_runs_before_word = word_scan - my_popc;
-              const unsigned upto_l         = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
-#  pragma unroll
-              for (int iter = 0; iter < items_per_thread; ++iter)
-              {
-                const unsigned w    = __shfl_sync(full_mask, my_word, iter);
-                const int word_base = __shfl_sync(full_mask, my_runs_before_word, iter);
-                if ((w >> lane_id) & 1u)
-                {
-                  const int run_idx                                = word_base + __popc(w & upto_l) - 1;
-                  const int loc                                    = warp_tile_offset + iter * 32 + lane_id;
-                  d_unique[global_runs_before_warp_tile + run_idx] = tile_keys[loc + key_skip];
-                }
-              }
-            }
-            else
-            {
-              // sparse band: decode head positions from the flag words. decode_run shuffles with
-              // the full mask, so every round must be executed by every lane (divergent per-lane
-              // loops around it DEADLOCK -- receipted the hard way)
-              const HeadFlagDecodeT dec(head_flag_buf[slot_id], warp_tile_id, lane_id);
-              const int rounds = (warp_tile_run_count + 31) >> 5;
-              for (int it = 0; it < rounds; ++it)
-              {
-                const int run_idx  = it * 32 + lane_id;
-                const RunSpanT run = dec.decode_run(run_idx < warp_tile_run_count ? run_idx : 0);
-                if (run_idx < warp_tile_run_count)
-                {
-                  d_unique[global_runs_before_warp_tile + run_idx] =
-                    tile_keys[warp_tile_offset + run.head_pos_in_warp_tile + key_skip];
-                }
-              }
-            }
-          }
-          if (ik_rec)
-          {
-            RBK_IK_END(KDrain, pipeline_gen);
-          }
-          __syncwarp();
-          if (lane_id == 0)
-          {
-            // keys drained: the ring recycles without waiting a single value operation
-            ptx::mbarrier_arrive(&empty[slot_id]);
           }
         }
       }
