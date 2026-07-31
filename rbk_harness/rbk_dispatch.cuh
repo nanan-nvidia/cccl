@@ -26,7 +26,9 @@ constexpr int kStockDispatchTiles = 1024;
 template <class KeyT, class ValueT, int kIptOverride = 0, int kStagesOverride = 0>
 struct winner_config
 {
-  static constexpr int kIPT          = (kIptOverride != 0) ? kIptOverride : 32;
+  // ring bytes stay constant across key widths (RLE lookahead selector: 8192x4B = 4096x8B = 2048x16B)
+  static constexpr int kIPT =
+    (kIptOverride != 0) ? kIptOverride : (sizeof(KeyT) >= 16 ? 8 : (sizeof(KeyT) == 8 ? 16 : 32));
   static constexpr int kNumCompWarps = 8;
   static constexpr int kStages       = (kStagesOverride != 0) ? kStagesOverride : 6; // key ring depth
   static constexpr int kPosStages    = (kStages + 1) / 2;

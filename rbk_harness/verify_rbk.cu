@@ -309,6 +309,8 @@ int main(int argc, char** argv)
   fails += run_combo<signed char, int, int>("I8K/I32", "I32", huge);
   fails += run_combo<int, double, int>("F64V", "I32", huge);
   fails += run_combo<long long, long long, long long>("I64K/I64V", "I64", huge);
+  fails += run_combo<__int128, int, int>("I128K/I32", "I32", huge);
+  fails += run_combo<__int128, __int128, int>("I128K/I128V", "I32", huge);
 
   std::printf(fails ? "*** %d FAILURES ***\n" : "ALL PASS\n", fails);
   return fails ? 1 : 0;

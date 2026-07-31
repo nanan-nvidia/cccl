@@ -21,6 +21,7 @@
 
 #include <cuda/atomic>
 #include <cuda/ptx>
+#include <cuda/std/bit>
 #include <cuda/std/cstdint>
 #include <cuda/std/limits>
 #include <cuda/std/type_traits>
@@ -356,6 +357,76 @@ clc_next_tile_id(uint4& clc_resp, ::cuda::std::uint64_t& clc_bar, int pipeline_g
   return __shfl_sync(full_mask, nxt, 0);
 }
 
+// __shfl_* has no >8B overloads: wide types (int128) shuffle as 64-bit halves
+template <class T>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_sync_wide(T v, int src_lane)
+{
+  if constexpr (sizeof(T) <= 8)
+  {
+    return __shfl_sync(full_mask, v, src_lane);
+  }
+  else
+  {
+    struct Halves
+    {
+      ::cuda::std::uint64_t h[sizeof(T) / 8];
+    };
+    auto hv = ::cuda::std::bit_cast<Halves>(v);
+#  pragma unroll
+    for (int i = 0; i < (int) (sizeof(T) / 8); ++i)
+    {
+      hv.h[i] = __shfl_sync(full_mask, hv.h[i], src_lane);
+    }
+    return ::cuda::std::bit_cast<T>(hv);
+  }
+}
+
+template <class T>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_up_sync_wide(T v, unsigned delta)
+{
+  if constexpr (sizeof(T) <= 8)
+  {
+    return __shfl_up_sync(full_mask, v, delta);
+  }
+  else
+  {
+    struct Halves
+    {
+      ::cuda::std::uint64_t h[sizeof(T) / 8];
+    };
+    auto hv = ::cuda::std::bit_cast<Halves>(v);
+#  pragma unroll
+    for (int i = 0; i < (int) (sizeof(T) / 8); ++i)
+    {
+      hv.h[i] = __shfl_up_sync(full_mask, hv.h[i], delta);
+    }
+    return ::cuda::std::bit_cast<T>(hv);
+  }
+}
+
+template <class T>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_xor_sync_wide(T v, int mask)
+{
+  if constexpr (sizeof(T) <= 8)
+  {
+    return __shfl_xor_sync(full_mask, v, mask);
+  }
+  else
+  {
+    struct Halves
+    {
+      ::cuda::std::uint64_t h[sizeof(T) / 8];
+    };
+    auto hv = ::cuda::std::bit_cast<Halves>(v);
+#  pragma unroll
+    for (int i = 0; i < (int) (sizeof(T) / 8); ++i)
+    {
+      hv.h[i] = __shfl_xor_sync(full_mask, hv.h[i], mask);
+    }
+    return ::cuda::std::bit_cast<T>(hv);
+  }
+}
+
 // calculate head_flags: each iter is 32 consecutive elements (lane L owns loc = warp_tile_offset + iter*32 + L)
 // head = (key != predecessor)
 template <int items_per_thread, bool clamp_tail, class KeyT>
@@ -364,45 +435,75 @@ compute_head_flags(const KeyT* key_buf, int warp_tile_offset, int tile_len, int 
 {
   static_assert(items_per_thread <= 32, "one lane per iter requires items_per_thread<=32");
   unsigned my_flags = 0;
-  // ONE read per element: the predecessor comes from a lane shuffle (row-internal) or the
-  // previous row's last lane; only the first row's lane 0 reads its predecessor from memory
-  // (receipted +10% at the long regimes in the standalone campaign)
-  int first_pred_idx = warp_tile_offset + skip_elems - 1; // slot_pad makes this legal when staged
-  if constexpr (clamp_tail)
+  if constexpr (sizeof(KeyT) > 8)
   {
-    first_pred_idx =
-      (tile_id == 0) ? max(min(warp_tile_offset, tile_len - 1) - 1, 0) : min(warp_tile_offset, tile_len - 1) - 1;
-    first_pred_idx = max(first_pred_idx, 0);
-  }
-  KeyT row_carry = key_buf[first_pred_idx];
+    // no __shfl_sync overload for 16B keys: the predecessor is a second buffer read (the RLE
+    // encode lookahead reference form)
 #  pragma unroll
-  for (int iter = 0; iter < items_per_thread; ++iter)
+    for (int iter = 0; iter < items_per_thread; ++iter)
+    {
+      const int loc = warp_tile_offset + iter * 32 + lane_id;
+      int key_idx   = loc + skip_elems;
+      int pred_idx  = loc + skip_elems - 1; // loc==0 reads the over fetched slot[slot_pad-1]
+      if constexpr (clamp_tail)
+      {
+        key_idx  = min(key_idx, tile_len - 1);
+        pred_idx = (tile_id == 0) ? max(key_idx - 1, 0) : key_idx - 1;
+      }
+      const KeyT key            = key_buf[key_idx];
+      const KeyT pred           = key_buf[pred_idx];
+      const int is_global_first = (tile_id == 0 && loc == 0);
+      const int head            = (loc < tile_len) ? (is_global_first ? 1 : !(key == pred)) : 0;
+      const unsigned flags      = __ballot_sync(full_mask, head);
+      if (lane_id == iter)
+      {
+        my_flags = flags;
+      }
+    }
+    return my_flags;
+  }
+  else
   {
-    const int loc = warp_tile_offset + iter * 32 + lane_id;
-    int key_idx   = loc + skip_elems;
+    // ONE read per element: the predecessor comes from a lane shuffle (row-internal) or the
+    // previous row's last lane; only the first row's lane 0 reads its predecessor from memory
+    // (receipted +10% at the long regimes in the standalone campaign)
+    int first_pred_idx = warp_tile_offset + skip_elems - 1; // slot_pad makes this legal when staged
     if constexpr (clamp_tail)
     {
-      // vvv regressed case: plain global loads have no ignore_oob, so clamp the tail reads into the input.
-      // the clamped values are garbage, but (loc < tile_len) below already zeroes those heads vvv
-      key_idx = min(key_idx, tile_len - 1);
-      // ^^^ regressed case ^^^
+      first_pred_idx =
+        (tile_id == 0) ? max(min(warp_tile_offset, tile_len - 1) - 1, 0) : min(warp_tile_offset, tile_len - 1) - 1;
+      first_pred_idx = max(first_pred_idx, 0);
     }
-    const KeyT key = key_buf[key_idx];
-    KeyT pred      = __shfl_up_sync(full_mask, key, 1);
-    if (lane_id == 0)
+    KeyT row_carry = key_buf[first_pred_idx];
+#  pragma unroll
+    for (int iter = 0; iter < items_per_thread; ++iter)
     {
-      pred = row_carry;
+      const int loc = warp_tile_offset + iter * 32 + lane_id;
+      int key_idx   = loc + skip_elems;
+      if constexpr (clamp_tail)
+      {
+        // vvv regressed case: plain global loads have no ignore_oob, so clamp the tail reads into the input.
+        // the clamped values are garbage, but (loc < tile_len) below already zeroes those heads vvv
+        key_idx = min(key_idx, tile_len - 1);
+        // ^^^ regressed case ^^^
+      }
+      const KeyT key = key_buf[key_idx];
+      KeyT pred      = __shfl_up_sync(full_mask, key, 1);
+      if (lane_id == 0)
+      {
+        pred = row_carry;
+      }
+      const int is_global_first = (tile_id == 0 && loc == 0);
+      const int head            = (loc < tile_len) ? (is_global_first ? 1 : !(key == pred)) : 0;
+      const unsigned flags      = __ballot_sync(full_mask, head);
+      if (lane_id == iter)
+      {
+        my_flags = flags;
+      }
+      row_carry = __shfl_sync(full_mask, key, 31);
     }
-    const int is_global_first = (tile_id == 0 && loc == 0);
-    const int head            = (loc < tile_len) ? (is_global_first ? 1 : !(key == pred)) : 0;
-    const unsigned flags      = __ballot_sync(full_mask, head);
-    if (lane_id == iter)
-    {
-      my_flags = flags;
-    }
-    row_carry = __shfl_sync(full_mask, key, 31);
+    return my_flags;
   }
-  return my_flags;
 }
 
 template <int compute_warps>
@@ -866,7 +967,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
           if (off >= first_off && off <= last_off)
           {
             const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-            const ValueT from_left   = __shfl_up_sync(full_mask, incl, off);
+            const ValueT from_left   = shfl_up_sync_wide(incl, off);
             if constexpr (sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
             {
               // force SETP + @p FADD (2 ops) over nvcc's FADD+FSEL+ISETP (3): the guard folds
@@ -910,7 +1011,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
       {
         d_aggregates[global_runs_before_warp_tile + run_idx] = incl;
       }
-      carry = __shfl_sync(full_mask, incl, 31);
+      carry = shfl_sync_wide(incl, 31);
     }
   }
   tail_out = carry; // sum since the warp tile's last head (whole tile when head-free)
@@ -1174,7 +1275,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT warp_span_sum(const ValueT* tile_vals,
 #  pragma unroll
   for (int offset = 16; offset; offset >>= 1)
   {
-    acc += __shfl_xor_sync(full_mask, acc, offset);
+    acc += shfl_xor_sync_wide(acc, offset);
   }
   return acc;
 }
@@ -2065,28 +2166,31 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
       wt_tail = warp_span_sum(tile_vals, warp_tile_offset + last_run.head_pos_in_warp_tile, wt_end, lane_id);
     }
-    else if (from_smem && sizeof(ValueT) == 4 && warp_tile_run_count < stream_threshold)
+    else if (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32 && warp_tile_run_count < stream_threshold)
     {
-      // (4-byte values only: the quad rotate/loads cast through uint4 -- hardening receipt:
-      // misaligned address with f64 values)
-      chunk_reduce_rotated<items_per_thread>(
-        d_aggregates,
-        staged_vals,
-        my_word,
-        global_runs_before_warp_tile,
-        warp_tile_offset,
-        wt_end,
-        lane_id,
-        wt_lead,
-        wt_tail);
+      // (4-byte values, 32x32 warp tiles only: the quad rotate/loads cast through uint4 --
+      // hardening receipt: misaligned address with f64 values)
+      if constexpr (sizeof(ValueT) == 4 && items_per_thread == 32)
+      {
+        chunk_reduce_rotated<items_per_thread>(
+          d_aggregates,
+          staged_vals,
+          my_word,
+          global_runs_before_warp_tile,
+          warp_tile_offset,
+          wt_end,
+          lane_id,
+          wt_lead,
+          wt_tail);
+      }
     }
-    else if (warp_tile_run_count >= stream_threshold || (from_smem && sizeof(ValueT) != 4))
+    else if (warp_tile_run_count >= stream_threshold || (from_smem && sizeof(ValueT) != 4) || items_per_thread != 32)
     {
       // stream density router (B200 receipts): quad wins to ~half density (seg4 -9.4%), pair
       // from there to ~3/4 (seg2, quad's interior-emission cost +14% there), the adaptive row
       // stream at near-all-heads (seg1)
       int stream_form = 0; // 0 = row
-      if constexpr (from_smem && sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+      if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32 && ::cuda::std::is_same_v<ValueT, float>)
       {
         // source counters (seg4): the run-count distribution tail spilled 7.9% of the kernel
         // into the row path; the pair form is receipted-good through this density
@@ -2097,7 +2201,8 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       }
       if (stream_form == 2)
       {
-        if constexpr (from_smem && sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+        if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32
+                      && ::cuda::std::is_same_v<ValueT, float>)
         {
           stream_values_quad<items_per_thread>(
             d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_tail);
@@ -2105,7 +2210,8 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       }
       else if (stream_form == 1)
       {
-        if constexpr (from_smem && sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+        if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32
+                      && ::cuda::std::is_same_v<ValueT, float>)
         {
           stream_values_paired<items_per_thread>(
             d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_tail);
@@ -2122,16 +2228,19 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else
     {
-      chunk_reduce_from_flags<items_per_thread>(
-        d_aggregates,
-        tile_vals,
-        my_word,
-        global_runs_before_warp_tile,
-        warp_tile_offset,
-        wt_end,
-        lane_id,
-        wt_lead,
-        wt_tail);
+      if constexpr (items_per_thread == 32)
+      {
+        chunk_reduce_from_flags<items_per_thread>(
+          d_aggregates,
+          tile_vals,
+          my_word,
+          global_runs_before_warp_tile,
+          warp_tile_offset,
+          wt_end,
+          lane_id,
+          wt_lead,
+          wt_tail);
+      }
     }
   };
   const int tile_total_runs =
@@ -2201,8 +2310,8 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
 #  pragma unroll
       for (int offset = 16; offset; offset >>= 1)
       {
-        open_agg += __shfl_xor_sync(full_mask, open_agg, offset);
-        lead_agg += __shfl_xor_sync(full_mask, lead_agg, offset);
+        open_agg += shfl_xor_sync_wide(open_agg, offset);
+        lead_agg += shfl_xor_sync_wide(lead_agg, offset);
       }
       if (lane_id == 0)
       {
@@ -2416,7 +2525,7 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
             wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + warp_tile_size, lane_id);
             wt_tail = wt_lead;
           }
-          else if (warp_tile_run_count >= stream_threshold)
+          else if (warp_tile_run_count >= stream_threshold || items_per_thread != 32)
           {
             stream_values_from_flags<items_per_thread, true>(
               d_aggregates,
@@ -2434,16 +2543,19 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
           }
           else
           {
-            chunk_reduce_from_flags<items_per_thread>(
-              d_aggregates,
-              tile_vals,
-              my_word,
-              global_runs_before_warp_tile,
-              warp_tile_offset,
-              warp_tile_offset + warp_tile_size,
-              lane_id,
-              wt_lead,
-              wt_tail);
+            if constexpr (items_per_thread == 32)
+            {
+              chunk_reduce_from_flags<items_per_thread>(
+                d_aggregates,
+                tile_vals,
+                my_word,
+                global_runs_before_warp_tile,
+                warp_tile_offset,
+                warp_tile_offset + warp_tile_size,
+                lane_id,
+                wt_lead,
+                wt_tail);
+            }
           }
           if (lane_id == 0)
           {
@@ -2484,8 +2596,8 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
 #  pragma unroll
               for (int offset = 16; offset; offset >>= 1)
               {
-                open_agg += __shfl_xor_sync(full_mask, open_agg, offset);
-                lead_agg += __shfl_xor_sync(full_mask, lead_agg, offset);
+                open_agg += shfl_xor_sync_wide(open_agg, offset);
+                lead_agg += shfl_xor_sync_wide(lead_agg, offset);
               }
               if (lane_id == 0)
               {
@@ -2571,7 +2683,7 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadCleanupKernel(
 #  pragma unroll
     for (int offset = 16; offset; offset >>= 1)
     {
-      part += __shfl_xor_sync(full_mask, part, offset);
+      part += shfl_xor_sync_wide(part, offset);
     }
     carry += part;
   }
