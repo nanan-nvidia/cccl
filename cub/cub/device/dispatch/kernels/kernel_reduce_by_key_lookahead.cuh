@@ -460,6 +460,96 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT span_sum_prefetched(const ValueT* tile
   return agg;
 }
 
+// ROTATED REGISTER-WALK band: the branchless chunk walk with its one receipted flaw removed.
+// Lane-contiguous chunks (chunk l == row l) bank-conflict 32-way on every load; rotating each
+// row r IN PLACE by r makes the walk's column-step banks (e+l) mod 32 -- conflict-free with ZERO
+// extra smem, no shuffles, no padding. The walk itself stays pure FADD/FSEL + one predicated
+// store (SASS receipted branchless). MIO per warp tile ~= 96 plain smem ops; no collectives.
+template <int items_per_thread, class ValueT, class OffT>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
+  ValueT* __restrict__ d_aggregates,
+  ValueT* __restrict__ smem_vals, // the staged tile; rows get ROTATED in place
+  unsigned my_word,
+  OffT global_runs_before_warp_tile,
+  int warp_tile_offset,
+  int wt_end,
+  int lane_id,
+  ValueT& lead_out,
+  ValueT& tail_out)
+{
+  static_assert(items_per_thread == 32, "the rotated walk assumes 32x32 warp tiles");
+  ValueT* const wt_base = smem_vals + warp_tile_offset;
+  // rotate row r by r (in place; per-warp program order makes the row's loads retire before its
+  // stores issue, and rows touch disjoint ranges so the unrolled rows pipeline)
+#  pragma unroll
+  for (int r = 0; r < items_per_thread; ++r)
+  {
+    const ValueT v                         = wt_base[r * 32 + lane_id];
+    wt_base[r * 32 + ((lane_id + r) & 31)] = v;
+  }
+  __syncwarp();
+  const int my_popc = __popc(my_word);
+  typename WarpScan<int>::TempStorage warp_scan_storage;
+  int rank_scan;
+  WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, rank_scan);
+  const OffT gbase = global_runs_before_warp_tile + (rank_scan - my_popc);
+  const int valid  = min(max(wt_end - (warp_tile_offset + lane_id * 32), 0), 32);
+  ValueT prefix_sum{};
+  ValueT sum_since_head{};
+  int heads_seen             = 0;
+  const ValueT* const my_row = wt_base + lane_id * 32;
+  ValueT* const out          = d_aggregates + gbase;
+  auto step                  = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
+    const bool head      = (my_word >> e) & 1u;
+    const ValueT new_ssh = head ? v : (sum_since_head + v);
+    const ValueT new_pfx = (head || heads_seen > 0) ? prefix_sum : (prefix_sum + v);
+    if (head && heads_seen > 0)
+    {
+      out[heads_seen - 1] = sum_since_head;
+    }
+    heads_seen += (int) head;
+    sum_since_head = new_ssh;
+    prefix_sum     = new_pfx;
+  };
+#  pragma unroll
+  for (int e = 0; e < items_per_thread; ++e)
+  {
+    const ValueT v = my_row[(e + lane_id) & 31]; // rotated, conflict-free
+    if (e < valid)
+    {
+      step(e, v);
+    }
+  }
+  const bool has_head   = heads_seen > 0;
+  const ValueT t        = has_head ? sum_since_head : prefix_sum;
+  const unsigned bmask  = __ballot_sync(full_mask, has_head);
+  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+  ValueT sseg           = t;
+#  pragma unroll
+  for (int off = 1; off < 32; off <<= 1)
+  {
+    const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+    const ValueT from_left   = __shfl_up_sync(full_mask, sseg, off);
+    if (lane_id >= off && ((bmask & upto_l & ~upto_prev) == 0u))
+    {
+      sseg += from_left;
+    }
+  }
+  const ValueT s_prev = __shfl_up_sync(full_mask, sseg, 1);
+  ValueT incoming{};
+  if (has_head)
+  {
+    incoming = prefix_sum + ((lane_id > 0) ? s_prev : ValueT{});
+    if ((bmask & ((1u << lane_id) - 1)) != 0)
+    {
+      d_aggregates[gbase - 1] = incoming;
+    }
+  }
+  const int first_head_lane = __ffs(bmask) - 1; // caller guarantees bmask != 0
+  lead_out                  = __shfl_sync(full_mask, incoming, first_head_lane);
+  tail_out                  = __shfl_sync(full_mask, sseg, 31);
+}
+
 // TWO-LEVEL SEGMENTED SCAN band (the receipted design): pass A runs an independent 5-step
 // masked scan per ROW (row-major = conflict-free; NO cross-row carry, so the shuffle chains of
 // consecutive rows overlap and the pass is issue-bound), writing local prefixes back over the
@@ -1606,14 +1696,14 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else if (from_smem && warp_tile_run_count < stream_threshold)
     {
-      scan_lookup_from_flags<items_per_thread>(
+      chunk_reduce_rotated<items_per_thread>(
         d_aggregates,
         staged_vals,
         my_word,
         global_runs_before_warp_tile,
         warp_tile_offset,
+        wt_end,
         lane_id,
-        wt_row_carry[wt],
         wt_lead,
         wt_tail);
     }
