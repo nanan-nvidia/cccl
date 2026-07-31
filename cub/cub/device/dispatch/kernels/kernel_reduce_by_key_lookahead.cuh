@@ -773,6 +773,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
                                                    // try_cancel)
   __shared__ int warp_run_counts[max_key_ring_stages][compute_warps]; // per compute warp run counts
   __shared__ unsigned head_flag_buf[max_key_ring_stages][compute_warps * 32]; // staged head-flag words
+  __shared__ unsigned word_mask[max_key_ring_stages][compute_warps]; // which of a wt's 32 flag words hold heads
 
   // for POLL to pass STORE the packed (run_count prefix, open aggregate) pair
   __shared__ PrefixT prefix_packed[max_key_ring_stages];
@@ -791,9 +792,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   // try_cancel writes a 16-byte response into clc_resp + completes clc_bar's tx.
   __shared__ __align__(16) uint4 clc_resp;
   __shared__ ::cuda::std::uint64_t clc_bar;
-  static_assert(sizeof(tile_id_buf) + sizeof(warp_run_counts) + sizeof(head_flag_buf) + sizeof(prefix_packed)
-                    + sizeof(full) + sizeof(computed) + sizeof(prefixed) + sizeof(empty) + sizeof(staged_warp_tile)
-                    + sizeof(clc_resp) + sizeof(clc_bar)
+  static_assert(sizeof(tile_id_buf) + sizeof(warp_run_counts) + sizeof(head_flag_buf) + sizeof(word_mask)
+                    + sizeof(prefix_packed) + sizeof(full) + sizeof(computed) + sizeof(prefixed) + sizeof(empty)
+                    + sizeof(staged_warp_tile) + sizeof(clc_resp) + sizeof(clc_bar)
                   <= RleLookaheadPolicy::static_smem_budget,
                 "static shared memory exceeds the budget assumed by the floor launch guarantee");
 
@@ -976,6 +977,11 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           // values never share this kernel at all (the two-pass design)
           head_flag_buf[slot_id][compute_warp_id * 32 + lane_id]                                 = my_flags;
           d_flag_words[(size_t) tile_id * (compute_warps * 32) + compute_warp_id * 32 + lane_id] = my_flags;
+          const unsigned nonempty_words = __ballot_sync(full_mask, my_flags != 0);
+          if (lane_id == 0)
+          {
+            word_mask[slot_id][compute_warp_id] = nonempty_words;
+          }
           __syncwarp();
           if (lane_id == 0)
           {
@@ -1151,20 +1157,25 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
             }
             else
             {
-              // sparse band: decode head positions from the flag words. decode_run shuffles with
-              // the full mask, so every round must be executed by every lane (divergent per-lane
-              // loops around it DEADLOCK -- receipted the hard way)
-              const HeadFlagDecodeT dec(head_flag_buf[slot_id], warp_tile_id, lane_id);
-              const int rounds = (warp_tile_run_count + 31) >> 5;
-              for (int it = 0; it < rounds; ++it)
+              // sparse band: masked replay -- compute published which words hold heads (one
+              // ballot, outside the scan loop), so the drain replays ONLY the live words. No
+              // shuffles, no decode chain; skipped words have popc 0, so the running output
+              // base stays correct. The loop is warp-uniform (mask is uniform).
+              const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+              unsigned live         = word_mask[slot_id][warp_tile_id];
+              int word_base         = 0;
+              while (live != 0)
               {
-                const int run_idx  = it * 32 + lane_id;
-                const RunSpanT run = dec.decode_run(run_idx < warp_tile_run_count ? run_idx : 0);
-                if (run_idx < warp_tile_run_count)
+                const int iter = __ffs(live) - 1;
+                live &= live - 1;
+                const unsigned w = head_flag_buf[slot_id][warp_tile_id * 32 + iter];
+                if ((w >> lane_id) & 1u)
                 {
-                  d_unique[global_runs_before_warp_tile + run_idx] =
-                    tile_keys[warp_tile_offset + run.head_pos_in_warp_tile + key_skip];
+                  const int run_idx                                = word_base + __popc(w & upto_l) - 1;
+                  const int loc                                    = warp_tile_offset + iter * 32 + lane_id;
+                  d_unique[global_runs_before_warp_tile + run_idx] = tile_keys[loc + key_skip];
                 }
+                word_base += __popc(w);
               }
             }
           }
