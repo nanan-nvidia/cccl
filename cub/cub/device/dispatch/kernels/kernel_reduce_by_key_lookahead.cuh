@@ -461,6 +461,106 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT span_sum_prefetched(const ValueT* tile
   return agg;
 }
 
+// CARRY-FREE STREAM (dense band, from smem): the classic stream's 5-step masked scan carries a
+// serial dependency ROW TO ROW (~32x5 dependent shuffles = the measured ~7us contended VEmit at
+// dense). Here every row scans INDEPENDENTLY -- the 32 short chains overlap -- and emits every
+// run that begins AND ends inside it. Each row defers AT MOST ONE emission (the run crossing
+// into it: the end before the row's first head, or the row-final end of a headless row); pass B
+// resolves all 32 deferrals with ONE masked scan over row totals plus one parallel store. The
+// warp tile's lead and tail fall out of the same scan.
+template <int items_per_thread, class ValueT, class OffT>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_carry_free(
+  ValueT* __restrict__ d_aggregates,
+  const ValueT* __restrict__ smem_vals,
+  unsigned my_word,
+  OffT global_runs_before_warp_tile,
+  int warp_tile_offset,
+  int lane_id,
+  ValueT& lead_out,
+  ValueT& tail_out)
+{
+  static_assert(items_per_thread == 32, "the carry-free stream assumes 32x32 warp tiles");
+  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+  int word_base         = 0; // heads in rows before the current one (uniform running sum)
+  ValueT my_row_tail{}; // row r's sum since its last head (whole row when headless)
+  ValueT my_deferred{}; // row r's crossing-run partial
+  bool my_has_head  = false;
+  bool my_has_defer = false;
+  int my_defer_rank = 0;
+#  pragma unroll 4
+  for (int r = 0; r < items_per_thread; ++r)
+  {
+    const unsigned w      = __shfl_sync(full_mask, my_word, r);
+    const unsigned w_next = (r + 1 < items_per_thread) ? __shfl_sync(full_mask, my_word, (r + 1) & 31) : 0u;
+    ValueT incl           = smem_vals[warp_tile_offset + r * 32 + lane_id];
+#  pragma unroll
+    for (int off = 1; off < 32; off <<= 1)
+    {
+      const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+      const ValueT from_left   = __shfl_up_sync(full_mask, incl, off);
+      if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u))
+      {
+        incl += from_left;
+      }
+    }
+    const bool is_end =
+      (lane_id < 31) ? (((w >> (lane_id + 1)) & 1u) != 0u) : ((r + 1 < items_per_thread) && ((w_next & 1u) != 0u));
+    const bool head_at_or_before = (w & upto_l) != 0u;
+    // runs both starting and ending in this row emit NOW (their scan needed no carry)
+    if (is_end && head_at_or_before)
+    {
+      const int run_idx                                    = word_base + __popc(w & upto_l) - 1;
+      d_aggregates[global_runs_before_warp_tile + run_idx] = incl;
+    }
+    // the (at most one) crossing run's partial: the first end with NO local head before it
+    const unsigned defer_mask = __ballot_sync(full_mask, is_end && !head_at_or_before);
+    const ValueT row_tail     = __shfl_sync(full_mask, incl, 31); // sum since the row's last head
+    if (lane_id == r)
+    {
+      my_row_tail   = row_tail;
+      my_has_head   = (w != 0u);
+      my_has_defer  = (defer_mask != 0u);
+      my_defer_rank = word_base - 1; // rank -1 == the warp tile's LEAD
+    }
+    if (defer_mask != 0u)
+    {
+      const int dlane = __ffs(defer_mask) - 1;
+      const ValueT dp = __shfl_sync(full_mask, incl, dlane);
+      if (lane_id == r)
+      {
+        my_deferred = dp;
+      }
+    }
+    word_base += __popc(w);
+  }
+  // pass B: one masked scan over row tails (breaks at headed rows) resolves every deferral
+  ValueT rs            = my_row_tail;
+  const unsigned rmask = __ballot_sync(full_mask, my_has_head);
+#  pragma unroll
+  for (int off = 1; off < 32; off <<= 1)
+  {
+    const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+    const ValueT from_left   = __shfl_up_sync(full_mask, rs, off);
+    if (lane_id >= off && ((rmask & upto_l & ~upto_prev) == 0u))
+    {
+      rs += from_left;
+    }
+  }
+  const ValueT rs_prev = __shfl_up_sync(full_mask, rs, 1); // sum since the last head before my row
+  ValueT resolved{};
+  if (my_has_defer)
+  {
+    resolved = my_deferred + ((lane_id > 0) ? rs_prev : ValueT{});
+    if (my_defer_rank >= 0)
+    {
+      d_aggregates[global_runs_before_warp_tile + my_defer_rank] = resolved;
+    }
+  }
+  const unsigned lead_mask = __ballot_sync(full_mask, my_has_defer && my_defer_rank < 0);
+  lead_out                 = (lead_mask != 0u) ? __shfl_sync(full_mask, resolved, __ffs(lead_mask) - 1) : ValueT{};
+  tail_out                 = __shfl_sync(full_mask, rs, 31); // sum since the warp tile's last head
+}
+
 // ROTATED REGISTER-WALK band: the branchless chunk walk with its one receipted flaw removed.
 // Lane-contiguous chunks (chunk l == row l) bank-conflict 32-way on every load; rotating each
 // row r IN PLACE by r makes the walk's column-step banks (e+l) mod 32 -- conflict-free with ZERO
@@ -1744,11 +1844,20 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else if (warp_tile_run_count >= stream_threshold)
     {
-      stream_values_from_flags<items_per_thread>(
-        d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
-      const HeadFlagDecodeT dec(my_word, lane_id);
-      const RunSpanT first_run = dec.decode_run(0);
-      wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+      if (from_smem)
+      {
+        stream_values_carry_free<items_per_thread>(
+          d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_lead, wt_tail);
+      }
+      else
+      {
+        stream_values_from_flags<items_per_thread>(
+          d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
+        const HeadFlagDecodeT dec(my_word, lane_id);
+        const RunSpanT first_run = dec.decode_run(0);
+        wt_lead =
+          warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+      }
     }
     else
     {
