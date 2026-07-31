@@ -973,6 +973,10 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
     {
       pair_scan_steps(1, 2); // reach 3
     }
+    else if (p_max <= 7)
+    {
+      pair_scan_steps(1, 4); // reach 7 -- seg4's regime (64% pair-break density)
+    }
     else
     {
       pair_scan_steps(1, 16);
