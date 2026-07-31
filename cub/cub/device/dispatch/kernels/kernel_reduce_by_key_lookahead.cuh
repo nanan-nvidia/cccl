@@ -825,13 +825,19 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
       const unsigned at_or_before = w & upto_l;
       const int my_dist           = (at_or_before != 0u) ? (lane_id - (31 - __clz(at_or_before))) : (lane_id + 1);
       const int max_dist          = __reduce_max_sync(full_mask, my_dist);
-      for (int off = 1; off < 32 && off <= max_dist; off <<= 1)
+      // static unroll with a UNIFORM skip per step: skipped steps issue no shuffle (the MIO
+      // saving), taken steps stay pipelined (the dynamic-bound loop form cost +29% at seg4)
+#  pragma unroll
+      for (int off = 1; off < 32; off <<= 1)
       {
-        const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-        const ValueT from_left   = __shfl_up_sync(full_mask, incl, off);
-        if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u))
+        if (off <= max_dist)
         {
-          incl += from_left;
+          const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+          const ValueT from_left   = __shfl_up_sync(full_mask, incl, off);
+          if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u))
+          {
+            incl += from_left;
+          }
         }
       }
       if ((w & upto_l) == 0u)
