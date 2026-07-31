@@ -1434,41 +1434,20 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     {
       ptx::mbarrier_init(&staged_bar, 1);
       ptx::fence_proxy_async(ptx::space_shared);
-      const unsigned vbytes      = (unsigned) ((size_t) stage_len * sizeof(ValueT));
-      const unsigned vspan       = (vbytes + 15u) & ~15u;
-      constexpr unsigned f_bytes = (unsigned) (compute_warps * 32 * sizeof(unsigned));
-      ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &staged_bar, vspan + f_bytes);
-      ptx::cp_async_bulk_ignore_oob(
-        ptx::space_shared,
-        ptx::space_global,
-        staged_vals,
-        d_values + (size_t) tile_id * tile_size,
-        vspan,
-        0u,
-        vspan - vbytes,
-        &staged_bar);
-      ptx::cp_async_bulk(
-        ptx::space_shared,
-        ptx::space_global,
-        staged_flags,
-        d_flag_words + (size_t) tile_id * (compute_warps * 32),
-        f_bytes,
-        &staged_bar);
     }
-    else
+    // fire-and-forget L2 prefetch for EVERY tile (v6b receipt); it also makes the conditional
+    // TMA stage below an L2-resident copy instead of a DRAM round trip
+    const char* vbase        = (const char*) (d_values + (size_t) tile_id * tile_size);
+    const char* vbase16      = (const char*) ((size_t) vbase & ~(size_t) 15);
+    const unsigned vpf_bytes = (unsigned) (((size_t) stage_len * sizeof(ValueT)) & ~(size_t) 15);
+    if (vpf_bytes > 0)
     {
-      const char* vbase        = (const char*) (d_values + (size_t) tile_id * tile_size);
-      const char* vbase16      = (const char*) ((size_t) vbase & ~(size_t) 15);
-      const unsigned vpf_bytes = (unsigned) (((size_t) stage_len * sizeof(ValueT)) & ~(size_t) 15);
-      if (vpf_bytes > 0)
-      {
-        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vbase16), "r"(vpf_bytes) : "memory");
-      }
-      const char* fbase = (const char*) (d_flag_words + (size_t) tile_id * (compute_warps * 32));
-      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fbase),
-                   "r"((unsigned) (compute_warps * 32 * sizeof(unsigned)))
-                   : "memory");
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vbase16), "r"(vpf_bytes) : "memory");
     }
+    const char* fbase = (const char*) (d_flag_words + (size_t) tile_id * (compute_warps * 32));
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fbase),
+                 "r"((unsigned) (compute_warps * 32 * sizeof(unsigned)))
+                 : "memory");
   }
   __syncthreads(); // staged_bar init is visible to every warp past this point
   const bool ik_rec = tile_id < 8;
@@ -1476,15 +1455,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   {
     RBK_IK_BEG(VSetup, tile_id);
   }
-  const int wt       = (int) (threadIdx.x >> 5);
-  const int lane_id  = (int) (threadIdx.x & 31);
-  const int tile_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
-  if (vals_staged)
-  {
-    wait_parity(&staged_bar, 0);
-  }
-  const unsigned my_word        = vals_staged ? staged_flags[wt * 32 + lane_id]
-                                              : d_flag_words[(size_t) tile_id * (compute_warps * 32) + wt * 32 + lane_id];
+  const int wt                  = (int) (threadIdx.x >> 5);
+  const int lane_id             = (int) (threadIdx.x & 31);
+  const int tile_len            = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
+  const unsigned my_word        = d_flag_words[(size_t) tile_id * (compute_warps * 32) + wt * 32 + lane_id];
   const int warp_tile_run_count = __reduce_add_sync(full_mask, __popc(my_word));
   if (lane_id == 0)
   {
@@ -1538,8 +1512,33 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         wt_tail);
     }
   };
-  if (vals_staged)
+#  ifdef K_VSTAGE_T
+  constexpr int stage_run_threshold = K_VSTAGE_T;
+#  else
+  // B200 receipt: smem bands win at seg16 (-15%) and dense (-8%) but the serial stage hop costs
+  // +5-20% where bands are light (seg64+); the crossover sits between ~250 and ~960 runs/tile
+  constexpr int stage_run_threshold = 512;
+#  endif
+  const int tile_total_runs =
+    __shfl_sync(full_mask, lane_runs_before_warp_tile + lane_warp_tile_run_count, compute_warps - 1);
+  if (vals_staged && tile_total_runs >= stage_run_threshold)
   {
+    if (threadIdx.x == 0)
+    {
+      const unsigned vbytes = (unsigned) ((size_t) stage_len * sizeof(ValueT));
+      const unsigned vspan  = (vbytes + 15u) & ~15u;
+      ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &staged_bar, vspan);
+      ptx::cp_async_bulk_ignore_oob(
+        ptx::space_shared,
+        ptx::space_global,
+        staged_vals,
+        d_values + (size_t) tile_id * tile_size,
+        vspan,
+        0u,
+        vspan - vbytes,
+        &staged_bar);
+    }
+    wait_parity(&staged_bar, 0);
     emit_bands(staged_vals, ::cuda::std::true_type{});
   }
   else
