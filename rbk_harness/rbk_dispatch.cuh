@@ -59,7 +59,11 @@ struct winner_config
     }
   };
 
-  static constexpr size_t kDynSmem = kPolicy.dyn_smem_bytes((int) sizeof(KeyT), (int) alignof(KeyT));
+  // positions are gone: the dyn smem is the keys ring + the compacted run-key staging (256
+  // entries per warp tile per slot); the policy's own accounting still charges the dead pos ring
+  static constexpr size_t kDynSmem =
+    (size_t) kStages * kPolicy.slot_stride((int) sizeof(KeyT), (int) alignof(KeyT)) * sizeof(KeyT)
+    + (size_t) kStages * kNumCompWarps * 256 * sizeof(KeyT);
 };
 
 template <class Config>
