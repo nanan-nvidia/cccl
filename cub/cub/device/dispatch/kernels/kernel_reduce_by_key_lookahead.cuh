@@ -325,6 +325,61 @@ clc_next_tile_id(uint4& clc_resp, ::cuda::std::uint64_t& clc_bar, int pipeline_g
 
 // calculate head_flags: each iter is 32 consecutive elements (lane L owns loc = warp_tile_offset + iter*32 + L)
 // head = (key != predecessor)
+// spread the 8 bits of x to stride-4 positions (bit i -> bit 4i)
+_CCCL_DEVICE_API _CCCL_FORCEINLINE unsigned spread4(unsigned x)
+{
+  x = (x | (x << 12)) & 0x000F000Fu;
+  x = (x | (x << 6)) & 0x03030303u;
+  x = (x | (x << 3)) & 0x11111111u;
+  return x;
+}
+
+// quad flag pass: lane b of quad-row q reads keys q*128 + 4b..4b+3 with ONE LDS.128, so 3 of 4
+// predecessor compares are register-local -- per-lane MIO drops 96 (32 LDS + 64 SHFL) to ~17
+// (8 LDS.128 + 16 SHFL). The ballots come out STRIDED (ballot j of quad-row q has bit 8s+b =
+// head of key q*128 + s*32 + 4b + j... wait: bit position = lane = 8s + (l>>2)); the row-major
+// word every consumer expects is reassembled with a pure-ALU 4-way bit interleave, so the flag
+// word layout is BYTE-IDENTICAL to the scalar pass. 4-byte aligned keys only; callers fall back
+// to the scalar pass otherwise (uniform branch outside any loop).
+template <int items_per_thread, class KeyT>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE unsigned
+compute_head_flags_quad(const KeyT* key_buf, int warp_tile_offset, int tile_len, int tile_id, int lane_id)
+{
+  static_assert(items_per_thread == 32 && sizeof(KeyT) == 4, "quad pass assumes 32x32 warp tiles of 4B keys");
+  unsigned my_flags = 0;
+  KeyT row_carry    = key_buf[warp_tile_offset - 1]; // slot_pad makes this legal when staged
+  const int my_quad = lane_id >> 2;
+  const int my_sub  = lane_id & 3;
+#  pragma unroll
+  for (int q = 0; q < items_per_thread / 4; ++q)
+  {
+    const int loc0 = warp_tile_offset + q * 128 + lane_id * 4;
+    KeyT k[4];
+    *(uint4*) k = *(const uint4*) (key_buf + loc0);
+    KeyT pred0  = __shfl_up_sync(full_mask, k[3], 1);
+    if (lane_id == 0)
+    {
+      pred0 = row_carry;
+    }
+    row_carry               = __shfl_sync(full_mask, k[3], 31);
+    const bool global_first = (tile_id == 0 && loc0 == 0);
+    unsigned bal[4];
+#  pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+      const KeyT pred = (j == 0) ? pred0 : k[j - 1];
+      const int head  = (loc0 + j < tile_len) ? ((global_first && j == 0) ? 1 : !(k[j] == pred)) : 0;
+      bal[j]          = __ballot_sync(full_mask, head);
+    }
+    if (my_quad == q)
+    {
+      my_flags = spread4((bal[0] >> (8 * my_sub)) & 0xffu) | (spread4((bal[1] >> (8 * my_sub)) & 0xffu) << 1)
+               | (spread4((bal[2] >> (8 * my_sub)) & 0xffu) << 2) | (spread4((bal[3] >> (8 * my_sub)) & 0xffu) << 3);
+    }
+  }
+  return my_flags;
+}
+
 template <int items_per_thread, bool clamp_tail, class KeyT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE unsigned
 compute_head_flags(const KeyT* key_buf, int warp_tile_offset, int tile_len, int tile_id, int lane_id, int skip_elems)
@@ -936,8 +991,24 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           if (keys_staged)
           {
             const KeyT* key_buf = tile_buf + (size_t) slot_id * slot_stride + slot_pad;
-            my_flags            = compute_head_flags<items_per_thread, false>(
-              key_buf, warp_tile_offset, tile_len, tile_id, lane_id, skip_elems);
+            bool quad_ok        = false;
+            if constexpr (items_per_thread == 32 && sizeof(KeyT) == 4)
+            {
+              quad_ok = (skip_elems == 0);
+            }
+            if (quad_ok)
+            {
+              if constexpr (items_per_thread == 32 && sizeof(KeyT) == 4)
+              {
+                my_flags =
+                  compute_head_flags_quad<items_per_thread>(key_buf, warp_tile_offset, tile_len, tile_id, lane_id);
+              }
+            }
+            else
+            {
+              my_flags = compute_head_flags<items_per_thread, false>(
+                key_buf, warp_tile_offset, tile_len, tile_id, lane_id, skip_elems);
+            }
           }
           else
           {
