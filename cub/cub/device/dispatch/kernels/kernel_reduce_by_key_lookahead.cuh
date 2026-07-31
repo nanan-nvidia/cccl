@@ -776,7 +776,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_from_flags(
 // value warps snapshot the flags and run fully detached from the rings). Emits every
 // within-warp-tile-closed aggregate; the trailing open sum comes back as the carry. The scan
 // loop is the FROZEN form -- lead/tail ride separate passes, never inside it.
-template <int items_per_thread, class ValueT, class OffT>
+template <int items_per_thread, bool full_tile, class ValueT, class OffT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
   ValueT* __restrict__ d_aggregates,
   const ValueT* __restrict__ tile_vals,
@@ -806,7 +806,14 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
     {
       const int iter = chunk + cr;
       const int loc  = warp_tile_offset + iter * 32 + lane_id;
-      row_vals[cr]   = (iter < items_per_thread && loc < tile_len) ? tile_vals[loc] : ValueT{};
+      if constexpr (full_tile)
+      {
+        row_vals[cr] = tile_vals[loc]; // staged tiles are zero-filled past tile_len
+      }
+      else
+      {
+        row_vals[cr] = (iter < items_per_thread && loc < tile_len) ? tile_vals[loc] : ValueT{};
+      }
     }
 #  pragma unroll
     for (int cr = 0; cr < chunk_rows; ++cr)
@@ -1783,7 +1790,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else if (warp_tile_run_count >= stream_threshold)
     {
-      stream_values_from_flags<items_per_thread>(
+      stream_values_from_flags<items_per_thread, from_smem>(
         d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
       const HeadFlagDecodeT dec(my_word, lane_id);
       const RunSpanT first_run = dec.decode_run(0);
@@ -2087,7 +2094,7 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
           }
           else if (warp_tile_run_count >= stream_threshold)
           {
-            stream_values_from_flags<items_per_thread>(
+            stream_values_from_flags<items_per_thread, true>(
               d_aggregates,
               tile_vals,
               my_word,
