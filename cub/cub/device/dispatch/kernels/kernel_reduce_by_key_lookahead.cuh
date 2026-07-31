@@ -1626,51 +1626,61 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   __shared__ ValueT wt_tails[compute_warps];
   __shared__ ValueT wt_row_carry[compute_warps][32];
 
-  const int tile_id = (int) blockIdx.x;
-  if (tile_id >= num_tiles)
+  if ((int) blockIdx.x >= num_tiles)
   {
     return;
   }
-  // STAGED mode (IKET receipt: the bands run 3.7x faster per warp tile from smem, and 6-block
-  // occupancy is the latency pipeline): one bulk TMA pulls the tile's values AND flag words into
-  // this block's smem before the bands run. Unstaged (misaligned values base): the old global
-  // path with the fire-and-forget L2 prefetch (v6b receipt).
+  // GRID-STRIDE tile loop: per-block overhead (start convoy + prologue + exit, the ~3.8us/tile
+  // outside every IKET range) amortizes over ~dozens of tiles, and the NEXT tile's TMA + flag
+  // prefetch issue right after the bands release the slot -- a whole tile of lead time. Strided
+  // assignment averages the sparse cost mix across each block's tiles.
   extern __shared__ char v_smem_raw[];
-  ValueT* const staged_vals    = (ValueT*) v_smem_raw;
-  unsigned* const staged_flags = (unsigned*) (v_smem_raw + (size_t) tile_size * sizeof(ValueT));
+  ValueT* const staged_vals = (ValueT*) v_smem_raw;
   __shared__ ::cuda::std::uint64_t staged_bar;
 #  ifdef K_VSTAGE_T
   constexpr int stage_run_threshold = K_VSTAGE_T;
 #  else
   constexpr int stage_run_threshold = 512;
 #  endif
-  const int stage_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
   if (threadIdx.x == 0)
   {
-    if (vals_staged)
-    {
-      ptx::mbarrier_init(&staged_bar, 1);
-      ptx::fence_proxy_async(ptx::space_shared);
-    }
+    ptx::mbarrier_init(&staged_bar, 1);
+    ptx::fence_proxy_async(ptx::space_shared);
     if (vals_staged && stage_run_threshold == 0)
     {
-      // always-stage shape: the TMA IS the fetch; issue it NOW so setup rides under the flight
-      const unsigned vbytes = (unsigned) ((size_t) stage_len * sizeof(ValueT));
+      // the first tile's TMA; every later tile's is issued a whole tile early
+      const int len0        = (int) min((OffT) tile_size, num_items - (OffT) blockIdx.x * tile_size);
+      const unsigned vbytes = (unsigned) ((size_t) len0 * sizeof(ValueT));
       const unsigned vspan  = (vbytes + 15u) & ~15u;
       ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &staged_bar, vspan);
       ptx::cp_async_bulk_ignore_oob(
         ptx::space_shared,
         ptx::space_global,
         staged_vals,
-        d_values + (size_t) tile_id * tile_size,
+        d_values + (size_t) blockIdx.x * tile_size,
         vspan,
         0u,
         vspan - vbytes,
         &staged_bar);
     }
-    else
+    const char* fbase = (const char*) (d_flag_words + (size_t) blockIdx.x * (compute_warps * 32));
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fbase),
+                 "r"((unsigned) (compute_warps * 32 * sizeof(unsigned)))
+                 : "memory");
+  }
+  __syncthreads(); // barrier init visible to every warp past this point
+  int stage_it = 0;
+  int n_issued = 0; // routed-mode stage count (the wait parity tracks issues, not tiles)
+  for (int tile_id = (int) blockIdx.x; tile_id < num_tiles; tile_id += (int) gridDim.x, ++stage_it)
+  {
+    // order warp 0's PREVIOUS epilogue reads (wt_counts/leads/tails) before this iteration's
+    // setup writes -- without this, warps 1..7 overwrite the arrays under the epilogue (hammer
+    // receipt: aggregate-shifted corruption at mid segs)
+    __syncthreads();
+    const int stage_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
+    if (threadIdx.x == 0 && (!vals_staged || stage_run_threshold > 0))
     {
-      // routed/unstaged shapes: L2 prefetch (v6b receipt)
+      // unstaged/routed shapes: L2 prefetch of the current tile (v6b receipt)
       const char* vbase        = (const char*) (d_values + (size_t) tile_id * tile_size);
       const char* vbase16      = (const char*) ((size_t) vbase & ~(size_t) 15);
       const unsigned vpf_bytes = (unsigned) (((size_t) stage_len * sizeof(ValueT)) & ~(size_t) 15);
@@ -1679,201 +1689,224 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vbase16), "r"(vpf_bytes) : "memory");
       }
     }
-    const char* fbase = (const char*) (d_flag_words + (size_t) tile_id * (compute_warps * 32));
-    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fbase),
-                 "r"((unsigned) (compute_warps * 32 * sizeof(unsigned)))
-                 : "memory");
-  }
-  __syncthreads(); // staged_bar init is visible to every warp past this point
-  const bool ik_rec = tile_id < 8;
-  if (ik_rec)
-  {
-    RBK_IK_BEG(VSetup, tile_id);
-  }
-  const int wt                  = (int) (threadIdx.x >> 5);
-  const int lane_id             = (int) (threadIdx.x & 31);
-  const int tile_len            = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
-  const unsigned my_word        = d_flag_words[(size_t) tile_id * (compute_warps * 32) + wt * 32 + lane_id];
-  const int warp_tile_run_count = __reduce_add_sync(full_mask, __popc(my_word));
-  if (lane_id == 0)
-  {
-    wt_counts[wt] = warp_tile_run_count;
-  }
-  __syncthreads();
-  const auto [lane_warp_tile_run_count, lane_runs_before_warp_tile] =
-    scan_warp_tile_run_counts<compute_warps>(wt_counts, lane_id);
-  const int runs_before_warp_tile         = __shfl_sync(full_mask, lane_runs_before_warp_tile, wt);
-  const OffT curr_prefix_run_count        = d_tile_prefix[tile_id].run_count();
-  const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
-  const int warp_tile_offset              = wt * warp_tile_size;
-  const int wt_end                        = min(warp_tile_offset + warp_tile_size, tile_len);
-  if (ik_rec)
-  {
-    RBK_IK_END(VSetup, tile_id);
-  }
-  if (ik_rec)
-  {
-    RBK_IK_BEG(VEmit, tile_id);
-  }
-  // boundary sums + the banded within-warp-tile emission (the receipted forms). The tag lambda
-  // keeps the smem pointer compile-time provable (the LD.E-vs-LDS receipt from the keys drain)
-  ValueT wt_lead{};
-  ValueT wt_tail{};
-  auto emit_bands = [&](const ValueT* tile_vals, auto staged_tag) _CCCL_FORCEINLINE_LAMBDA {
-    constexpr bool from_smem = decltype(staged_tag)::value;
-    if (warp_tile_run_count == 0)
+    const bool ik_rec = tile_id < 8;
+    if (ik_rec)
     {
-      wt_lead = warp_span_sum(tile_vals, warp_tile_offset, wt_end, lane_id);
-      wt_tail = wt_lead; // head-free: the whole warp tile leads AND trails
+      RBK_IK_BEG(VSetup, tile_id);
     }
-    else if (from_smem && warp_tile_run_count < stream_threshold)
+    const int wt                  = (int) (threadIdx.x >> 5);
+    const int lane_id             = (int) (threadIdx.x & 31);
+    const int tile_len            = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
+    const unsigned my_word        = d_flag_words[(size_t) tile_id * (compute_warps * 32) + wt * 32 + lane_id];
+    const int warp_tile_run_count = __reduce_add_sync(full_mask, __popc(my_word));
+    if (lane_id == 0)
     {
-      chunk_reduce_rotated<items_per_thread>(
-        d_aggregates,
-        staged_vals,
-        my_word,
-        global_runs_before_warp_tile,
-        warp_tile_offset,
-        wt_end,
-        lane_id,
-        wt_lead,
-        wt_tail);
+      wt_counts[wt] = warp_tile_run_count;
     }
-    else if (warp_tile_run_count >= stream_threshold)
+    __syncthreads();
+    const auto [lane_warp_tile_run_count, lane_runs_before_warp_tile] =
+      scan_warp_tile_run_counts<compute_warps>(wt_counts, lane_id);
+    const int runs_before_warp_tile         = __shfl_sync(full_mask, lane_runs_before_warp_tile, wt);
+    const OffT curr_prefix_run_count        = d_tile_prefix[tile_id].run_count();
+    const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
+    const int warp_tile_offset              = wt * warp_tile_size;
+    const int wt_end                        = min(warp_tile_offset + warp_tile_size, tile_len);
+    if (ik_rec)
     {
-      stream_values_from_flags<items_per_thread>(
-        d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
-      const HeadFlagDecodeT dec(my_word, lane_id);
-      const RunSpanT first_run = dec.decode_run(0);
-      wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+      RBK_IK_END(VSetup, tile_id);
+    }
+    if (ik_rec)
+    {
+      RBK_IK_BEG(VEmit, tile_id);
+    }
+    // boundary sums + the banded within-warp-tile emission (the receipted forms). The tag lambda
+    // keeps the smem pointer compile-time provable (the LD.E-vs-LDS receipt from the keys drain)
+    ValueT wt_lead{};
+    ValueT wt_tail{};
+    auto emit_bands = [&](const ValueT* tile_vals, auto staged_tag) _CCCL_FORCEINLINE_LAMBDA {
+      constexpr bool from_smem = decltype(staged_tag)::value;
+      if (warp_tile_run_count == 0)
+      {
+        wt_lead = warp_span_sum(tile_vals, warp_tile_offset, wt_end, lane_id);
+        wt_tail = wt_lead; // head-free: the whole warp tile leads AND trails
+      }
+      else if (from_smem && warp_tile_run_count < stream_threshold)
+      {
+        chunk_reduce_rotated<items_per_thread>(
+          d_aggregates,
+          staged_vals,
+          my_word,
+          global_runs_before_warp_tile,
+          warp_tile_offset,
+          wt_end,
+          lane_id,
+          wt_lead,
+          wt_tail);
+      }
+      else if (warp_tile_run_count >= stream_threshold)
+      {
+        stream_values_from_flags<items_per_thread>(
+          d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
+        const HeadFlagDecodeT dec(my_word, lane_id);
+        const RunSpanT first_run = dec.decode_run(0);
+        wt_lead =
+          warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+      }
+      else
+      {
+        chunk_reduce_from_flags<items_per_thread>(
+          d_aggregates,
+          tile_vals,
+          my_word,
+          global_runs_before_warp_tile,
+          warp_tile_offset,
+          wt_end,
+          lane_id,
+          wt_lead,
+          wt_tail);
+      }
+    };
+    const int tile_total_runs =
+      __shfl_sync(full_mask, lane_runs_before_warp_tile + lane_warp_tile_run_count, compute_warps - 1);
+    if (vals_staged && tile_total_runs >= stage_run_threshold)
+    {
+      if (stage_run_threshold > 0 && threadIdx.x == 0)
+      {
+        const unsigned vbytes = (unsigned) ((size_t) stage_len * sizeof(ValueT));
+        const unsigned vspan  = (vbytes + 15u) & ~15u;
+        ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &staged_bar, vspan);
+        ptx::cp_async_bulk_ignore_oob(
+          ptx::space_shared,
+          ptx::space_global,
+          staged_vals,
+          d_values + (size_t) tile_id * tile_size,
+          vspan,
+          0u,
+          vspan - vbytes,
+          &staged_bar);
+      }
+      if (ik_rec)
+      {
+        RBK_IK_BEG(VStageWait, tile_id);
+      }
+      wait_parity(&staged_bar, (unsigned) ((stage_run_threshold == 0 ? stage_it : n_issued) & 1));
+      ++n_issued;
+      if (ik_rec)
+      {
+        RBK_IK_END(VStageWait, tile_id);
+      }
+      emit_bands(staged_vals, ::cuda::std::true_type{});
     }
     else
     {
-      chunk_reduce_from_flags<items_per_thread>(
-        d_aggregates,
-        tile_vals,
-        my_word,
-        global_runs_before_warp_tile,
-        warp_tile_offset,
-        wt_end,
-        lane_id,
-        wt_lead,
-        wt_tail);
+      emit_bands(d_values + (size_t) tile_id * tile_size, ::cuda::std::false_type{});
     }
-  };
-  const int tile_total_runs =
-    __shfl_sync(full_mask, lane_runs_before_warp_tile + lane_warp_tile_run_count, compute_warps - 1);
-  if (vals_staged && tile_total_runs >= stage_run_threshold)
-  {
-    if (stage_run_threshold > 0 && threadIdx.x == 0)
+    if (lane_id == 0)
     {
-      const unsigned vbytes = (unsigned) ((size_t) stage_len * sizeof(ValueT));
-      const unsigned vspan  = (vbytes + 15u) & ~15u;
-      ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &staged_bar, vspan);
-      ptx::cp_async_bulk_ignore_oob(
-        ptx::space_shared,
-        ptx::space_global,
-        staged_vals,
-        d_values + (size_t) tile_id * tile_size,
-        vspan,
-        0u,
-        vspan - vbytes,
-        &staged_bar);
+      wt_leads[wt] = wt_lead;
+      wt_tails[wt] = wt_tail;
     }
     if (ik_rec)
     {
-      RBK_IK_BEG(VStageWait, tile_id);
+      RBK_IK_END(VEmit, tile_id);
     }
-    wait_parity(&staged_bar, 0);
-    if (ik_rec)
+    __syncthreads(); // every warp's band is done: the slot is dead, the next stage may launch
+    const int next_tile = tile_id + (int) gridDim.x;
+    if (threadIdx.x == 0 && next_tile < num_tiles)
     {
-      RBK_IK_END(VStageWait, tile_id);
-    }
-    emit_bands(staged_vals, ::cuda::std::true_type{});
-  }
-  else
-  {
-    emit_bands(d_values + (size_t) tile_id * tile_size, ::cuda::std::false_type{});
-  }
-  if (lane_id == 0)
-  {
-    wt_leads[wt] = wt_lead;
-    wt_tails[wt] = wt_tail;
-  }
-  if (ik_rec)
-  {
-    RBK_IK_END(VEmit, tile_id);
-  }
-  __syncthreads();
-  if (ik_rec)
-  {
-    RBK_IK_BEG(VBoundary, tile_id);
-  }
-  // warp 0: the record + the within-tile boundary closes (aggregate chains over the wt sums)
-  if (wt == 0)
-  {
-    const int lane_count                    = (lane_id < compute_warps) ? wt_counts[lane_id] : 0;
-    const unsigned nonempty_warp_tiles_mask = __ballot_sync(full_mask, lane_count > 0);
-    const bool any_head                     = (nonempty_warp_tiles_mask != 0);
-    const bool is_last_tile                 = (tile_id == num_tiles - 1);
-    {
-      const int last_headed  = any_head ? (31 - __clz(nonempty_warp_tiles_mask)) : 0;
-      const int first_headed = any_head ? (__ffs(nonempty_warp_tiles_mask) - 1) : compute_warps;
-      ValueT open_agg        = (lane_id < compute_warps && lane_id >= last_headed) ? wt_tails[lane_id] : ValueT{};
-      ValueT lead_agg        = (lane_id < compute_warps && lane_id < first_headed) ? wt_tails[lane_id] : ValueT{};
-      if (any_head && lane_id == first_headed)
+      if (vals_staged && stage_run_threshold == 0)
       {
-        lead_agg += wt_leads[first_headed];
+        const int nlen        = (int) min((OffT) tile_size, num_items - (OffT) next_tile * tile_size);
+        const unsigned vbytes = (unsigned) ((size_t) nlen * sizeof(ValueT));
+        const unsigned vspan  = (vbytes + 15u) & ~15u;
+        ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &staged_bar, vspan);
+        ptx::cp_async_bulk_ignore_oob(
+          ptx::space_shared,
+          ptx::space_global,
+          staged_vals,
+          d_values + (size_t) next_tile * tile_size,
+          vspan,
+          0u,
+          vspan - vbytes,
+          &staged_bar);
       }
+      const char* nfbase = (const char*) (d_flag_words + (size_t) next_tile * (compute_warps * 32));
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(nfbase),
+                   "r"((unsigned) (compute_warps * 32 * sizeof(unsigned)))
+                   : "memory");
+      const char* npbase = (const char*) ((size_t) (d_tile_prefix + next_tile) & ~(size_t) 127);
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(npbase), "r"(128u) : "memory");
+    }
+    if (ik_rec)
+    {
+      RBK_IK_BEG(VBoundary, tile_id);
+    }
+    // warp 0: the record + the within-tile boundary closes (aggregate chains over the wt sums)
+    if (wt == 0)
+    {
+      const int lane_count                    = (lane_id < compute_warps) ? wt_counts[lane_id] : 0;
+      const unsigned nonempty_warp_tiles_mask = __ballot_sync(full_mask, lane_count > 0);
+      const bool any_head                     = (nonempty_warp_tiles_mask != 0);
+      const bool is_last_tile                 = (tile_id == num_tiles - 1);
+      {
+        const int last_headed  = any_head ? (31 - __clz(nonempty_warp_tiles_mask)) : 0;
+        const int first_headed = any_head ? (__ffs(nonempty_warp_tiles_mask) - 1) : compute_warps;
+        ValueT open_agg        = (lane_id < compute_warps && lane_id >= last_headed) ? wt_tails[lane_id] : ValueT{};
+        ValueT lead_agg        = (lane_id < compute_warps && lane_id < first_headed) ? wt_tails[lane_id] : ValueT{};
+        if (any_head && lane_id == first_headed)
+        {
+          lead_agg += wt_leads[first_headed];
+        }
 #  pragma unroll
-      for (int offset = 16; offset; offset >>= 1)
-      {
-        open_agg += __shfl_xor_sync(full_mask, open_agg, offset);
-        lead_agg += __shfl_xor_sync(full_mask, lead_agg, offset);
+        for (int offset = 16; offset; offset >>= 1)
+        {
+          open_agg += __shfl_xor_sync(full_mask, open_agg, offset);
+          lead_agg += __shfl_xor_sync(full_mask, lead_agg, offset);
+        }
+        if (lane_id == 0)
+        {
+          TileValueRecordT<ValueT, OffT> rec;
+          rec.open_agg = open_agg;
+          rec.lead_agg = lead_agg;
+          rec.boundary_dst =
+            (curr_prefix_run_count > 0 && (any_head || is_last_tile)) ? (OffT) (curr_prefix_run_count - 1) : (OffT) -1;
+          rec.boundary_from      = d_tile_prefix[tile_id].last_tile_with_runs();
+          value_records[tile_id] = rec;
+        }
       }
-      if (lane_id == 0)
+      if (lane_id < compute_warps && lane_count > 0)
       {
-        TileValueRecordT<ValueT, OffT> rec;
-        rec.open_agg = open_agg;
-        rec.lead_agg = lead_agg;
-        rec.boundary_dst =
-          (curr_prefix_run_count > 0 && (any_head || is_last_tile)) ? (OffT) (curr_prefix_run_count - 1) : (OffT) -1;
-        rec.boundary_from      = d_tile_prefix[tile_id].last_tile_with_runs();
-        value_records[tile_id] = rec;
+        const unsigned later = nonempty_warp_tiles_mask >> (lane_id + 1);
+        // this warp's scan already gave lane i warp-tile i's runs-before
+        const OffT last_run_global_idx = curr_prefix_run_count + lane_runs_before_warp_tile + lane_count - 1;
+        if (later)
+        {
+          const int next_headed = lane_id + 1 + __ffs(later) - 1;
+          ValueT closing        = wt_tails[lane_id];
+          for (int w2 = lane_id + 1; w2 < next_headed; ++w2)
+          {
+            closing += wt_tails[w2]; // head-free middles: whole sums
+          }
+          closing += wt_leads[next_headed];
+          d_aggregates[last_run_global_idx] = closing;
+        }
+        else if (is_last_tile)
+        {
+          ValueT closing = wt_tails[lane_id];
+          for (int w2 = lane_id + 1; w2 < compute_warps; ++w2)
+          {
+            closing += wt_tails[w2];
+          }
+          d_aggregates[last_run_global_idx] = closing;
+        }
+        // else: open into the next tile -- the cleanup pass closes it
       }
     }
-    if (lane_id < compute_warps && lane_count > 0)
+    if (ik_rec)
     {
-      const unsigned later = nonempty_warp_tiles_mask >> (lane_id + 1);
-      // this warp's scan already gave lane i warp-tile i's runs-before
-      const OffT last_run_global_idx = curr_prefix_run_count + lane_runs_before_warp_tile + lane_count - 1;
-      if (later)
-      {
-        const int next_headed = lane_id + 1 + __ffs(later) - 1;
-        ValueT closing        = wt_tails[lane_id];
-        for (int w2 = lane_id + 1; w2 < next_headed; ++w2)
-        {
-          closing += wt_tails[w2]; // head-free middles: whole sums
-        }
-        closing += wt_leads[next_headed];
-        d_aggregates[last_run_global_idx] = closing;
-      }
-      else if (is_last_tile)
-      {
-        ValueT closing = wt_tails[lane_id];
-        for (int w2 = lane_id + 1; w2 < compute_warps; ++w2)
-        {
-          closing += wt_tails[w2];
-        }
-        d_aggregates[last_run_global_idx] = closing;
-      }
-      // else: open into the next tile -- the cleanup pass closes it
+      RBK_IK_END(VBoundary, tile_id);
     }
-  }
-  if (ik_rec)
-  {
-    RBK_IK_END(VBoundary, tile_id);
-  }
+  } // grid-stride tile loop
 }
 
 // THE PERSISTENT VALUE PASS: the keys pipeline minus everything hard -- no poll squad, no

@@ -194,7 +194,20 @@ inline cudaError_t persistent_rbk_encode(
   {
     return error;
   }
-  vkernel<<<(int) tiles, Config::kNumCompWarps * 32, vals_staged ? kValBlockSmem : 0, stream>>>(
+  int v_occ = 0, sm_count = 0;
+  error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &v_occ, vkernel, Config::kNumCompWarps * 32, vals_staged ? kValBlockSmem : 0);
+  if (error != cudaSuccess)
+  {
+    return error;
+  }
+  error = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+  if (error != cudaSuccess)
+  {
+    return error;
+  }
+  const int v_grid = (int) cuda::std::min<long long>(tiles, (long long) v_occ * sm_count);
+  vkernel<<<v_grid, Config::kNumCompWarps * 32, vals_staged ? kValBlockSmem : 0, stream>>>(
     d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles, vals_staged);
   error = cudaPeekAtLastError();
   if (error != cudaSuccess)
