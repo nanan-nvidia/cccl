@@ -1165,8 +1165,31 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
               // extracts its own word's heads serially (no sync collectives, divergence safe).
               const unsigned live_mask = word_mask[slot_id][warp_tile_id];
               const int num_live       = __popc(live_mask);
-              unsigned my_word         = 0;
-              int my_word_idx          = 0;
+              if (num_live <= 4)
+              {
+                // near-empty sub-band: at ~2 live words the serial replay's couple of exposed
+                // LDS latencies beat the lane-parallel form's warp-scan setup (B200 receipt:
+                // 193 vs 223us at seg1024); the serial form's loss starts at ~8 live words
+                const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+                unsigned live         = live_mask;
+                int word_base         = 0;
+                while (live != 0)
+                {
+                  const int iter = __ffs(live) - 1;
+                  live &= live - 1;
+                  const unsigned w = head_flag_buf[slot_id][warp_tile_id * 32 + iter];
+                  if ((w >> lane_id) & 1u)
+                  {
+                    const int run_idx                                = word_base + __popc(w & upto_l) - 1;
+                    const int loc                                    = warp_tile_offset + iter * 32 + lane_id;
+                    d_unique[global_runs_before_warp_tile + run_idx] = tile_keys[loc + key_skip];
+                  }
+                  word_base += __popc(w);
+                }
+                continue;
+              }
+              unsigned my_word = 0;
+              int my_word_idx  = 0;
               if (lane_id < num_live)
               {
                 my_word_idx = (int) __fns(live_mask, 0, lane_id + 1);
