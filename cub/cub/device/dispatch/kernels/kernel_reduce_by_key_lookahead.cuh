@@ -2086,8 +2086,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       int stream_form = 0; // 0 = row
       if constexpr (from_smem && sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
       {
+        // source counters (seg4): the run-count distribution tail spilled 7.9% of the kernel
+        // into the row path; the pair form is receipted-good through this density
         stream_form = (warp_tile_run_count < warp_tile_size / 2) ? 2
-                    : (warp_tile_run_count < (3 * warp_tile_size) / 4)
+                    : (warp_tile_run_count < (7 * warp_tile_size) / 8)
                       ? 1
                       : 0;
       }
