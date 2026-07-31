@@ -490,24 +490,21 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_from_flags(
   ValueT sum_since_head{};
   int heads_seen      = 0;
   const ValueT* chunk = tile_vals + chunk_begin;
-  auto step           = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
-    if ((my_word >> e) & 1u)
+  ValueT* const out   = d_aggregates + gbase; // register base: no per-step LDC rematerialization
+  // BRANCHLESS walk (SASS receipt: the if/elif/else form compiled to a BSSY/BRA/BSYNC divergent
+  // block PER ELEMENT -- ~5700 cycles/warp tile for compute that costs ~300): selects + one
+  // predicated store, nothing for lanes to diverge on
+  auto step = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
+    const bool head      = (my_word >> e) & 1u;
+    const ValueT new_ssh = head ? v : (sum_since_head + v);
+    const ValueT new_pfx = (head || heads_seen > 0) ? prefix_sum : (prefix_sum + v);
+    if (head && heads_seen > 0)
     {
-      if (heads_seen > 0)
-      {
-        d_aggregates[gbase + heads_seen - 1] = sum_since_head; // interior run closes in-lane
-      }
-      ++heads_seen;
-      sum_since_head = v;
+      out[heads_seen - 1] = sum_since_head; // interior run closes in-lane
     }
-    else if (heads_seen > 0)
-    {
-      sum_since_head += v;
-    }
-    else
-    {
-      prefix_sum += v;
-    }
+    heads_seen += (int) head;
+    sum_since_head = new_ssh;
+    prefix_sum     = new_pfx;
   };
   if (valid == 32 && sizeof(ValueT) == 4 && (((size_t) chunk & 15) == 0))
   {
