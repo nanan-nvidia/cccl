@@ -461,6 +461,144 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT span_sum_prefetched(const ValueT* tile
   return agg;
 }
 
+// ILP-SPLIT QUAD WALK (belt, full warp tiles): four independent 8-element sub-chains (two quads
+// each) interleave so the select chains overlap 4-wide instead of one 32-deep chain; sub-chain
+// rank bases are constant-mask popcounts, so emissions need nothing from earlier chains; three
+// pure-ALU stitches merge the seams. Same quad rotation and loads as the rotated walk; the
+// cross-lane machinery is identical. Belt emissions are rare, so the per-element bookkeeping
+// that killed the dense split does not bind here.
+template <int items_per_thread, class ValueT, class OffT>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_split(
+  ValueT* __restrict__ d_aggregates,
+  ValueT* __restrict__ smem_vals, // the staged tile; quads get rotated in place
+  unsigned my_word,
+  OffT global_runs_before_warp_tile,
+  int warp_tile_offset,
+  int lane_id,
+  ValueT& lead_out,
+  ValueT& tail_out)
+{
+  static_assert(items_per_thread == 32, "the split walk assumes 32x32 warp tiles");
+  ValueT* const wt_base = smem_vals + warp_tile_offset;
+#  pragma unroll
+  for (int rr = 0; rr < 8; ++rr)
+  {
+    const int row = rr * 4 + (lane_id >> 3);
+    const int q   = lane_id & 7;
+    ValueT v4[4];
+    *(uint4*) v4 = *(const uint4*) (wt_base + row * 32 + q * 4);
+    __syncwarp();
+    *(uint4*) (wt_base + row * 32 + (((q + row) & 7) * 4)) = *(const uint4*) v4;
+  }
+  __syncwarp();
+  const int my_popc = __popc(my_word);
+  typename WarpScan<int>::TempStorage warp_scan_storage;
+  int rank_scan;
+  WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, rank_scan);
+  const OffT gbase           = global_runs_before_warp_tile + (rank_scan - my_popc);
+  const ValueT* const my_row = wt_base + lane_id * 32;
+  ValueT* const out          = d_aggregates + gbase;
+  ValueT pfx[4]              = {};
+  ValueT ssh[4]              = {};
+  int hs[4]                  = {};
+  int rank_b[4];
+#  pragma unroll
+  for (int sc = 0; sc < 4; ++sc)
+  {
+    rank_b[sc] = __popc(my_word & ((sc == 0) ? 0u : ((1u << (8 * sc)) - 1u)));
+  }
+#  pragma unroll
+  for (int h = 0; h < 2; ++h)
+  {
+    ValueT v[4][4];
+#  pragma unroll
+    for (int sc = 0; sc < 4; ++sc)
+    {
+      *(uint4*) v[sc] = *(const uint4*) (my_row + (((2 * sc + h + lane_id) & 7) << 2));
+    }
+#  pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+#  pragma unroll
+      for (int sc = 0; sc < 4; ++sc)
+      {
+        const int e          = 8 * sc + 4 * h + j;
+        const bool head      = (my_word >> e) & 1u;
+        const ValueT new_ssh = head ? v[sc][j] : (ssh[sc] + v[sc][j]);
+        const ValueT new_pfx = (head || hs[sc] > 0) ? pfx[sc] : (pfx[sc] + v[sc][j]);
+        if (head && hs[sc] > 0)
+        {
+          out[rank_b[sc] + hs[sc] - 1] = ssh[sc];
+        }
+        hs[sc] += (int) head;
+        ssh[sc] = new_ssh;
+        pfx[sc] = new_pfx;
+      }
+    }
+  }
+  // three pure-ALU stitches merge the sub-chain seams
+  ValueT prefix_sum     = pfx[0];
+  ValueT sum_since_head = ssh[0];
+  int heads_seen        = hs[0];
+#  pragma unroll
+  for (int sc = 1; sc < 4; ++sc)
+  {
+    if (hs[sc] == 0)
+    {
+      if (heads_seen > 0)
+      {
+        sum_since_head += pfx[sc];
+      }
+      else
+      {
+        prefix_sum += pfx[sc];
+      }
+    }
+    else
+    {
+      if (heads_seen > 0)
+      {
+        out[rank_b[sc] - 1] = sum_since_head + pfx[sc];
+      }
+      else
+      {
+        prefix_sum += pfx[sc];
+      }
+      sum_since_head = ssh[sc];
+      heads_seen += hs[sc];
+    }
+  }
+  // cross-lane resolution: identical to the rotated walk
+  const bool has_head   = heads_seen > 0;
+  const ValueT t        = has_head ? sum_since_head : prefix_sum;
+  const unsigned bmask  = __ballot_sync(full_mask, has_head);
+  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+  ValueT sseg           = t;
+#  pragma unroll
+  for (int off = 1; off < 32; off <<= 1)
+  {
+    const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+    const ValueT from_left   = __shfl_up_sync(full_mask, sseg, off);
+    if (lane_id >= off && ((bmask & upto_l & ~upto_prev) == 0u))
+    {
+      sseg += from_left;
+    }
+  }
+  const ValueT s_prev = __shfl_up_sync(full_mask, sseg, 1);
+  ValueT incoming{};
+  if (has_head)
+  {
+    incoming = prefix_sum + ((lane_id > 0) ? s_prev : ValueT{});
+    if ((bmask & ((1u << lane_id) - 1)) != 0)
+    {
+      d_aggregates[gbase - 1] = incoming;
+    }
+  }
+  const int first_head_lane = __ffs(bmask) - 1; // caller guarantees bmask != 0
+  lead_out                  = __shfl_sync(full_mask, incoming, first_head_lane);
+  tail_out                  = __shfl_sync(full_mask, sseg, 31);
+}
+
 // ROTATED REGISTER-WALK band: the branchless chunk walk with its one receipted flaw removed.
 // Lane-contiguous chunks (chunk l == row l) bank-conflict 32-way on every load; rotating each
 // row r IN PLACE by r makes the walk's column-step banks (e+l) mod 32 -- conflict-free with ZERO
@@ -2055,16 +2193,24 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else if (from_smem && warp_tile_run_count < stream_threshold)
     {
-      chunk_reduce_rotated<items_per_thread>(
-        d_aggregates,
-        staged_vals,
-        my_word,
-        global_runs_before_warp_tile,
-        warp_tile_offset,
-        wt_end,
-        lane_id,
-        wt_lead,
-        wt_tail);
+      if (wt_end == warp_tile_offset + warp_tile_size)
+      {
+        chunk_reduce_split<items_per_thread>(
+          d_aggregates, staged_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_lead, wt_tail);
+      }
+      else
+      {
+        chunk_reduce_rotated<items_per_thread>(
+          d_aggregates,
+          staged_vals,
+          my_word,
+          global_runs_before_warp_tile,
+          warp_tile_offset,
+          wt_end,
+          lane_id,
+          wt_lead,
+          wt_tail);
+      }
     }
     else if (warp_tile_run_count >= stream_threshold)
     {
