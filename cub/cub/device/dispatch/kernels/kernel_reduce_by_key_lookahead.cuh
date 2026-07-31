@@ -428,6 +428,107 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT span_sum_prefetched(const ValueT* tile
   return agg;
 }
 
+// single-read per-lane chunk band: lane l owns elements [32l, 32l+32) of the warp tile, which
+// is EXACTLY flag word l. Loads are 512B/instruction coalesced (LDG.128 per lane); each lane
+// closes its interior runs straight from the register walk; ONE masked segmented scan over the
+// lane sums closes every cross-lane run and yields the warp tile's lead and tail as byproducts.
+// Replaces the whole-warp/wave/per-lane span-walk bands, whose serial latency chains AND
+// separate lead/tail re-reads (up to a full extra pass at seg1024) were the mid-regime tax.
+template <int items_per_thread, class ValueT, class OffT>
+_CCCL_DEVICE_API __noinline__ void chunk_reduce_from_flags(
+  ValueT* d_aggregates,
+  const ValueT* tile_vals,
+  unsigned my_word,
+  OffT global_runs_before_warp_tile,
+  int warp_tile_offset,
+  int wt_end,
+  int lane_id,
+  ValueT& lead_out,
+  ValueT& tail_out)
+{
+  static_assert(items_per_thread == 32, "the chunk band assumes 32x32 warp tiles");
+  const int chunk_begin = warp_tile_offset + lane_id * 32;
+  const int valid       = min(max(wt_end - chunk_begin, 0), 32);
+  const int my_popc     = __popc(my_word);
+  typename WarpScan<int>::TempStorage warp_scan_storage;
+  int rank_scan;
+  WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, rank_scan);
+  const OffT gbase = global_runs_before_warp_tile + (rank_scan - my_popc);
+  ValueT prefix_sum{}; // sum of my elements before my first head
+  ValueT sum_since_head{};
+  int heads_seen      = 0;
+  const ValueT* chunk = tile_vals + chunk_begin;
+  auto step           = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
+    if ((my_word >> e) & 1u)
+    {
+      if (heads_seen > 0)
+      {
+        d_aggregates[gbase + heads_seen - 1] = sum_since_head; // interior run closes in-lane
+      }
+      ++heads_seen;
+      sum_since_head = v;
+    }
+    else if (heads_seen > 0)
+    {
+      sum_since_head += v;
+    }
+    else
+    {
+      prefix_sum += v;
+    }
+  };
+  if (valid == 32 && sizeof(ValueT) == 4 && (((size_t) chunk & 15) == 0))
+  {
+#  pragma unroll
+    for (int c = 0; c < 8; ++c)
+    {
+      ValueT v4[4];
+      *(uint4*) v4 = *(const uint4*) (chunk + 4 * c);
+#  pragma unroll
+      for (int j = 0; j < 4; ++j)
+      {
+        step(4 * c + j, v4[j]);
+      }
+    }
+  }
+  else
+  {
+    for (int e = 0; e < valid; ++e)
+    {
+      step(e, chunk[e]);
+    }
+  }
+  const bool has_head   = heads_seen > 0;
+  const ValueT t        = has_head ? sum_since_head : prefix_sum; // sum since the last head at or before me
+  const unsigned bmask  = __ballot_sync(full_mask, has_head);
+  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+  ValueT s              = t;
+#  pragma unroll
+  for (int off = 1; off < 32; off <<= 1)
+  {
+    const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+    const ValueT from_left   = __shfl_up_sync(full_mask, s, off);
+    if (lane_id >= off && ((bmask & upto_l & ~upto_prev) == 0u))
+    {
+      s += from_left;
+    }
+  }
+  const ValueT s_prev = __shfl_up_sync(full_mask, s, 1);
+  ValueT incoming{};
+  if (has_head)
+  {
+    // the run ENDING at my first head: its rank is one before my first owned run
+    incoming = prefix_sum + ((lane_id > 0) ? s_prev : ValueT{});
+    if ((bmask & ((1u << lane_id) - 1)) != 0)
+    {
+      d_aggregates[gbase - 1] = incoming;
+    }
+  }
+  const int first_head_lane = __ffs(bmask) - 1; // caller guarantees bmask != 0
+  lead_out                  = __shfl_sync(full_mask, incoming, first_head_lane);
+  tail_out                  = __shfl_sync(full_mask, s, 31); // sum since the warp tile's last head
+}
+
 // values-only streaming reduce over one warp tile, boundaries from REGISTER flag words (the
 // value warps snapshot the flags and run fully detached from the rings). Emits every
 // within-warp-tile-closed aggregate; the trailing open sum comes back as the carry. The scan
@@ -1352,78 +1453,16 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   }
   else
   {
-    const HeadFlagDecodeT dec(my_word, lane_id);
-    if (warp_tile_run_count < 16)
-    {
-      // long-span band (mean span >= 64): sub-warp cooperative walks, 8 lanes per span in waves
-      // of 4 runs. Cutoff receipts: 8 dropped seg256's ~8x128 shape into one-lane serial walks
-      // (26% trough -> 43% at cutoff 32); 32 dragged seg64's ~31x32 shape into wave overhead
-      // (-11%). Span-driven boundary.
-      const RunSpanT lane_run = dec.decode_run(lane_id < warp_tile_run_count ? lane_id : 0);
-      if (warp_tile_run_count < 4)
-      {
-        // very few, very long spans: ALL 32 lanes walk each span (8-lane waves here quadruple
-        // the serial depth exactly where spans are longest -- the 1K/4K regression receipt;
-        // crossover receipts: 8 re-serialized seg256's ~7-run tiles, 701 vs 650us)
-        for (int run_idx = 0; run_idx + 1 < warp_tile_run_count; ++run_idx)
-        {
-          const int head   = __shfl_sync(full_mask, lane_run.head_pos_in_warp_tile, run_idx);
-          const int next   = __shfl_sync(full_mask, lane_run.next_head_pos, run_idx);
-          const ValueT agg = warp_span_sum(tile_vals, warp_tile_offset + head, warp_tile_offset + next, lane_id);
-          if (lane_id == 0)
-          {
-            d_aggregates[global_runs_before_warp_tile + run_idx] = agg;
-          }
-        }
-      }
-      else
-      {
-        const int sub_lane  = lane_id & 7;
-        const int sub_group = lane_id >> 3;
-        for (int wave = 0; wave + 1 <= warp_tile_run_count; wave += 4)
-        {
-          const int run_idx    = wave + sub_group;
-          const bool active    = run_idx + 1 < warp_tile_run_count; // the last run is the closes' job
-          const int head       = __shfl_sync(full_mask, lane_run.head_pos_in_warp_tile, run_idx & 31);
-          const int next       = __shfl_sync(full_mask, lane_run.next_head_pos, run_idx & 31);
-          const int span_begin = warp_tile_offset + head;
-          const int span_end   = active ? warp_tile_offset + next : span_begin;
-          ValueT agg{};
-          for (int pos = span_begin + sub_lane; pos < span_end; pos += 8)
-          {
-            agg += tile_vals[pos];
-          }
-#  pragma unroll
-          for (int offset = 4; offset; offset >>= 1)
-          {
-            agg += __shfl_xor_sync(full_mask, agg, offset);
-          }
-          if (active && sub_lane == 0)
-          {
-            d_aggregates[global_runs_before_warp_tile + run_idx] = agg;
-          }
-        }
-      }
-    }
-    else
-    {
-      // mid band: one run per lane, plain pre-seeded span walks (decode rounds are warp-uniform)
-      const int rounds = (warp_tile_run_count + 31) >> 5;
-      for (int it = 0; it < rounds; ++it)
-      {
-        const int run_idx  = it * 32 + lane_id;
-        const RunSpanT run = dec.decode_run(run_idx < warp_tile_run_count ? run_idx : 0);
-        if (run_idx + 1 < warp_tile_run_count)
-        {
-          d_aggregates[global_runs_before_warp_tile + run_idx] = span_sum_prefetched(
-            tile_vals, warp_tile_offset + run.head_pos_in_warp_tile, warp_tile_offset + run.next_head_pos);
-        }
-      }
-    }
-    const RunSpanT first_run = dec.decode_run(0);
-    const RunSpanT last_run  = dec.decode_run(warp_tile_run_count - 1);
-    wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
-    wt_tail = warp_span_sum(tile_vals, warp_tile_offset + last_run.head_pos_in_warp_tile, wt_end, lane_id);
+    chunk_reduce_from_flags<items_per_thread>(
+      d_aggregates,
+      tile_vals,
+      my_word,
+      global_runs_before_warp_tile,
+      warp_tile_offset,
+      wt_end,
+      lane_id,
+      wt_lead,
+      wt_tail);
   }
   if (lane_id == 0)
   {
