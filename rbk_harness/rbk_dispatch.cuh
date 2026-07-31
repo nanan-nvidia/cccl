@@ -182,7 +182,12 @@ inline cudaError_t persistent_rbk_encode(
   // PASS 2: values. Persistent TMA-ring kernel when the values base is 16B-aligned and the ring
   // fits the opt-in smem; the block-per-tile kernel is the fallback (misaligned bases, small smem)
   constexpr size_t kValDynSmem = (size_t) Config::kStages * Config::kTileSize * sizeof(ValueT);
-  if ((((size_t) d_values & 15) == 0) && (size_t) smem_optin >= kValDynSmem)
+#ifdef K_NO_VPERS
+  constexpr bool kUseValPersistent = false;
+#else
+  constexpr bool kUseValPersistent = true;
+#endif
+  if (kUseValPersistent && (((size_t) d_values & 15) == 0) && (size_t) smem_optin >= kValDynSmem)
   {
     auto* vkernel2 =
       rbk_kernels::DeviceReduceByKeyLookaheadValuePersistentKernel<typename Config::Selector, ValueT, OffT>;
