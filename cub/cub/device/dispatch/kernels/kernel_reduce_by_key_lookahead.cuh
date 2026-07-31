@@ -910,6 +910,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
   ValueT& tail_out)
 {
   static_assert(items_per_thread == 32, "the paired stream assumes 32x32 warp tiles");
+  ValueT* const out = d_aggregates + global_runs_before_warp_tile; // register base: no per-
+                                                                   // emission LDC rematerialization
   ValueT carry{}; // sum since the last head seen so far (exact, left-to-right)
   int word_base = 0; // heads in words before the current double-row (uniform)
 #  pragma unroll 4
@@ -990,18 +992,20 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
     const int wb      = word_base + ((lane_id < 16) ? 0 : __popc(w0));
     const int rank_e0 = wb + __popc(wsel & ((1u << bofs) - 1u)); // heads before e0 in the wt
     // a head at e0 closes the incoming run (rank_e0 - 1); a head at e1 closes the run ending at
-    // e0 (rank_e0 + h0 - 1): fully local when it started at e0, incoming + v0 otherwise
-    if (h0 && rank_e0 >= 1)
+    // e0 (rank_e0 + h0 - 1): fully local when it started at e0, incoming + v0 otherwise.
+    // Values and ranks computed unconditionally; the stores are the ONLY conditional ops
+    // (bare `if (b) out[i] = v` compiles to @P STG -- the branchless-walk receipt)
+    const bool e0_emit  = h0 && (rank_e0 >= 1);
+    const int r1        = rank_e0 + (h0 ? 1 : 0) - 1;
+    const bool e1_emit  = h1 && (r1 >= 0);
+    const ValueT e1_val = h0 ? v0 : (P_in + v0);
+    if (e0_emit)
     {
-      d_aggregates[global_runs_before_warp_tile + rank_e0 - 1] = P_in;
+      out[rank_e0 - 1] = P_in;
     }
-    if (h1)
+    if (e1_emit)
     {
-      const int r1 = rank_e0 + (h0 ? 1 : 0) - 1;
-      if (r1 >= 0)
-      {
-        d_aggregates[global_runs_before_warp_tile + r1] = h0 ? v0 : (P_in + v0);
-      }
+      out[r1] = e1_val;
     }
     // carry update: sum since the last head after this double-row = S at lane 31 (+ carry if the
     // row had no breaks at all)
