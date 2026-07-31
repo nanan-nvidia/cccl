@@ -1057,9 +1057,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           }
           const auto [lane_warp_tile_run_count, lane_runs_before_warp_tile] =
             scan_warp_tile_run_counts<compute_warps>(warp_run_counts[slot_id], lane_id);
-          const KeyT* tile_keys =
-            keys_staged ? tile_buf + (size_t) slot_id * slot_stride + slot_pad : d_keys + (size_t) tile_id * tile_size;
-          const int key_skip = keys_staged ? skip_elems : 0;
           if (ik_rec)
           {
             RBK_IK_BEG(KWaitPrefixed, pipeline_gen);
@@ -1088,95 +1085,71 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
               *d_num_runs = (NumRunsT) (curr_prefix_run_count + tile_total_runs);
             }
           }
-          for (int warp_tile_id = key_warp_idx; warp_tile_id < compute_warps; warp_tile_id += key_store_warps)
-          {
-            const int warp_tile_run_count   = __shfl_sync(full_mask, lane_warp_tile_run_count, warp_tile_id);
-            const int runs_before_warp_tile = __shfl_sync(full_mask, lane_runs_before_warp_tile, warp_tile_id);
-            if (warp_tile_run_count == 0)
+          // the drain reads keys via LDS only when the pointer is compile-time provably SMEM: the
+          // old runtime staged/global ternary forced generic LD.E on every key read (SASS
+          // receipt: the flat ~36ns/word KDrain at every density)
+          auto drain_tiles = [&](auto staged_tag) _CCCL_FORCEINLINE_LAMBDA {
+            constexpr bool wt_keys_staged = decltype(staged_tag)::value;
+            const KeyT* tile_keys         = wt_keys_staged ? tile_buf + (size_t) slot_id * slot_stride + slot_pad
+                                                           : d_keys + (size_t) tile_id * tile_size;
+            const int key_skip            = wt_keys_staged ? skip_elems : 0;
+            for (int warp_tile_id = key_warp_idx; warp_tile_id < compute_warps; warp_tile_id += key_store_warps)
             {
-              continue;
-            }
-            if (ik_rec)
-            {
-              RBK_IK_BEG(KWaitStaged, pipeline_gen);
-            }
-            wait_parity(&staged_warp_tile[slot_id][warp_tile_id], key_ring.parity);
-            if (ik_rec)
-            {
-              RBK_IK_END(KWaitStaged, pipeline_gen);
-            }
-            const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
-            const int warp_tile_offset              = warp_tile_id * warp_tile_size;
+              const int warp_tile_run_count   = __shfl_sync(full_mask, lane_warp_tile_run_count, warp_tile_id);
+              const int runs_before_warp_tile = __shfl_sync(full_mask, lane_runs_before_warp_tile, warp_tile_id);
+              if (warp_tile_run_count == 0)
+              {
+                continue;
+              }
+              if (ik_rec)
+              {
+                RBK_IK_BEG(KWaitStaged, pipeline_gen);
+              }
+              wait_parity(&staged_warp_tile[slot_id][warp_tile_id], key_ring.parity);
+              if (ik_rec)
+              {
+                RBK_IK_END(KWaitStaged, pipeline_gen);
+              }
+              const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
+              const int warp_tile_offset              = warp_tile_id * warp_tile_size;
 #  ifdef K_DRAIN_THRESH
-            constexpr int word_serial_threshold = K_DRAIN_THRESH;
+              constexpr int word_serial_threshold = K_DRAIN_THRESH;
 #  else
             constexpr int word_serial_threshold = 256;
 #  endif
-            if (warp_tile_run_count >= staging_threshold && warp_tile_run_count <= word_serial_threshold)
-            {
-              // word-serial band (IKET receipt: KDrain flat 1.38us/gen at seg4-16 = the broadcast
-              // band's fixed 2-shuffles-per-word loop on the MIO pipe): each lane owns its own
-              // flag word and extracts its runs serially -- no shuffles, no sync collectives, so
-              // the divergence is safe; one smem read + one store per RUN
-              const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
-              const int my_popc      = __popc(my_word);
-              typename WarpScan<int>::TempStorage warp_scan_storage;
-              int word_scan;
-              WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
-              int rank     = word_scan - my_popc;
-              unsigned rem = my_word;
-              while (rem != 0)
+              if (warp_tile_run_count >= staging_threshold && warp_tile_run_count <= word_serial_threshold)
               {
-                const int bit = __ffs(rem) - 1;
-                rem &= rem - 1;
-                d_unique[global_runs_before_warp_tile + rank] =
-                  tile_keys[warp_tile_offset + lane_id * 32 + bit + key_skip];
-                ++rank;
-              }
-            }
-            else if (warp_tile_run_count >= staging_threshold)
-            {
-              // broadcast band: replay the flag words IN ORDER from smem (same-address LDS is a
-              // free 32-lane broadcast) and emit at head lanes; the word's output base is a
-              // warp-uniform running sum, so the loop has NO shuffles at all. Actives within an
-              // iteration write consecutive unique slots = coalesced.
-              const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
-              int word_base         = 0;
-#  pragma unroll
-              for (int iter = 0; iter < items_per_thread; ++iter)
-              {
-                const unsigned w = head_flag_buf[slot_id][warp_tile_id * 32 + iter];
-                if ((w >> lane_id) & 1u)
+                // word-serial band (IKET receipt: KDrain flat 1.38us/gen at seg4-16 = the broadcast
+                // band's fixed 2-shuffles-per-word loop on the MIO pipe): each lane owns its own
+                // flag word and extracts its runs serially -- no shuffles, no sync collectives, so
+                // the divergence is safe; one smem read + one store per RUN
+                const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
+                const int my_popc      = __popc(my_word);
+                typename WarpScan<int>::TempStorage warp_scan_storage;
+                int word_scan;
+                WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
+                int rank     = word_scan - my_popc;
+                unsigned rem = my_word;
+                while (rem != 0)
                 {
-                  const int run_idx                                = word_base + __popc(w & upto_l) - 1;
-                  const int loc                                    = warp_tile_offset + iter * 32 + lane_id;
-                  d_unique[global_runs_before_warp_tile + run_idx] = tile_keys[loc + key_skip];
+                  const int bit = __ffs(rem) - 1;
+                  rem &= rem - 1;
+                  d_unique[global_runs_before_warp_tile + rank] =
+                    tile_keys[warp_tile_offset + lane_id * 32 + bit + key_skip];
+                  ++rank;
                 }
-                word_base += __popc(w);
               }
-            }
-            else
-            {
-              // sparse band: lane-parallel masked word-serial. Compute published which words
-              // hold heads (one ballot, outside the scan loop); lane i owns the i-th LIVE word
-              // (<32 runs => <32 live words, always one round), so all live words load in ONE
-              // parallel LDS round -- the serial-walk form paid one exposed LDS latency per
-              // word and regressed seg64 2x (receipted). Rank base via warp scan; each lane
-              // extracts its own word's heads serially (no sync collectives, divergence safe).
-              const unsigned live_mask = word_mask[slot_id][warp_tile_id];
-              const int num_live       = __popc(live_mask);
-              if (num_live <= 4)
+              else if (warp_tile_run_count >= staging_threshold)
               {
-                // near-empty sub-band: at ~2 live words the serial replay's couple of exposed
-                // LDS latencies beat the lane-parallel form's warp-scan setup (B200 receipt:
-                // 193 vs 223us at seg1024); the serial form's loss starts at ~8 live words
+                // broadcast band: replay the flag words IN ORDER from smem (same-address LDS is a
+                // free 32-lane broadcast) and emit at head lanes; the word's output base is a
+                // warp-uniform running sum, so the loop has NO shuffles at all. Actives within an
+                // iteration write consecutive unique slots = coalesced.
                 const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
-                unsigned live         = live_mask;
                 int word_base         = 0;
-                while (live != 0)
+#  pragma unroll
+                for (int iter = 0; iter < items_per_thread; ++iter)
                 {
-                  const int iter = __ffs(live) - 1;
-                  live &= live - 1;
                   const unsigned w = head_flag_buf[slot_id][warp_tile_id * 32 + iter];
                   if ((w >> lane_id) & 1u)
                   {
@@ -1186,30 +1159,71 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
                   }
                   word_base += __popc(w);
                 }
-                continue;
               }
-              unsigned my_word = 0;
-              int my_word_idx  = 0;
-              if (lane_id < num_live)
+              else
               {
-                my_word_idx = (int) __fns(live_mask, 0, lane_id + 1);
-                my_word     = head_flag_buf[slot_id][warp_tile_id * 32 + my_word_idx];
-              }
-              const int my_popc = __popc(my_word);
-              typename WarpScan<int>::TempStorage warp_scan_storage;
-              int word_scan;
-              WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
-              int rank     = word_scan - my_popc;
-              unsigned rem = my_word;
-              while (rem != 0)
-              {
-                const int bit = __ffs(rem) - 1;
-                rem &= rem - 1;
-                d_unique[global_runs_before_warp_tile + rank] =
-                  tile_keys[warp_tile_offset + my_word_idx * 32 + bit + key_skip];
-                ++rank;
+                // sparse band: lane-parallel masked word-serial. Compute published which words
+                // hold heads (one ballot, outside the scan loop); lane i owns the i-th LIVE word
+                // (<32 runs => <32 live words, always one round), so all live words load in ONE
+                // parallel LDS round -- the serial-walk form paid one exposed LDS latency per
+                // word and regressed seg64 2x (receipted). Rank base via warp scan; each lane
+                // extracts its own word's heads serially (no sync collectives, divergence safe).
+                const unsigned live_mask = word_mask[slot_id][warp_tile_id];
+                const int num_live       = __popc(live_mask);
+                if (num_live <= 4)
+                {
+                  // near-empty sub-band: at ~2 live words the serial replay's couple of exposed
+                  // LDS latencies beat the lane-parallel form's warp-scan setup (B200 receipt:
+                  // 193 vs 223us at seg1024); the serial form's loss starts at ~8 live words
+                  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+                  unsigned live         = live_mask;
+                  int word_base         = 0;
+                  while (live != 0)
+                  {
+                    const int iter = __ffs(live) - 1;
+                    live &= live - 1;
+                    const unsigned w = head_flag_buf[slot_id][warp_tile_id * 32 + iter];
+                    if ((w >> lane_id) & 1u)
+                    {
+                      const int run_idx                                = word_base + __popc(w & upto_l) - 1;
+                      const int loc                                    = warp_tile_offset + iter * 32 + lane_id;
+                      d_unique[global_runs_before_warp_tile + run_idx] = tile_keys[loc + key_skip];
+                    }
+                    word_base += __popc(w);
+                  }
+                  continue;
+                }
+                unsigned my_word = 0;
+                int my_word_idx  = 0;
+                if (lane_id < num_live)
+                {
+                  my_word_idx = (int) __fns(live_mask, 0, lane_id + 1);
+                  my_word     = head_flag_buf[slot_id][warp_tile_id * 32 + my_word_idx];
+                }
+                const int my_popc = __popc(my_word);
+                typename WarpScan<int>::TempStorage warp_scan_storage;
+                int word_scan;
+                WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
+                int rank     = word_scan - my_popc;
+                unsigned rem = my_word;
+                while (rem != 0)
+                {
+                  const int bit = __ffs(rem) - 1;
+                  rem &= rem - 1;
+                  d_unique[global_runs_before_warp_tile + rank] =
+                    tile_keys[warp_tile_offset + my_word_idx * 32 + bit + key_skip];
+                  ++rank;
+                }
               }
             }
+          };
+          if (keys_staged)
+          {
+            drain_tiles(::cuda::std::true_type{});
+          }
+          else
+          {
+            drain_tiles(::cuda::std::false_type{});
           }
           if (ik_rec)
           {
