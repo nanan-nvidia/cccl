@@ -1285,6 +1285,24 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   {
     return;
   }
+  // pass 1 never touches d_values, so every band's first loads are cold DRAM misses at the head
+  // of a serial chain; pull the block's value tile (and its flag words) toward L2 now,
+  // fire-and-forget, while setup runs (v6b receipt: the cold-miss latency was -29% at long)
+  if (threadIdx.x == 0)
+  {
+    const int pf_len         = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
+    const char* vbase        = (const char*) (d_values + (size_t) tile_id * tile_size);
+    const char* vbase16      = (const char*) ((size_t) vbase & ~(size_t) 15);
+    const unsigned vpf_bytes = (unsigned) (((size_t) pf_len * sizeof(ValueT)) & ~(size_t) 15);
+    if (vpf_bytes > 0)
+    {
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vbase16), "r"(vpf_bytes) : "memory");
+    }
+    const char* fbase = (const char*) (d_flag_words + (size_t) tile_id * (compute_warps * 32));
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fbase),
+                 "r"((unsigned) (compute_warps * 32 * sizeof(unsigned)))
+                 : "memory");
+  }
   const bool ik_rec = tile_id < 8;
   if (ik_rec)
   {
