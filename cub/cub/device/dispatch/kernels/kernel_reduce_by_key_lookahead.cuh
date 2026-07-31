@@ -2020,6 +2020,27 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       wt_lead = warp_span_sum(tile_vals, warp_tile_offset, wt_end, lane_id);
       wt_tail = wt_lead; // head-free: the whole warp tile leads AND trails
     }
+    else if (from_smem && warp_tile_run_count < 4)
+    {
+      // whole-warp span band (restored): a 2-run warp tile paid the full rotate + ~390-inst walk
+      // (SASS census); two coalesced span sums cost ~60. All 32 lanes walk each span together.
+      const HeadFlagDecodeT dec(my_word, lane_id);
+      const RunSpanT lane_run = dec.decode_run(lane_id < warp_tile_run_count ? lane_id : 0);
+      for (int run_idx = 0; run_idx + 1 < warp_tile_run_count; ++run_idx)
+      {
+        const int head   = __shfl_sync(full_mask, lane_run.head_pos_in_warp_tile, run_idx);
+        const int next   = __shfl_sync(full_mask, lane_run.next_head_pos, run_idx);
+        const ValueT agg = warp_span_sum(tile_vals, warp_tile_offset + head, warp_tile_offset + next, lane_id);
+        if (lane_id == 0)
+        {
+          d_aggregates[global_runs_before_warp_tile + run_idx] = agg;
+        }
+      }
+      const RunSpanT first_run = dec.decode_run(0);
+      const RunSpanT last_run  = dec.decode_run(warp_tile_run_count - 1);
+      wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+      wt_tail = warp_span_sum(tile_vals, warp_tile_offset + last_run.head_pos_in_warp_tile, wt_end, lane_id);
+    }
     else if (from_smem && warp_tile_run_count < stream_threshold)
     {
       chunk_reduce_rotated<items_per_thread>(
