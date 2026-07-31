@@ -461,65 +461,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT span_sum_prefetched(const ValueT* tile
   return agg;
 }
 
-template <class ValueT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT warp_span_sum(const ValueT* tile_vals, int begin, int end, int lane_id);
-
-// SHORT-SPAN GATHER band (dense regimes, from smem): when EVERY 32-element row contains a head
-// (one ballot; probability ~1 above ~8 runs/row and the stream handles the rest), every closed
-// run ends within one row of lookahead. Each head lane gathers its own span directly -- reads at
-// banks (l+j) mod 32 are conflict-free, one __reduce_max per row sets the uniform trip count,
-// and stores land instruction-coalesced at consecutive ranks. No cross-row carry, no 5-step
-// masked scan, no per-element collectives (the receipted stream serializers).
-template <int items_per_thread, class ValueT, class OffT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE void short_span_gather_from_flags(
-  ValueT* __restrict__ d_aggregates,
-  const ValueT* __restrict__ smem_vals,
-  unsigned my_word,
-  OffT global_runs_before_warp_tile,
-  int warp_tile_offset,
-  int wt_end,
-  int lane_id,
-  ValueT& lead_out,
-  ValueT& tail_out)
-{
-  static_assert(items_per_thread == 32, "the gather band assumes 32x32 warp tiles");
-  const ValueT* const wt_base = smem_vals + warp_tile_offset;
-  int word_base               = 0; // runs in rows before the current one (uniform running sum)
-  unsigned w_cur              = __shfl_sync(full_mask, my_word, 0);
-#  pragma unroll 4
-  for (int r = 0; r < items_per_thread; ++r)
-  {
-    const unsigned w_next = (r + 1 < items_per_thread) ? __shfl_sync(full_mask, my_word, (r + 1) & 31) : 0u;
-    const bool head       = (w_cur >> lane_id) & 1u;
-    const unsigned after  = (lane_id < 31) ? (w_cur >> (lane_id + 1)) : 0u;
-    // offset from my position to the NEXT head (== my run's length); the wt's last head has no
-    // successor within the lookahead and is the OPEN run -- excluded
-    const bool closed = head && ((after != 0u) || (w_next != 0u));
-    const int end_off = closed ? ((after != 0u) ? __ffs(after) : (31 - lane_id + __ffs(w_next))) : 1;
-    const int rounds  = __reduce_max_sync(full_mask, end_off);
-    const int p       = r * 32 + lane_id;
-    ValueT sum        = head ? wt_base[p] : ValueT{};
-    for (int j = 1; j < rounds; ++j)
-    {
-      sum += (j < end_off && head) ? wt_base[p + j] : ValueT{};
-    }
-    if (closed)
-    {
-      const int rank                                    = word_base + __popc(w_cur & ((1u << lane_id) - 1));
-      d_aggregates[global_runs_before_warp_tile + rank] = sum;
-    }
-    word_base += __popc(w_cur);
-    w_cur = w_next;
-  }
-  // band property: rows 0 and 31 both contain heads, so lead/tail spans stay within one row
-  const unsigned w0  = __shfl_sync(full_mask, my_word, 0);
-  const unsigned w31 = __shfl_sync(full_mask, my_word, 31);
-  const int first_p  = __ffs(w0) - 1;
-  const int last_p   = 31 * 32 + (31 - __clz(w31));
-  lead_out           = warp_span_sum(smem_vals, warp_tile_offset, warp_tile_offset + first_p, lane_id);
-  tail_out           = warp_span_sum(smem_vals, warp_tile_offset + last_p, wt_end, lane_id);
-}
-
 // ROTATED REGISTER-WALK band: the branchless chunk walk with its one receipted flaw removed.
 // Lane-contiguous chunks (chunk l == row l) bank-conflict 32-way on every load; rotating each
 // row r IN PLACE by r makes the walk's column-step banks (e+l) mod 32 -- conflict-free with ZERO
@@ -1800,28 +1741,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else if (warp_tile_run_count >= stream_threshold)
     {
-      if (from_smem && __ballot_sync(full_mask, my_word != 0u) == full_mask)
-      {
-        short_span_gather_from_flags<items_per_thread>(
-          d_aggregates,
-          tile_vals,
-          my_word,
-          global_runs_before_warp_tile,
-          warp_tile_offset,
-          wt_end,
-          lane_id,
-          wt_lead,
-          wt_tail);
-      }
-      else
-      {
-        stream_values_from_flags<items_per_thread>(
-          d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
-        const HeadFlagDecodeT dec(my_word, lane_id);
-        const RunSpanT first_run = dec.decode_run(0);
-        wt_lead =
-          warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
-      }
+      stream_values_from_flags<items_per_thread>(
+        d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
+      const HeadFlagDecodeT dec(my_word, lane_id);
+      const RunSpanT first_run = dec.decode_run(0);
+      wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
     }
     else
     {
