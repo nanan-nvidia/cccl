@@ -28,7 +28,7 @@ struct winner_config
 {
   static constexpr int kIPT           = (kIptOverride != 0) ? kIptOverride : 32;
   static constexpr int kNumCompWarps  = 8;
-  static constexpr int kStages        = (kStagesOverride != 0) ? kStagesOverride : 5; // key ring depth
+  static constexpr int kStages        = (kStagesOverride != 0) ? kStagesOverride : 6; // key ring depth
   static constexpr int kPosStages     = (kStages + 1) / 2;
 #ifdef K_POLL_MLP
   static constexpr int kPollMlp = K_POLL_MLP;
