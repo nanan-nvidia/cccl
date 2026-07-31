@@ -1157,25 +1157,34 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
             }
             else
             {
-              // sparse band: masked replay -- compute published which words hold heads (one
-              // ballot, outside the scan loop), so the drain replays ONLY the live words. No
-              // shuffles, no decode chain; skipped words have popc 0, so the running output
-              // base stays correct. The loop is warp-uniform (mask is uniform).
-              const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
-              unsigned live         = word_mask[slot_id][warp_tile_id];
-              int word_base         = 0;
-              while (live != 0)
+              // sparse band: lane-parallel masked word-serial. Compute published which words
+              // hold heads (one ballot, outside the scan loop); lane i owns the i-th LIVE word
+              // (<32 runs => <32 live words, always one round), so all live words load in ONE
+              // parallel LDS round -- the serial-walk form paid one exposed LDS latency per
+              // word and regressed seg64 2x (receipted). Rank base via warp scan; each lane
+              // extracts its own word's heads serially (no sync collectives, divergence safe).
+              const unsigned live_mask = word_mask[slot_id][warp_tile_id];
+              const int num_live       = __popc(live_mask);
+              unsigned my_word         = 0;
+              int my_word_idx          = 0;
+              if (lane_id < num_live)
               {
-                const int iter = __ffs(live) - 1;
-                live &= live - 1;
-                const unsigned w = head_flag_buf[slot_id][warp_tile_id * 32 + iter];
-                if ((w >> lane_id) & 1u)
-                {
-                  const int run_idx                                = word_base + __popc(w & upto_l) - 1;
-                  const int loc                                    = warp_tile_offset + iter * 32 + lane_id;
-                  d_unique[global_runs_before_warp_tile + run_idx] = tile_keys[loc + key_skip];
-                }
-                word_base += __popc(w);
+                my_word_idx = (int) __fns(live_mask, 0, lane_id + 1);
+                my_word     = head_flag_buf[slot_id][warp_tile_id * 32 + my_word_idx];
+              }
+              const int my_popc = __popc(my_word);
+              typename WarpScan<int>::TempStorage warp_scan_storage;
+              int word_scan;
+              WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
+              int rank     = word_scan - my_popc;
+              unsigned rem = my_word;
+              while (rem != 0)
+              {
+                const int bit = __ffs(rem) - 1;
+                rem &= rem - 1;
+                d_unique[global_runs_before_warp_tile + rank] =
+                  tile_keys[warp_tile_offset + my_word_idx * 32 + bit + key_skip];
+                ++rank;
               }
             }
           }
