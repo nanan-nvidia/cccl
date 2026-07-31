@@ -836,9 +836,21 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
           {
             const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
             const ValueT from_left   = __shfl_up_sync(full_mask, incl, off);
-            if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u))
+            if constexpr (sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
             {
-              incl += from_left;
+              // force SETP + @p FADD (2 ops) over nvcc's FADD+FSEL+ISETP (3): the guard folds
+              // into the test value with one LOP3 -- nonzero test blocks lanes below the step
+              const unsigned t = (w & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
+              asm volatile("{ .reg .pred p; setp.eq.u32 p, %1, 0; @p add.f32 %0, %0, %2; }"
+                           : "+f"(incl)
+                           : "r"(t), "f"(from_left));
+            }
+            else
+            {
+              if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u))
+              {
+                incl += from_left;
+              }
             }
           }
         }
