@@ -512,13 +512,21 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
     sum_since_head = new_ssh;
     prefix_sum     = new_pfx;
   };
-#  pragma unroll
-  for (int e = 0; e < items_per_thread; ++e)
+  if (valid == items_per_thread)
   {
-    const ValueT v = my_row[(e + lane_id) & 31]; // rotated, conflict-free
-    if (e < valid)
+    // full warp tile: NO per-element guard (SASS receipt: a runtime bound inside the unrolled
+    // walk re-branchifies every element -- the divergent-block disease all over again)
+#  pragma unroll
+    for (int e = 0; e < items_per_thread; ++e)
     {
-      step(e, v);
+      step(e, my_row[(e + lane_id) & 31]); // rotated, conflict-free
+    }
+  }
+  else
+  {
+    for (int e = 0; e < valid; ++e)
+    {
+      step(e, my_row[(e + lane_id) & 31]);
     }
   }
   const bool has_head   = heads_seen > 0;
