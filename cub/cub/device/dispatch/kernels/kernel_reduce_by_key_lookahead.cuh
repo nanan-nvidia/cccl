@@ -931,29 +931,51 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
     const ValueT tail = h1 ? v1 : (h0 ? (v0 + v1) : (v0 + v1)); // since the pair's last head (whole pair if headless)
     const bool brk    = h0 || h1;
     // masked inclusive scan over pair tails, breaks at pairs with heads: S = sum since the last
-    // head at-or-before this pair (within this double-row)
-    const unsigned pmask  = __ballot_sync(full_mask, brk);
-    const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
-    ValueT S              = tail;
+    // head at-or-before this pair (within this double-row). ADAPTIVE depth (the row-stream
+    // receipt, -27% at its densest cell): the max pair-distance to a break bounds the steps any
+    // lane needs; three uniform paths, every path unrolled, extra steps always mask-safe.
+    const unsigned pmask          = __ballot_sync(full_mask, brk);
+    const unsigned upto_l         = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+    ValueT S                      = tail;
+    const unsigned p_at_or_before = pmask & upto_l;
+    const int p_dist              = (p_at_or_before != 0u) ? (lane_id - (31 - __clz(p_at_or_before))) : (lane_id + 1);
+    const int p_max               = __reduce_max_sync(full_mask, p_dist);
+    auto pair_scan_steps          = [&](int first_off, int last_off) _CCCL_FORCEINLINE_LAMBDA {
 #  pragma unroll
-    for (int off = 1; off < 32; off <<= 1)
-    {
-      const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-      const ValueT from_left   = __shfl_up_sync(full_mask, S, off);
-      if constexpr (sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+      for (int off = 1; off < 32; off <<= 1)
       {
-        const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
-        asm volatile("{ .reg .pred p; setp.eq.u32 p, %1, 0; @p add.f32 %0, %0, %2; }"
-                     : "+f"(S)
-                     : "r"(t), "f"(from_left));
-      }
-      else
-      {
-        if (lane_id >= off && ((pmask & upto_l & ~upto_prev) == 0u))
+        if (off >= first_off && off <= last_off)
         {
-          S += from_left;
+          const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+          const ValueT from_left   = __shfl_up_sync(full_mask, S, off);
+          if constexpr (sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+          {
+            const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
+            asm volatile("{ .reg .pred p; setp.eq.u32 p, %1, 0; @p add.f32 %0, %0, %2; }"
+                         : "+f"(S)
+                         : "r"(t), "f"(from_left));
+          }
+          else
+          {
+            if (lane_id >= off && ((pmask & upto_l & ~upto_prev) == 0u))
+            {
+              S += from_left;
+            }
+          }
         }
       }
+    };
+    if (p_max == 0)
+    {
+      // every pair contains a head: S is already each pair's own tail
+    }
+    else if (p_max <= 3)
+    {
+      pair_scan_steps(1, 2); // reach 3
+    }
+    else
+    {
+      pair_scan_steps(1, 16);
     }
     // P_in: the exact sum since the last head STRICTLY before this pair (previous pair's scan
     // value, plus the inter-row carry when no break precedes in this double-row)
