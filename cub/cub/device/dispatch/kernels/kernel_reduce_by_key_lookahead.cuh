@@ -480,13 +480,19 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
 {
   static_assert(items_per_thread == 32, "the rotated walk assumes 32x32 warp tiles");
   ValueT* const wt_base = smem_vals + warp_tile_offset;
-  // rotate row r by r (in place; per-warp program order makes the row's loads retire before its
-  // stores issue, and rows touch disjoint ranges so the unrolled rows pipeline)
+  // QUAD-granularity rotation (SASS census: the scalar form spent 222 integer ops/wt on rotated
+  // addressing + bit tests): rotate row r's eight 16B quads by (r & 7). Eight LDS.128/STS.128
+  // pairs replace 32 scalar pairs; the walk then loads four elements per LDS.128 at quad index
+  // (c + lane) & 7 -- 4-phase bank-optimal both ways.
 #  pragma unroll
-  for (int r = 0; r < items_per_thread; ++r)
+  for (int rr = 0; rr < 8; ++rr)
   {
-    const ValueT v                         = wt_base[r * 32 + lane_id];
-    wt_base[r * 32 + ((lane_id + r) & 31)] = v;
+    const int row = rr * 4 + (lane_id >> 3); // 4 rows per iteration, 8 lanes each
+    const int q   = lane_id & 7;
+    ValueT v4[4];
+    *(uint4*) v4 = *(const uint4*) (wt_base + row * 32 + q * 4);
+    __syncwarp(); // the whole warp's reads retire before any lane's rotated write lands
+    *(uint4*) (wt_base + row * 32 + (((q + row) & 7) * 4)) = *(const uint4*) v4;
   }
   __syncwarp();
   const int my_popc = __popc(my_word);
@@ -514,19 +520,25 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   };
   if (valid == items_per_thread)
   {
-    // full warp tile: NO per-element guard (SASS receipt: a runtime bound inside the unrolled
-    // walk re-branchifies every element -- the divergent-block disease all over again)
+    // full warp tile: NO per-element guard (SASS receipt); four elements per LDS.128
 #  pragma unroll
-    for (int e = 0; e < items_per_thread; ++e)
+    for (int c = 0; c < 8; ++c)
     {
-      step(e, my_row[(e + lane_id) & 31]); // rotated, conflict-free
+      ValueT v[4];
+      *(uint4*) v = *(const uint4*) (my_row + (((c + lane_id) & 7) << 2));
+#  pragma unroll
+      for (int j = 0; j < 4; ++j)
+      {
+        step(4 * c + j, v[j]);
+      }
     }
   }
   else
   {
     for (int e = 0; e < valid; ++e)
     {
-      step(e, my_row[(e + lane_id) & 31]);
+      // quad-rotated layout: element e lives in quad ((e>>2)+lane)&7 at sub-position e&3
+      step(e, my_row[(((((e >> 2) + lane_id) & 7)) << 2) + (e & 3)]);
     }
   }
   const bool has_head   = heads_seen > 0;
