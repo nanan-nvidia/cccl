@@ -892,6 +892,127 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
   tail_out = carry; // sum since the warp tile's last head (whole tile when head-free)
 }
 
+// QUAD-COMPRESSED STREAM (staged full tiles, 4-byte values): each lane owns FOUR consecutive
+// elements -- one LDS.128 and one masked scan per 128 elements. Interior runs (start AND end
+// inside the quad) emit from the branchless local walk with purely local values; the single
+// possible incoming close per quad defers to after the cross-quad scan (P_in), exactly the
+// pair form's shape. At short-span densities the quad-distance bound collapses the scan to
+// 0-1 steps. Emissions are bare predicated stores off a hoisted base (SASS receipts).
+template <int items_per_thread, class ValueT, class OffT>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
+  ValueT* __restrict__ d_aggregates,
+  const ValueT* __restrict__ tile_vals, // staged smem, zero-filled past tile_len
+  unsigned my_word,
+  OffT global_runs_before_warp_tile,
+  int warp_tile_offset,
+  int lane_id,
+  ValueT& tail_out)
+{
+  static_assert(items_per_thread == 32, "the quad stream assumes 32x32 warp tiles");
+  ValueT* const out = d_aggregates + global_runs_before_warp_tile;
+  ValueT carry{}; // sum since the last head seen so far (exact, left-to-right)
+  int word_base = 0; // heads in words before the current 128-element block (uniform)
+#  pragma unroll
+  for (int it = 0; it < items_per_thread / 4; ++it)
+  {
+    const unsigned w0   = __shfl_sync(full_mask, my_word, 4 * it);
+    const unsigned w1   = __shfl_sync(full_mask, my_word, 4 * it + 1);
+    const unsigned w2   = __shfl_sync(full_mask, my_word, 4 * it + 2);
+    const unsigned w3   = __shfl_sync(full_mask, my_word, 4 * it + 3);
+    const unsigned wsel = (lane_id < 8) ? w0 : (lane_id < 16) ? w1 : (lane_id < 24) ? w2 : w3;
+    const int bofs      = (lane_id & 7) * 4;
+    const unsigned nib  = (wsel >> bofs) & 0xFu;
+    ValueT v[4];
+    *(uint4*) v = *(const uint4*) (tile_vals + warp_tile_offset + it * 128 + 4 * lane_id);
+    // rank base: heads before my quad in the warp tile
+    const int wb = word_base + ((lane_id >= 8) ? __popc(w0) : 0) + ((lane_id >= 16) ? __popc(w1) : 0)
+                 + ((lane_id >= 24) ? __popc(w2) : 0);
+    const int rank_base = wb + __popc(wsel & ((1u << bofs) - 1u));
+    // branchless quad-local walk: interior runs emit NOW (local values); the incoming close
+    // defers to post-scan
+    ValueT pfx{};
+    ValueT ssh{};
+    int hs = 0;
+#  pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+      const bool head      = (nib >> j) & 1u;
+      const ValueT new_ssh = head ? v[j] : (ssh + v[j]);
+      const ValueT new_pfx = (head || hs > 0) ? pfx : (pfx + v[j]);
+      if (head && hs > 0)
+      {
+        out[rank_base + hs - 1] = ssh;
+      }
+      hs += (int) head;
+      ssh = new_ssh;
+      pfx = new_pfx;
+    }
+    const bool brk    = nib != 0u;
+    const ValueT tail = (hs > 0) ? ssh : pfx; // since the quad's last head (whole quad if headless)
+    // masked scan over quad tails, breaks at quads with heads; adaptive depth in QUAD units
+    const unsigned pmask          = __ballot_sync(full_mask, brk);
+    const unsigned upto_l         = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+    ValueT S                      = tail;
+    const unsigned q_at_or_before = pmask & upto_l;
+    const int q_dist              = (q_at_or_before != 0u) ? (lane_id - (31 - __clz(q_at_or_before))) : (lane_id + 1);
+    const int q_max               = __reduce_max_sync(full_mask, q_dist);
+    auto quad_scan_steps          = [&](int first_off, int last_off) _CCCL_FORCEINLINE_LAMBDA {
+#  pragma unroll
+      for (int off = 1; off < 32; off <<= 1)
+      {
+        if (off >= first_off && off <= last_off)
+        {
+          const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+          const ValueT from_left   = __shfl_up_sync(full_mask, S, off);
+          if constexpr (sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+          {
+            const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
+            asm volatile("{ .reg .pred p; setp.eq.u32 p, %1, 0; @p add.f32 %0, %0, %2; }"
+                         : "+f"(S)
+                         : "r"(t), "f"(from_left));
+          }
+          else
+          {
+            if (lane_id >= off && ((pmask & upto_l & ~upto_prev) == 0u))
+            {
+              S += from_left;
+            }
+          }
+        }
+      }
+    };
+    if (q_max == 0)
+    {
+    }
+    else if (q_max <= 1)
+    {
+      quad_scan_steps(1, 1);
+    }
+    else if (q_max <= 3)
+    {
+      quad_scan_steps(1, 2);
+    }
+    else
+    {
+      quad_scan_steps(1, 16);
+    }
+    // deferred incoming close: everything since the last head strictly before this quad
+    const ValueT S_prev   = __shfl_up_sync(full_mask, S, 1);
+    const unsigned before = pmask & ((1u << lane_id) - 1u);
+    const ValueT P_in     = ((lane_id > 0) ? S_prev : ValueT{}) + ((before == 0u) ? carry : ValueT{});
+    const bool in_emit    = brk && (rank_base >= 1);
+    const ValueT in_val   = P_in + pfx;
+    if (in_emit)
+    {
+      out[rank_base - 1] = in_val;
+    }
+    const ValueT S31 = __shfl_sync(full_mask, S, 31);
+    carry            = (pmask == 0u) ? (carry + S31) : S31;
+    word_base += __popc(w0) + __popc(w1) + __popc(w2) + __popc(w3);
+  }
+  tail_out = carry;
+}
+
 // PAIR-COMPRESSED STREAM (staged full tiles, 4-byte values): each lane owns elements (2l, 2l+1)
 // of a 64-element double-row -- one LDS.64, one masked scan per 64 elements instead of two full
 // row iterations. Pair algebra: a pair's carry contribution is the sum since its last head (the
@@ -1925,7 +2046,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       {
         if constexpr (from_smem && sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
         {
-          stream_values_paired<items_per_thread>(
+          stream_values_quad<items_per_thread>(
             d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_tail);
         }
       }
