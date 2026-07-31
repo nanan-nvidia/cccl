@@ -1153,11 +1153,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
                   const unsigned w = head_flag_buf[slot_id][warp_tile_id * 32 + iter];
                   if ((w >> lane_id) & 1u)
                   {
-                    const int run_idx = word_base + __popc(w & upto_l) - 1;
-                    const int loc     = warp_tile_offset + iter * 32 + lane_id;
-                    // few reads at few runs: take them from L2 (the TMA staging just pulled the
-                    // tile through it) and keep the contended MIO pipe for the flag pass
-                    d_unique[global_runs_before_warp_tile + run_idx] = d_keys[(size_t) tile_id * tile_size + loc];
+                    const int run_idx                                = word_base + __popc(w & upto_l) - 1;
+                    const int loc                                    = warp_tile_offset + iter * 32 + lane_id;
+                    d_unique[global_runs_before_warp_tile + run_idx] = tile_keys[loc + key_skip];
                   }
                   word_base += __popc(w);
                 }
@@ -1213,7 +1211,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
                   const int bit = __ffs(rem) - 1;
                   rem &= rem - 1;
                   d_unique[global_runs_before_warp_tile + rank] =
-                    d_keys[(size_t) tile_id * tile_size + warp_tile_offset + my_word_idx * 32 + bit];
+                    tile_keys[warp_tile_offset + my_word_idx * 32 + bit + key_skip];
                   ++rank;
                 }
               }
