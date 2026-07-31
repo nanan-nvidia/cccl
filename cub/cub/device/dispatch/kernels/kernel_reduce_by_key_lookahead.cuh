@@ -818,8 +818,14 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
       }
       const unsigned w = __shfl_sync(full_mask, my_word, iter);
       ValueT incl      = row_vals[cr];
-#  pragma unroll
-      for (int off = 1; off < 32; off <<= 1)
+      // ADAPTIVE scan depth (dense receipt: the fixed 5-step scan is the MIO wall at ~8 ops/row
+      // x 256 rows/tile; step k only matters if some accumulation distance reaches 2^(k-1)).
+      // Each lane's distance to its nearest head at-or-before covers spans, carry-in and
+      // carry-out regions exactly; the warp max bounds the needed steps. Continuous and general.
+      const unsigned at_or_before = w & upto_l;
+      const int my_dist           = (at_or_before != 0u) ? (lane_id - (31 - __clz(at_or_before))) : (lane_id + 1);
+      const int max_dist          = __reduce_max_sync(full_mask, my_dist);
+      for (int off = 1; off < 32 && off <= max_dist; off <<= 1)
       {
         const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
         const ValueT from_left   = __shfl_up_sync(full_mask, incl, off);
