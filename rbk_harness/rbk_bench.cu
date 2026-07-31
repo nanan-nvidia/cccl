@@ -15,8 +15,14 @@
 #  define K_STAGES 0
 #endif
 
-using KeyT   = int;
-using ValueT = float;
+#ifndef K_KEY_T
+#  define K_KEY_T int
+#endif
+#ifndef K_VALUE_T
+#  define K_VALUE_T float
+#endif
+using KeyT   = K_KEY_T;
+using ValueT = K_VALUE_T;
 
 namespace
 {

@@ -303,6 +303,12 @@ int main(int argc, char** argv)
   fails += run_combo<int, int, long long>("I32", "I64", huge);
   fails += run_combo<int, float, int>("F32", "I32", huge);
   fails += run_combo<int, float, long long>("F32", "I64", huge);
+  // hardening type lines: non-4-byte keys/values exercise every constexpr fallback path
+  fails += run_combo<long long, float, int>("I64K/F32", "I32", huge);
+  fails += run_combo<short, int, int>("I16K/I32", "I32", huge);
+  fails += run_combo<signed char, int, int>("I8K/I32", "I32", huge);
+  fails += run_combo<int, double, int>("F64V", "I32", huge);
+  fails += run_combo<long long, long long, long long>("I64K/I64V", "I64", huge);
 
   std::printf(fails ? "*** %d FAILURES ***\n" : "ALL PASS\n", fails);
   return fails ? 1 : 0;

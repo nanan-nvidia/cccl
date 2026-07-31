@@ -100,10 +100,15 @@ inline cudaError_t persistent_rbk_encode(
   cub::DeviceReduce::ReduceByKey(
     nullptr, cub_bytes, d_keys, d_unique, d_values, d_aggregates, d_num_runs, cuda::std::plus<>{}, num_items, stream);
   const long long q_tiles = rbk_state_tiles<Config>((long long) num_items);
+  // each carve is rounded up to 16B: the flag-words bulk prefetch requires a 16B-aligned base
+  // (24B TileValueRecordT with 8B values left it 8-mod-16 -> misaligned address)
+  const auto align16 = [](size_t b) {
+    return (b + 15) & ~(size_t) 15;
+  };
   const size_t pers_bytes =
-    (size_t) q_tiles
-    * (sizeof(CountStateT) + sizeof(TileValueRecordT<ValueT, OffT>) + sizeof(TilePrefixT<OffT>)
-       + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned));
+    align16((size_t) q_tiles * sizeof(CountStateT)) + align16((size_t) q_tiles * sizeof(TileValueRecordT<ValueT, OffT>))
+    + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>))
+    + align16((size_t) q_tiles * (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned));
   const size_t required = cuda::std::max(cub_bytes, pers_bytes);
   if (d_temp_storage == nullptr)
   {
@@ -143,10 +148,11 @@ inline cudaError_t persistent_rbk_encode(
       num_items,
       stream);
   }
-  auto* count_states    = (CountStateT*) d_temp_storage;
-  auto* value_records   = (TileValueRecordT<ValueT, OffT>*) (count_states + tiles);
-  auto* tile_prefixes   = (TilePrefixT<OffT>*) (value_records + tiles);
-  auto* flag_words      = (unsigned*) (tile_prefixes + tiles);
+  auto* count_states  = (CountStateT*) d_temp_storage;
+  auto* value_records = (TileValueRecordT<ValueT, OffT>*) ((char*) count_states + align16(tiles * sizeof(CountStateT)));
+  auto* tile_prefixes =
+    (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(TileValueRecordT<ValueT, OffT>)));
+  auto* flag_words      = (unsigned*) ((char*) tile_prefixes + align16(tiles * sizeof(TilePrefixT<OffT>)));
   const int init_blocks = (int) ((tiles + 255) / 256);
   // only the tagged COUNT states need clearing; the value records are plain outputs of the main
   // kernel, synchronized by the launch boundary

@@ -2065,8 +2065,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
       wt_tail = warp_span_sum(tile_vals, warp_tile_offset + last_run.head_pos_in_warp_tile, wt_end, lane_id);
     }
-    else if (from_smem && warp_tile_run_count < stream_threshold)
+    else if (from_smem && sizeof(ValueT) == 4 && warp_tile_run_count < stream_threshold)
     {
+      // (4-byte values only: the quad rotate/loads cast through uint4 -- hardening receipt:
+      // misaligned address with f64 values)
       chunk_reduce_rotated<items_per_thread>(
         d_aggregates,
         staged_vals,
@@ -2078,7 +2080,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         wt_lead,
         wt_tail);
     }
-    else if (warp_tile_run_count >= stream_threshold)
+    else if (warp_tile_run_count >= stream_threshold || (from_smem && sizeof(ValueT) != 4))
     {
       // stream density router (B200 receipts): quad wins to ~half density (seg4 -9.4%), pair
       // from there to ~3/4 (seg2, quad's interior-emission cost +14% there), the adaptive row
