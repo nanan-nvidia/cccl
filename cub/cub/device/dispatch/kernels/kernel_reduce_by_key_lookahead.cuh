@@ -520,16 +520,28 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   };
   if (valid == items_per_thread)
   {
-    // full warp tile: NO per-element guard (SASS receipt); four elements per LDS.128
+    // full warp tile: NO per-element guard (SASS receipt); four elements per LDS.128, with
+    // explicit load-ahead -- the belt ncu showed 76% issue occupancy, and the exposed term is
+    // each quad's load-to-use latency (its steps wait on its own load)
+    ValueT v[4];
+    *(uint4*) v = *(const uint4*) (my_row + ((lane_id & 7) << 2));
 #  pragma unroll
     for (int c = 0; c < 8; ++c)
     {
-      ValueT v[4];
-      *(uint4*) v = *(const uint4*) (my_row + (((c + lane_id) & 7) << 2));
+      ValueT vn[4];
+      if (c + 1 < 8)
+      {
+        *(uint4*) vn = *(const uint4*) (my_row + (((c + 1 + lane_id) & 7) << 2));
+      }
 #  pragma unroll
       for (int j = 0; j < 4; ++j)
       {
         step(4 * c + j, v[j]);
+      }
+#  pragma unroll
+      for (int j = 0; j < 4; ++j)
+      {
+        v[j] = vn[j];
       }
     }
   }
