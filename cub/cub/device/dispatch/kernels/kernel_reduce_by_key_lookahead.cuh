@@ -461,6 +461,137 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT span_sum_prefetched(const ValueT* tile
   return agg;
 }
 
+// ILP-SPLIT ROTATED WALK (dense band, from smem): the dense receipts killed collective forms on
+// MIO op count (stream = the op floor of masked scans) AND unsplit serial forms on their 32-step
+// chain. This form threads both: lane-local FADD/select chains (off the MIO pipe) split into
+// FOUR independent 8-element sub-walks -- emission ranks are known UP FRONT per sub-chain
+// (popc of a constant mask), so the chains never interact until three pure-ALU boundary
+// stitches. Cross-lane resolution reuses the walk's existing machinery.
+template <int items_per_thread, class ValueT, class OffT>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_split(
+  ValueT* __restrict__ d_aggregates,
+  ValueT* __restrict__ smem_vals, // rows get rotated in place (conflict-free walk loads)
+  unsigned my_word,
+  OffT global_runs_before_warp_tile,
+  int warp_tile_offset,
+  int wt_end,
+  int lane_id,
+  ValueT& lead_out,
+  ValueT& tail_out)
+{
+  static_assert(items_per_thread == 32, "the split walk assumes 32x32 warp tiles");
+  ValueT* const wt_base = smem_vals + warp_tile_offset;
+#  pragma unroll
+  for (int r = 0; r < items_per_thread; ++r)
+  {
+    const ValueT v                         = wt_base[r * 32 + lane_id];
+    wt_base[r * 32 + ((lane_id + r) & 31)] = v;
+  }
+  __syncwarp();
+  const int my_popc = __popc(my_word);
+  typename WarpScan<int>::TempStorage warp_scan_storage;
+  int rank_scan;
+  WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, rank_scan);
+  const OffT gbase           = global_runs_before_warp_tile + (rank_scan - my_popc);
+  const ValueT* const my_row = wt_base + lane_id * 32;
+  ValueT* const out          = d_aggregates + gbase;
+  // four independent sub-walks over elements [8c, 8c+8); rank base per sub-chain is a constant-
+  // mask popcount, so emissions need nothing from earlier chains
+  ValueT pfx[4] = {};
+  ValueT ssh[4] = {};
+  int hs[4]     = {};
+  int rank_b[4];
+#  pragma unroll
+  for (int c = 0; c < 4; ++c)
+  {
+    rank_b[c] = __popc(my_word & ((c == 0) ? 0u : ((1u << (8 * c)) - 1u)));
+  }
+#  pragma unroll
+  for (int j = 0; j < 8; ++j)
+  {
+#  pragma unroll
+    for (int c = 0; c < 4; ++c)
+    {
+      const int e          = 8 * c + j;
+      const ValueT v       = my_row[(e + lane_id) & 31]; // rotated, conflict-free
+      const bool head      = (my_word >> e) & 1u;
+      const ValueT new_ssh = head ? v : (ssh[c] + v);
+      const ValueT new_pfx = (head || hs[c] > 0) ? pfx[c] : (pfx[c] + v);
+      if (head && hs[c] > 0)
+      {
+        out[rank_b[c] + hs[c] - 1] = ssh[c]; // run fully inside sub-chain c closes
+      }
+      hs[c] += (int) head;
+      ssh[c] = new_ssh;
+      pfx[c] = new_pfx;
+    }
+  }
+  // three pure-ALU boundary stitches: merge the crossing run at each sub-chain seam
+  ValueT prefix_sum     = pfx[0];
+  ValueT sum_since_head = ssh[0];
+  int heads_seen        = hs[0];
+#  pragma unroll
+  for (int c = 1; c < 4; ++c)
+  {
+    if (hs[c] == 0)
+    {
+      // headless sub-chain: its whole sum (pfx) extends the open run (or the lane lead)
+      if (heads_seen > 0)
+      {
+        sum_since_head += pfx[c];
+      }
+      else
+      {
+        prefix_sum += pfx[c];
+      }
+    }
+    else
+    {
+      if (heads_seen > 0)
+      {
+        // the run entering sub-chain c closes at c's first head
+        out[rank_b[c] - 1] = sum_since_head + pfx[c];
+      }
+      else
+      {
+        prefix_sum += pfx[c]; // still before the lane's first head
+      }
+      sum_since_head = ssh[c];
+      heads_seen += hs[c];
+    }
+  }
+  // cross-lane resolution: identical to the rotated walk from here on
+  const bool has_head   = heads_seen > 0;
+  const ValueT t        = has_head ? sum_since_head : prefix_sum;
+  const unsigned bmask  = __ballot_sync(full_mask, has_head);
+  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+  ValueT sseg           = t;
+#  pragma unroll
+  for (int off = 1; off < 32; off <<= 1)
+  {
+    const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+    const ValueT from_left   = __shfl_up_sync(full_mask, sseg, off);
+    if (lane_id >= off && ((bmask & upto_l & ~upto_prev) == 0u))
+    {
+      sseg += from_left;
+    }
+  }
+  const ValueT s_prev = __shfl_up_sync(full_mask, sseg, 1);
+  ValueT incoming{};
+  if (has_head)
+  {
+    incoming = prefix_sum + ((lane_id > 0) ? s_prev : ValueT{});
+    if ((bmask & ((1u << lane_id) - 1)) != 0)
+    {
+      d_aggregates[gbase - 1] = incoming;
+    }
+  }
+  const int first_head_lane = __ffs(bmask) - 1; // caller guarantees bmask != 0
+  lead_out                  = __shfl_sync(full_mask, incoming, first_head_lane);
+  tail_out                  = __shfl_sync(full_mask, sseg, 31);
+  (void) wt_end; // dense band runs the full-tile shape (staged zeros past tile_len)
+}
+
 // ROTATED REGISTER-WALK band: the branchless chunk walk with its one receipted flaw removed.
 // Lane-contiguous chunks (chunk l == row l) bank-conflict 32-way on every load; rotating each
 // row r IN PLACE by r makes the walk's column-step banks (e+l) mod 32 -- conflict-free with ZERO
@@ -1744,11 +1875,28 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else if (warp_tile_run_count >= stream_threshold)
     {
-      stream_values_from_flags<items_per_thread>(
-        d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
-      const HeadFlagDecodeT dec(my_word, lane_id);
-      const RunSpanT first_run = dec.decode_run(0);
-      wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+      if constexpr (from_smem)
+      {
+        chunk_reduce_split<items_per_thread>(
+          d_aggregates,
+          staged_vals,
+          my_word,
+          global_runs_before_warp_tile,
+          warp_tile_offset,
+          wt_end,
+          lane_id,
+          wt_lead,
+          wt_tail);
+      }
+      else
+      {
+        stream_values_from_flags<items_per_thread>(
+          d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
+        const HeadFlagDecodeT dec(my_word, lane_id);
+        const RunSpanT first_run = dec.decode_run(0);
+        wt_lead =
+          warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+      }
     }
     else
     {
