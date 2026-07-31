@@ -1255,10 +1255,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       // (26% trough -> 43% at cutoff 32); 32 dragged seg64's ~31x32 shape into wave overhead
       // (-11%). Span-driven boundary.
       const RunSpanT lane_run = dec.decode_run(lane_id < warp_tile_run_count ? lane_id : 0);
-      if (warp_tile_run_count < 8)
+      if (warp_tile_run_count < 4)
       {
         // very few, very long spans: ALL 32 lanes walk each span (8-lane waves here quadruple
-        // the serial depth exactly where spans are longest -- the 1K/4K regression receipt)
+        // the serial depth exactly where spans are longest -- the 1K/4K regression receipt;
+        // crossover receipts: 8 re-serialized seg256's ~7-run tiles, 701 vs 650us)
         for (int run_idx = 0; run_idx + 1 < warp_tile_run_count; ++run_idx)
         {
           const int head   = __shfl_sync(full_mask, lane_run.head_pos_in_warp_tile, run_idx);
