@@ -1255,29 +1255,47 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       // (26% trough -> 43% at cutoff 32); 32 dragged seg64's ~31x32 shape into wave overhead
       // (-11%). Span-driven boundary.
       const RunSpanT lane_run = dec.decode_run(lane_id < warp_tile_run_count ? lane_id : 0);
-      const int sub_lane      = lane_id & 7;
-      const int sub_group     = lane_id >> 3;
-      for (int wave = 0; wave + 1 <= warp_tile_run_count; wave += 4)
+      if (warp_tile_run_count < 8)
       {
-        const int run_idx    = wave + sub_group;
-        const bool active    = run_idx + 1 < warp_tile_run_count; // the last run is the closes' job
-        const int head       = __shfl_sync(full_mask, lane_run.head_pos_in_warp_tile, run_idx & 31);
-        const int next       = __shfl_sync(full_mask, lane_run.next_head_pos, run_idx & 31);
-        const int span_begin = warp_tile_offset + head;
-        const int span_end   = active ? warp_tile_offset + next : span_begin;
-        ValueT agg{};
-        for (int pos = span_begin + sub_lane; pos < span_end; pos += 8)
+        // very few, very long spans: ALL 32 lanes walk each span (8-lane waves here quadruple
+        // the serial depth exactly where spans are longest -- the 1K/4K regression receipt)
+        for (int run_idx = 0; run_idx + 1 < warp_tile_run_count; ++run_idx)
         {
-          agg += tile_vals[pos];
+          const int head   = __shfl_sync(full_mask, lane_run.head_pos_in_warp_tile, run_idx);
+          const int next   = __shfl_sync(full_mask, lane_run.next_head_pos, run_idx);
+          const ValueT agg = warp_span_sum(tile_vals, warp_tile_offset + head, warp_tile_offset + next, lane_id);
+          if (lane_id == 0)
+          {
+            d_aggregates[global_runs_before_warp_tile + run_idx] = agg;
+          }
         }
+      }
+      else
+      {
+        const int sub_lane  = lane_id & 7;
+        const int sub_group = lane_id >> 3;
+        for (int wave = 0; wave + 1 <= warp_tile_run_count; wave += 4)
+        {
+          const int run_idx    = wave + sub_group;
+          const bool active    = run_idx + 1 < warp_tile_run_count; // the last run is the closes' job
+          const int head       = __shfl_sync(full_mask, lane_run.head_pos_in_warp_tile, run_idx & 31);
+          const int next       = __shfl_sync(full_mask, lane_run.next_head_pos, run_idx & 31);
+          const int span_begin = warp_tile_offset + head;
+          const int span_end   = active ? warp_tile_offset + next : span_begin;
+          ValueT agg{};
+          for (int pos = span_begin + sub_lane; pos < span_end; pos += 8)
+          {
+            agg += tile_vals[pos];
+          }
 #  pragma unroll
-        for (int offset = 4; offset; offset >>= 1)
-        {
-          agg += __shfl_xor_sync(full_mask, agg, offset);
-        }
-        if (active && sub_lane == 0)
-        {
-          d_aggregates[global_runs_before_warp_tile + run_idx] = agg;
+          for (int offset = 4; offset; offset >>= 1)
+          {
+            agg += __shfl_xor_sync(full_mask, agg, offset);
+          }
+          if (active && sub_lane == 0)
+          {
+            d_aggregates[global_runs_before_warp_tile + run_idx] = agg;
+          }
         }
       }
     }
