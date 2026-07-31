@@ -460,6 +460,121 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT span_sum_prefetched(const ValueT* tile
   return agg;
 }
 
+// TWO-LEVEL SEGMENTED SCAN band (the receipted design): pass A runs an independent 5-step
+// masked scan per ROW (row-major = conflict-free; NO cross-row carry, so the shuffle chains of
+// consecutive rows overlap and the pass is issue-bound), writing local prefixes back over the
+// staged values IN PLACE and collecting row totals one-per-lane. Pass B is ONE masked scan over
+// the 32 row totals (segment breaks at rows containing heads) = each row's incoming carry.
+// Emission is pure lookups, R-proportional: the run ending at position p is
+// S_local[p] + (carry[row] iff p precedes the row's first head). Left-to-right numerics.
+// The two receipted serializers this replaces: the chunk walk's 32-way bank-conflicted lane
+// chunks, and the streaming scan's row-to-row carry chain.
+template <int items_per_thread, class ValueT, class OffT>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE void scan_lookup_from_flags(
+  ValueT* __restrict__ d_aggregates,
+  ValueT* smem_vals, // the staged warp tile; OVERWRITTEN with local prefixes
+  unsigned my_word,
+  OffT global_runs_before_warp_tile,
+  int warp_tile_offset,
+  int lane_id,
+  ValueT* row_carry, // [32] per-warp-tile scratch
+  ValueT& lead_out,
+  ValueT& tail_out)
+{
+  static_assert(items_per_thread == 32, "the scan band assumes 32x32 warp tiles");
+  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+  // ---- pass A: independent local row scans, in place; row totals collect one per lane ----
+  ValueT my_row_total = ValueT{};
+#  pragma unroll
+  for (int r = 0; r < items_per_thread; ++r)
+  {
+    const unsigned w = __shfl_sync(full_mask, my_word, r);
+    const int loc    = warp_tile_offset + r * 32 + lane_id;
+    ValueT incl      = smem_vals[loc];
+#  pragma unroll
+    for (int off = 1; off < 32; off <<= 1)
+    {
+      const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+      const ValueT from_left   = __shfl_up_sync(full_mask, incl, off);
+      if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u))
+      {
+        incl += from_left;
+      }
+    }
+    smem_vals[loc]         = incl; // local prefix (no incoming carry yet)
+    const ValueT row_total = __shfl_sync(full_mask, incl, 31); // sum since the row's last head
+    if (lane_id == r)
+    {
+      my_row_total = row_total;
+    }
+  }
+  // ---- pass B: one masked scan across row totals; break at rows that contain a head ----
+  const bool row_has_head = (my_word != 0);
+  const unsigned rmask    = __ballot_sync(full_mask, row_has_head);
+  ValueT rs               = my_row_total;
+#  pragma unroll
+  for (int off = 1; off < 32; off <<= 1)
+  {
+    const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+    const ValueT from_left   = __shfl_up_sync(full_mask, rs, off);
+    if (lane_id >= off && ((rmask & upto_l & ~upto_prev) == 0u))
+    {
+      rs += from_left;
+    }
+  }
+  // carry INTO row l = rs of row l-1 (sum since the last head at or before row l-1)
+  const ValueT my_carry = __shfl_up_sync(full_mask, rs, 1);
+  row_carry[lane_id]    = (lane_id > 0) ? my_carry : ValueT{};
+  __syncwarp();
+  // ---- emission: lane l owns row l's heads; the run ENDING at head bit b lives at p = b-1 ----
+  const int my_popc = __popc(my_word);
+  typename WarpScan<int>::TempStorage warp_scan_storage;
+  int rank_scan;
+  WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, rank_scan);
+  const OffT gbase      = global_runs_before_warp_tile + (rank_scan - my_popc);
+  const unsigned w_prev = __shfl_up_sync(full_mask, my_word, 1); // row l-1's word (row -1: garbage, unused)
+  ValueT* const out     = d_aggregates + gbase;
+  auto s_final          = [&](int p) _CCCL_FORCEINLINE_LAMBDA { // p = absolute pos within the warp tile
+    const int prow       = p >> 5;
+    const int pbit       = p & 31;
+    const unsigned pword = (prow == lane_id) ? my_word : w_prev; // emission only touches rows l and l-1
+    const bool pre_head  = (pword & ((2u << pbit) - 1)) == 0u; // no head at or before p in its row
+    return smem_vals[warp_tile_offset + p] + (pre_head ? row_carry[prow] : ValueT{});
+  };
+  const int runs_before_lane = rank_scan - my_popc;
+  unsigned rem               = my_word;
+  int i                      = 0;
+  while (rem != 0)
+  {
+    const int b = __ffs(rem) - 1;
+    rem &= rem - 1;
+    // my i-th head is the wt's head number (runs_before_lane + i); every head but the wt's FIRST
+    // closes the run ranked one before my base (the first head's incoming span is the wt lead)
+    if (runs_before_lane + i > 0)
+    {
+      out[i - 1] = s_final(lane_id * 32 + b - 1);
+    }
+    ++i;
+  }
+  // wt lead: the span before the wt's first head, looked up BY the lane owning that row (the
+  // s_final word registers are per-lane)
+  const unsigned head_rows  = __ballot_sync(full_mask, my_word != 0);
+  const int first_head_lane = __ffs(head_rows) - 1; // caller guarantees runs >= 1
+  int fh_bit                = (lane_id == first_head_lane) ? (__ffs(my_word) - 1) : 0;
+  fh_bit                    = __shfl_sync(full_mask, fh_bit, first_head_lane);
+  const int lead_end        = first_head_lane * 32 + fh_bit - 1;
+  const int lead_row        = lead_end >> 5;
+  ValueT lead_val{};
+  if (lead_end >= 0 && lane_id == lead_row)
+  {
+    const bool pre = (my_word & ((2u << (lead_end & 31)) - 1)) == 0u;
+    lead_val       = smem_vals[warp_tile_offset + lead_end] + (pre ? row_carry[lead_row] : ValueT{});
+  }
+  lead_out = (lead_end >= 0) ? __shfl_sync(full_mask, lead_val, lead_row & 31) : ValueT{};
+  // tail: rs at lane 31 = sum since the wt's last head (rows past the last head have no breaks)
+  tail_out = __shfl_sync(full_mask, rs, 31);
+}
+
 // single-read per-lane chunk band: lane l owns elements [32l, 32l+32) of the warp tile, which
 // is EXACTLY flag word l. Loads are 512B/instruction coalesced (LDG.128 per lane); each lane
 // closes its interior runs straight from the register walk; ONE masked segmented scan over the
@@ -1410,6 +1525,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   __shared__ int wt_counts[compute_warps];
   __shared__ ValueT wt_leads[compute_warps];
   __shared__ ValueT wt_tails[compute_warps];
+  __shared__ ValueT wt_row_carry[compute_warps][32];
 
   const int tile_id = (int) blockIdx.x;
   if (tile_id >= num_tiles)
@@ -1481,11 +1597,25 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   // keeps the smem pointer compile-time provable (the LD.E-vs-LDS receipt from the keys drain)
   ValueT wt_lead{};
   ValueT wt_tail{};
-  auto emit_bands = [&](const ValueT* tile_vals, auto) _CCCL_FORCEINLINE_LAMBDA {
+  auto emit_bands = [&](const ValueT* tile_vals, auto staged_tag) _CCCL_FORCEINLINE_LAMBDA {
+    constexpr bool from_smem = decltype(staged_tag)::value;
     if (warp_tile_run_count == 0)
     {
       wt_lead = warp_span_sum(tile_vals, warp_tile_offset, wt_end, lane_id);
       wt_tail = wt_lead; // head-free: the whole warp tile leads AND trails
+    }
+    else if (from_smem && warp_tile_run_count < stream_threshold)
+    {
+      scan_lookup_from_flags<items_per_thread>(
+        d_aggregates,
+        staged_vals,
+        my_word,
+        global_runs_before_warp_tile,
+        warp_tile_offset,
+        lane_id,
+        wt_row_carry[wt],
+        wt_lead,
+        wt_tail);
     }
     else if (warp_tile_run_count >= stream_threshold)
     {
