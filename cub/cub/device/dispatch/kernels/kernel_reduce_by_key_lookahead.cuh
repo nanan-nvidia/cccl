@@ -1484,19 +1484,13 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   // keeps the smem pointer compile-time provable (the LD.E-vs-LDS receipt from the keys drain)
   ValueT wt_lead{};
   ValueT wt_tail{};
-  auto emit_bands = [&](const ValueT* tile_vals, auto staged_tag) _CCCL_FORCEINLINE_LAMBDA {
-    // COMPUTE receipt (IKET, smem-staged): the chunk walk is a 32-step serially-dependent
-    // select/FADD chain -- 2.9us/warp tile with loads SOLVED. The segmented scan is the
-    // log-depth parallel form; its old >=256 gate was a cold-load-era receipt (chunked preloads
-    // exposed DRAM latency), void from smem. Staged tiles stream from 32 runs up.
-    constexpr bool from_smem  = decltype(staged_tag)::value;
-    constexpr int stream_gate = from_smem ? 32 : stream_threshold;
+  auto emit_bands = [&](const ValueT* tile_vals, auto) _CCCL_FORCEINLINE_LAMBDA {
     if (warp_tile_run_count == 0)
     {
       wt_lead = warp_span_sum(tile_vals, warp_tile_offset, wt_end, lane_id);
       wt_tail = wt_lead; // head-free: the whole warp tile leads AND trails
     }
-    else if (warp_tile_run_count >= stream_gate)
+    else if (warp_tile_run_count >= stream_threshold)
     {
       stream_values_from_flags<items_per_thread>(
         d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
