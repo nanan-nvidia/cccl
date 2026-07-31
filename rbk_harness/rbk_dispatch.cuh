@@ -182,29 +182,20 @@ inline cudaError_t persistent_rbk_encode(
   // PASS 2: values. Persistent TMA-ring kernel when the values base is 16B-aligned and the ring
   // fits the opt-in smem; the block-per-tile kernel is the fallback (misaligned bases, small smem)
   constexpr size_t kValDynSmem = (size_t) Config::kStages * Config::kTileSize * sizeof(ValueT);
-#ifdef K_NO_VPERS
-  constexpr bool kUseValPersistent = false;
-#else
-  constexpr bool kUseValPersistent = true;
-#endif
-  if (kUseValPersistent && (((size_t) d_values & 15) == 0) && (size_t) smem_optin >= kValDynSmem)
+  // staged mode: one bulk TMA per block pulls the tile's values + flag words into smem (IKET
+  // receipt: bands 3.7x faster from smem; the 6-block occupancy is the latency pipeline). The
+  // smem is values + flags per block.
+  constexpr size_t kValBlockSmem =
+    (size_t) Config::kTileSize * sizeof(ValueT) + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned);
+  const bool vals_staged = (((size_t) d_values & 15) == 0) && (size_t) smem_optin >= kValBlockSmem;
+  auto* vkernel          = rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT>;
+  error = cudaFuncSetAttribute(vkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kValBlockSmem);
+  if (error != cudaSuccess)
   {
-    auto* vkernel2 =
-      rbk_kernels::DeviceReduceByKeyLookaheadValuePersistentKernel<typename Config::Selector, ValueT, OffT>;
-    error = cudaFuncSetAttribute(vkernel2, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kValDynSmem);
-    if (error != cudaSuccess)
-    {
-      return error;
-    }
-    vkernel2<<<(int) tiles, (1 + Config::kNumCompWarps) * 32, kValDynSmem, stream>>>(
-      d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles, Config::kStages);
+    return error;
   }
-  else
-  {
-    auto* vkernel = rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT>;
-    vkernel<<<(int) tiles, Config::kNumCompWarps * 32, 0, stream>>>(
-      d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles);
-  }
+  vkernel<<<(int) tiles, Config::kNumCompWarps * 32, vals_staged ? kValBlockSmem : 0, stream>>>(
+    d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles, vals_staged);
   error = cudaPeekAtLastError();
   if (error != cudaSuccess)
   {

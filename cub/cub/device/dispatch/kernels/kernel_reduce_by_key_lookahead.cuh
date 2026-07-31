@@ -1396,7 +1396,8 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     const PrefixT<OffT>* __restrict__ d_tile_prefix,
     TileValueRecordT<ValueT, OffT>* __restrict__ value_records,
     OffT num_items,
-    int num_tiles)
+    int num_tiles,
+    bool vals_staged)
 {
   static constexpr RleLookaheadPolicy policy = current_policy<PolicySelector>().lookahead;
   constexpr int items_per_thread             = policy.items_per_thread;
@@ -1418,34 +1419,72 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   {
     return;
   }
-  // pass 1 never touches d_values, so every band's first loads are cold DRAM misses at the head
-  // of a serial chain; pull the block's value tile (and its flag words) toward L2 now,
-  // fire-and-forget, while setup runs (v6b receipt: the cold-miss latency was -29% at long)
+  // STAGED mode (IKET receipt: the bands run 3.7x faster per warp tile from smem, and 6-block
+  // occupancy is the latency pipeline): one bulk TMA pulls the tile's values AND flag words into
+  // this block's smem before the bands run. Unstaged (misaligned values base): the old global
+  // path with the fire-and-forget L2 prefetch (v6b receipt).
+  extern __shared__ char v_smem_raw[];
+  ValueT* const staged_vals    = (ValueT*) v_smem_raw;
+  unsigned* const staged_flags = (unsigned*) (v_smem_raw + (size_t) tile_size * sizeof(ValueT));
+  __shared__ ::cuda::std::uint64_t staged_bar;
+  const int stage_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
   if (threadIdx.x == 0)
   {
-    const int pf_len         = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
-    const char* vbase        = (const char*) (d_values + (size_t) tile_id * tile_size);
-    const char* vbase16      = (const char*) ((size_t) vbase & ~(size_t) 15);
-    const unsigned vpf_bytes = (unsigned) (((size_t) pf_len * sizeof(ValueT)) & ~(size_t) 15);
-    if (vpf_bytes > 0)
+    if (vals_staged)
     {
-      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vbase16), "r"(vpf_bytes) : "memory");
+      ptx::mbarrier_init(&staged_bar, 1);
+      ptx::fence_proxy_async(ptx::space_shared);
+      const unsigned vbytes      = (unsigned) ((size_t) stage_len * sizeof(ValueT));
+      const unsigned vspan       = (vbytes + 15u) & ~15u;
+      constexpr unsigned f_bytes = (unsigned) (compute_warps * 32 * sizeof(unsigned));
+      ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &staged_bar, vspan + f_bytes);
+      ptx::cp_async_bulk_ignore_oob(
+        ptx::space_shared,
+        ptx::space_global,
+        staged_vals,
+        d_values + (size_t) tile_id * tile_size,
+        vspan,
+        0u,
+        vspan - vbytes,
+        &staged_bar);
+      ptx::cp_async_bulk(
+        ptx::space_shared,
+        ptx::space_global,
+        staged_flags,
+        d_flag_words + (size_t) tile_id * (compute_warps * 32),
+        f_bytes,
+        &staged_bar);
     }
-    const char* fbase = (const char*) (d_flag_words + (size_t) tile_id * (compute_warps * 32));
-    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fbase),
-                 "r"((unsigned) (compute_warps * 32 * sizeof(unsigned)))
-                 : "memory");
+    else
+    {
+      const char* vbase        = (const char*) (d_values + (size_t) tile_id * tile_size);
+      const char* vbase16      = (const char*) ((size_t) vbase & ~(size_t) 15);
+      const unsigned vpf_bytes = (unsigned) (((size_t) stage_len * sizeof(ValueT)) & ~(size_t) 15);
+      if (vpf_bytes > 0)
+      {
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vbase16), "r"(vpf_bytes) : "memory");
+      }
+      const char* fbase = (const char*) (d_flag_words + (size_t) tile_id * (compute_warps * 32));
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fbase),
+                   "r"((unsigned) (compute_warps * 32 * sizeof(unsigned)))
+                   : "memory");
+    }
   }
+  __syncthreads(); // staged_bar init is visible to every warp past this point
   const bool ik_rec = tile_id < 8;
   if (ik_rec)
   {
     RBK_IK_BEG(VSetup, tile_id);
   }
-  const int wt                  = (int) (threadIdx.x >> 5);
-  const int lane_id             = (int) (threadIdx.x & 31);
-  const int tile_len            = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
-  const ValueT* tile_vals       = d_values + (size_t) tile_id * tile_size;
-  const unsigned my_word        = d_flag_words[(size_t) tile_id * (compute_warps * 32) + wt * 32 + lane_id];
+  const int wt       = (int) (threadIdx.x >> 5);
+  const int lane_id  = (int) (threadIdx.x & 31);
+  const int tile_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
+  if (vals_staged)
+  {
+    wait_parity(&staged_bar, 0);
+  }
+  const unsigned my_word        = vals_staged ? staged_flags[wt * 32 + lane_id]
+                                              : d_flag_words[(size_t) tile_id * (compute_warps * 32) + wt * 32 + lane_id];
   const int warp_tile_run_count = __reduce_add_sync(full_mask, __popc(my_word));
   if (lane_id == 0)
   {
@@ -1467,34 +1506,45 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   {
     RBK_IK_BEG(VEmit, tile_id);
   }
-  // boundary sums + the banded within-warp-tile emission (the receipted forms)
+  // boundary sums + the banded within-warp-tile emission (the receipted forms). The tag lambda
+  // keeps the smem pointer compile-time provable (the LD.E-vs-LDS receipt from the keys drain)
   ValueT wt_lead{};
   ValueT wt_tail{};
-  if (warp_tile_run_count == 0)
+  auto emit_bands = [&](const ValueT* tile_vals, auto) _CCCL_FORCEINLINE_LAMBDA {
+    if (warp_tile_run_count == 0)
+    {
+      wt_lead = warp_span_sum(tile_vals, warp_tile_offset, wt_end, lane_id);
+      wt_tail = wt_lead; // head-free: the whole warp tile leads AND trails
+    }
+    else if (warp_tile_run_count >= stream_threshold)
+    {
+      stream_values_from_flags<items_per_thread>(
+        d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
+      const HeadFlagDecodeT dec(my_word, lane_id);
+      const RunSpanT first_run = dec.decode_run(0);
+      wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+    }
+    else
+    {
+      chunk_reduce_from_flags<items_per_thread>(
+        d_aggregates,
+        tile_vals,
+        my_word,
+        global_runs_before_warp_tile,
+        warp_tile_offset,
+        wt_end,
+        lane_id,
+        wt_lead,
+        wt_tail);
+    }
+  };
+  if (vals_staged)
   {
-    wt_lead = warp_span_sum(tile_vals, warp_tile_offset, wt_end, lane_id);
-    wt_tail = wt_lead; // head-free: the whole warp tile leads AND trails
-  }
-  else if (warp_tile_run_count >= stream_threshold)
-  {
-    stream_values_from_flags<items_per_thread>(
-      d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
-    const HeadFlagDecodeT dec(my_word, lane_id);
-    const RunSpanT first_run = dec.decode_run(0);
-    wt_lead = warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+    emit_bands(staged_vals, ::cuda::std::true_type{});
   }
   else
   {
-    chunk_reduce_from_flags<items_per_thread>(
-      d_aggregates,
-      tile_vals,
-      my_word,
-      global_runs_before_warp_tile,
-      warp_tile_offset,
-      wt_end,
-      lane_id,
-      wt_lead,
-      wt_tail);
+    emit_bands(d_values + (size_t) tile_id * tile_size, ::cuda::std::false_type{});
   }
   if (lane_id == 0)
   {
