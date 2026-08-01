@@ -630,7 +630,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   const int valid  = min(max(wt_end - (warp_tile_offset + lane_id * 32), 0), 32);
   ValueT prefix_sum{};
   ValueT sum_since_head{};
-  int heads_seen             = 0;
+  bool seen = false; // any head so far: the COUNT is dead since the indexed
+                     // store left (bool drops 2 ISETPs per element)
   const ValueT* const my_row = wt_base + lane_id * 32;
   ValueT* const out          = d_aggregates + gbase;
   // element 0 SEEDS both accumulators outside the loop (no identity element is ever combined
@@ -643,22 +644,22 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   ValueT* run_out = out;
   auto step       = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
     const bool head      = (my_word >> e) & 1u;
-    const bool emit      = head && heads_seen > 0;
+    const bool emit      = head && seen;
     const ValueT new_ssh = head ? v : op(sum_since_head, v);
-    const ValueT new_pfx = (head || heads_seen > 0) ? prefix_sum : op(prefix_sum, v);
+    const ValueT new_pfx = (head || seen) ? prefix_sum : op(prefix_sum, v);
     if (emit)
     {
       *run_out = sum_since_head;
     }
     run_out += (int) emit;
-    heads_seen += (int) head;
+    seen           = seen || head;
     sum_since_head = new_ssh;
     prefix_sum     = new_pfx;
   };
   auto seed = [&](ValueT v0) _CCCL_FORCEINLINE_LAMBDA {
     sum_since_head = v0;
     prefix_sum     = v0; // never read when element 0 is a head (pfx_has = !(my_word & 1))
-    heads_seen     = (int) (my_word & 1u);
+    seen           = (my_word & 1u) != 0u;
   };
   // the hot path is full warp tiles only (partial tiles bail to the cold outline before the
   // walk); every lane owns a full 32-element chunk
@@ -686,7 +687,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
       }
     }
   }
-  const bool has_head   = heads_seen > 0;
+  const bool has_head   = seen;
   const ValueT t        = has_head ? sum_since_head : prefix_sum;
   const unsigned bmask  = __ballot_sync(full_mask, has_head);
   const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
