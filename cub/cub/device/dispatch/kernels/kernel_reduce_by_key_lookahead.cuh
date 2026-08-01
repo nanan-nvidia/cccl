@@ -633,27 +633,39 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   int heads_seen             = 0;
   const ValueT* const my_row = wt_base + lane_id * 32;
   ValueT* const out          = d_aggregates + gbase;
-  // e == 0 seeds both accumulators (e is an unroll constant: the seed costs nothing); after the
-  // seed both are non-empty whenever they are read, so no identity element is ever combined in
-  auto step = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
+  // element 0 SEEDS both accumulators outside the loop (no identity element is ever combined
+  // in); the e >= 1 step keeps the receipted two-ternary branchless body EXACTLY (an e == 0
+  // check inside the step degenerated the predicated store: ncu receipt +44M instructions on
+  // the emission line alone)
+  // RUNNING output pointer: out[heads_seen - 1] indexing made ptxas rematerialize the base from
+  // the const bank per emission at the 40-reg cap (ncu: 7 inst/emission incl. @P LDC.64) -- the
+  // running pointer is one predicated store + one predicated pointer bump
+  ValueT* run_out = out;
+  auto step       = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
     const bool head      = (my_word >> e) & 1u;
-    const ValueT new_ssh = head ? v : ((e == 0) ? v : op(sum_since_head, v));
-    const ValueT new_pfx = (head || heads_seen > 0) ? prefix_sum : ((e == 0) ? v : op(prefix_sum, v));
-    if (head && heads_seen > 0)
+    const bool emit      = head && heads_seen > 0;
+    const ValueT new_ssh = head ? v : op(sum_since_head, v);
+    const ValueT new_pfx = (head || heads_seen > 0) ? prefix_sum : op(prefix_sum, v);
+    if (emit)
     {
-      out[heads_seen - 1] = sum_since_head;
+      *run_out = sum_since_head;
     }
+    run_out += (int) emit;
     heads_seen += (int) head;
     sum_since_head = new_ssh;
     prefix_sum     = new_pfx;
   };
-  if (valid == items_per_thread)
+  auto seed = [&](ValueT v0) _CCCL_FORCEINLINE_LAMBDA {
+    sum_since_head = v0;
+    prefix_sum     = v0; // never read when element 0 is a head (pfx_has = !(my_word & 1))
+    heads_seen     = (int) (my_word & 1u);
+  };
+  // the hot path is full warp tiles only (partial tiles bail to the cold outline before the
+  // walk); every lane owns a full 32-element chunk
   {
-    // full warp tile: NO per-element guard (SASS receipt); four elements per LDS.128, with
-    // explicit load-ahead -- the belt ncu showed 76% issue occupancy, and the exposed term is
-    // each quad's load-to-use latency (its steps wait on its own load)
     ValueT v[4];
     *(uint4*) v = *(const uint4*) (my_row + ((lane_id & 7) << 2));
+    seed(v[0]);
 #  pragma unroll
     for (int c = 0; c < 8; ++c)
     {
@@ -663,7 +675,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
         *(uint4*) vn = *(const uint4*) (my_row + (((c + 1 + lane_id) & 7) << 2));
       }
 #  pragma unroll
-      for (int j = 0; j < 4; ++j)
+      for (int j = (c == 0) ? 1 : 0; j < 4; ++j)
       {
         step(4 * c + j, v[j]);
       }
@@ -672,14 +684,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
       {
         v[j] = vn[j];
       }
-    }
-  }
-  else
-  {
-    for (int e = 0; e < valid; ++e)
-    {
-      // quad-rotated layout: element e lives in quad ((e>>2)+lane)&7 at sub-position e&3
-      step(e, my_row[(((((e >> 2) + lane_id) & 7)) << 2) + (e & 3)]);
     }
   }
   const bool has_head   = heads_seen > 0;
