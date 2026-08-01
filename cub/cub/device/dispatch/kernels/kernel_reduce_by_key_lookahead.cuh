@@ -2269,27 +2269,9 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     // keeps the smem pointer compile-time provable (the LD.E-vs-LDS receipt from the keys drain)
     ValueT wt_lead{};
     ValueT wt_tail{};
-    const bool full_wt = (wt_end == warp_tile_offset + warp_tile_size);
-    auto emit_bands    = [&](const ValueT* tile_vals, auto staged_tag) _CCCL_FORCEINLINE_LAMBDA {
+    auto emit_bands = [&](const ValueT* tile_vals, auto staged_tag) _CCCL_FORCEINLINE_LAMBDA {
       constexpr bool from_smem = decltype(staged_tag)::value;
-      if (!from_smem || !full_wt)
-      {
-        // cold: unstaged tiles (misaligned bases) and the last tile's partial warp tiles
-        const WarpTileSumsT<ValueT> cold_sums = emit_warp_tile_cold<items_per_thread>(
-          d_aggregates,
-          tile_vals,
-          my_word,
-          warp_tile_run_count,
-          global_runs_before_warp_tile,
-          warp_tile_offset,
-          wt_end,
-          tile_len,
-          lane_id,
-          reduction_op);
-        wt_lead = cold_sums.lead;
-        wt_tail = cold_sums.tail;
-      }
-      else if (warp_tile_run_count == 0)
+      if (warp_tile_run_count == 0)
       {
         wt_lead = warp_span_fold(tile_vals, warp_tile_offset, wt_end, lane_id, reduction_op);
         wt_tail = wt_lead; // head-free: the whole warp tile leads AND trails
@@ -2351,12 +2333,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
           // and partial warp tiles take the row stream.
           // source counters (seg4): the run-count distribution tail spilled 7.9% of the kernel
           // into the row path; the pair form is receipted-good through this density
-          stream_form =
-            !full_wt                                     ? 0
-               : (warp_tile_run_count < warp_tile_size / 2) ? 2
-               : (warp_tile_run_count < (7 * warp_tile_size) / 8)
-                 ? 1
-                 : 0;
+          stream_form = (warp_tile_run_count < warp_tile_size / 2) ? 2
+                      : (warp_tile_run_count < (7 * warp_tile_size) / 8)
+                        ? 1
+                        : 0;
         }
         if (stream_form == 2)
         {
@@ -2401,7 +2381,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     };
     const int tile_total_runs =
       __shfl_sync(full_mask, lane_runs_before_warp_tile + lane_warp_tile_run_count, compute_warps - 1);
-    if (vals_staged && tile_total_runs >= stage_run_threshold)
+    // TILE-level hot gate, provably warp-uniform (kernel param + blockIdx-derived): a cold CALL
+    // inside the band branch chain broke ptxas' convergence proof and dual-compiled every
+    // collective band (WARPSYNC/ENDCOLLECTIVE safe copies = the +30% executed-instruction tax)
+    if (vals_staged && tile_len == tile_size && tile_total_runs >= stage_run_threshold)
     {
       if (stage_run_threshold > 0 && threadIdx.x == 0)
       {
@@ -2431,7 +2414,20 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else
     {
-      emit_bands(d_values + (size_t) tile_id * tile_size, ::cuda::std::false_type{});
+      // cold tiles (misaligned bases; the last partial tile): whole tile through the outlined path
+      const WarpTileSumsT<ValueT> cold_sums = emit_warp_tile_cold<items_per_thread>(
+        d_aggregates,
+        d_values + (size_t) tile_id * tile_size,
+        my_word,
+        warp_tile_run_count,
+        global_runs_before_warp_tile,
+        warp_tile_offset,
+        wt_end,
+        tile_len,
+        lane_id,
+        reduction_op);
+      wt_lead = cold_sums.lead;
+      wt_tail = cold_sums.tail;
     }
     if (lane_id == 0)
     {
