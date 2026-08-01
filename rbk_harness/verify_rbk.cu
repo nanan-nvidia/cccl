@@ -90,6 +90,111 @@ static bool agg_matches(ValueT got, double ref)
   }
 }
 
+// associative, NON-commutative, exact: composition of affine maps x -> s*x + o over Z/2^16,
+// packed (s | o<<16) in a u32. op(a, b) = "a then b": s = sa*sb, o = oa*sb + ob (mod 2^16)
+struct AffineComposeOp
+{
+  __host__ __device__ unsigned operator()(unsigned a, unsigned b) const
+  {
+    const unsigned sa = a & 0xffffu, oa = a >> 16, sb = b & 0xffffu, ob = b >> 16;
+    return ((sa * sb) & 0xffffu) | ((((oa * sb) + ob) & 0xffffu) << 16);
+  }
+};
+
+struct MinOp
+{
+  template <class T>
+  __host__ __device__ T operator()(T a, T b) const
+  {
+    return b < a ? b : a;
+  }
+};
+
+// generic-op verification: exact CPU fold (same op, left-to-right) vs the device line
+template <class ValueT, class OpT>
+static bool run_op_case(const char* op_name, long long n, int max_seg, unsigned seed, OpT op, int voff = 0)
+{
+  using KeyT       = int;
+  using RbkConfigT = rbk_impl::winner_config<KeyT, ValueT, K_IPT, K_STAGES>;
+  auto h           = gen_keys<KeyT>(n, max_seg, seed);
+  std::vector<ValueT> hv((size_t) n);
+  {
+    std::mt19937 rng(seed ^ 0x51ed2701u);
+    std::uniform_int_distribution<unsigned> vd(0u, 0xffffffffu);
+    for (auto& x : hv)
+    {
+      x = (ValueT) vd(rng);
+    }
+  }
+  std::vector<KeyT> ref_u;
+  std::vector<ValueT> ref_a;
+  for (long long i = 0; i < n; ++i)
+  {
+    if (i == 0 || !(h[i] == h[i - 1]))
+    {
+      ref_u.push_back(h[i]);
+      ref_a.push_back(hv[i]);
+    }
+    else
+    {
+      ref_a.back() = op(ref_a.back(), hv[i]);
+    }
+  }
+  const long long refR = (long long) ref_u.size();
+
+  KeyT *dk{}, *du{};
+  ValueT *dv{}, *da{};
+  int* dn{};
+  void* dtemp{};
+  CHECK_CUDA(cudaMalloc(&dk, sizeof(KeyT) * (size_t) n));
+  CHECK_CUDA(cudaMemcpy(dk, h.data(), sizeof(KeyT) * (size_t) n, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMalloc(&dv, sizeof(ValueT) * ((size_t) n + voff)));
+  dv += voff;
+  CHECK_CUDA(cudaMemcpy(dv, hv.data(), sizeof(ValueT) * (size_t) n, cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMalloc(&du, sizeof(KeyT) * (size_t) n));
+  CHECK_CUDA(cudaMalloc(&da, sizeof(ValueT) * (size_t) n));
+  CHECK_CUDA(cudaMalloc(&dn, sizeof(int)));
+  size_t temp_bytes = 0;
+  rbk_impl::persistent_rbk_encode<RbkConfigT>(nullptr, temp_bytes, dk, dv, du, da, dn, (int) n, 0, op);
+  CHECK_CUDA(cudaMalloc(&dtemp, temp_bytes));
+  CHECK_CUDA(cudaMemset(da, 0xEE, sizeof(ValueT) * (size_t) n));
+  CHECK_CUDA(rbk_impl::persistent_rbk_encode<RbkConfigT>(dtemp, temp_bytes, dk, dv, du, da, dn, (int) n, 0, op));
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  int gotR = -1;
+  CHECK_CUDA(cudaMemcpy(&gotR, dn, sizeof(int), cudaMemcpyDeviceToHost));
+  std::vector<KeyT> gu((size_t) refR);
+  std::vector<ValueT> ga((size_t) refR);
+  bool ok = ((long long) gotR == refR);
+  if (ok)
+  {
+    CHECK_CUDA(cudaMemcpy(gu.data(), du, sizeof(KeyT) * (size_t) refR, cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(ga.data(), da, sizeof(ValueT) * (size_t) refR, cudaMemcpyDeviceToHost));
+    for (long long i = 0; i < refR && ok; ++i)
+    {
+      ok = (gu[(size_t) i] == ref_u[(size_t) i]) && (ga[(size_t) i] == ref_a[(size_t) i]);
+      if (!ok)
+      {
+        std::printf("  op mismatch at run %lld: key %d/%d agg %llx/%llx\n",
+                    i,
+                    (int) gu[(size_t) i],
+                    (int) ref_u[(size_t) i],
+                    (unsigned long long) ga[(size_t) i],
+                    (unsigned long long) ref_a[(size_t) i]);
+      }
+    }
+  }
+  std::printf(
+    "%s\t op=%s n=%lld\tmax_seg=%d\truns=%lld\tvoff=%d\n", ok ? "PASS" : "FAIL", op_name, n, max_seg, refR, voff);
+  CHECK_CUDA(cudaFree(dk));
+  CHECK_CUDA(cudaFree(dv - voff));
+  CHECK_CUDA(cudaFree(du));
+  CHECK_CUDA(cudaFree(da));
+  CHECK_CUDA(cudaFree(dn));
+  CHECK_CUDA(cudaFree(dtemp));
+  return ok;
+}
+
 template <class T, class ValueT, class OffsetT>
 static bool run_case(long long n, int max_seg, unsigned seed, bool sampled = false, int koff = 0, int voff = 0)
 {
@@ -311,6 +416,16 @@ int main(int argc, char** argv)
   fails += run_combo<long long, long long, long long>("I64K/I64V", "I64", huge);
   fails += run_combo<__int128, int, int>("I128K/I32", "I32", huge);
   fails += run_combo<__int128, __int128, int>("I128K/I128V", "I32", huge);
+  // generic associative (non-commutative) ops through the flagged order-preserving path
+  std::printf("== generic ops ==\n");
+  const long long gn = (1LL << 24) + 12345; // >= 1024 tiles at every tile size in play
+  for (int seg : {1, 2, 4, 64, 1024, 65536})
+  {
+    fails += !run_op_case<unsigned>("affine", gn, seg, 1234u + (unsigned) seg, AffineComposeOp{});
+  }
+  fails += !run_op_case<unsigned>("affine", gn, 4, 77u, AffineComposeOp{}, /*voff=*/1);
+  fails += !run_op_case<int>("min", gn, 64, 4321u, MinOp{});
+  fails += !run_op_case<long long>("min64", gn, 1024, 555u, MinOp{}); // 8B values through the generic path
 
   std::printf(fails ? "*** %d FAILURES ***\n" : "ALL PASS\n", fails);
   return fails ? 1 : 0;

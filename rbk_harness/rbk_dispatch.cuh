@@ -17,6 +17,8 @@ namespace rbk_kernels = CUB_NS_QUALIFIER::detail::reduce_by_key::lookahead;
 using CountStateT = rbk_kernels::CountStateT;
 template <class ValueT, class OffT>
 using TileValueRecordT = rbk_kernels::TileValueRecordT<ValueT, OffT>;
+template <class ValueT, class OffT, class ReductionOpT>
+using TileValueRecordForOpT = rbk_kernels::TileValueRecordForOpT<ValueT, OffT, ReductionOpT>;
 template <class OffT>
 using TilePrefixT = rbk_kernels::PrefixT<OffT>;
 
@@ -85,7 +87,7 @@ __global__ void rbk_init_states(StateT* states, long long n_states)
   }
 }
 
-template <class Config, class KeyT, class ValueT, class NumRunsT, class OffT>
+template <class Config, class KeyT, class ValueT, class NumRunsT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
 inline cudaError_t persistent_rbk_encode(
   void* d_temp_storage,
   size_t& temp_storage_bytes,
@@ -95,12 +97,15 @@ inline cudaError_t persistent_rbk_encode(
   ValueT* d_aggregates,
   NumRunsT* d_num_runs,
   OffT num_items,
-  cudaStream_t stream = 0)
+  cudaStream_t stream       = 0,
+  ReductionOpT reduction_op = {})
 {
+  constexpr bool kIsPlus = ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>;
+  using RecordT          = TileValueRecordForOpT<ValueT, OffT, ReductionOpT>;
   // size query must cover BOTH paths (the same allocation may serve either across calls)
   size_t cub_bytes = 0;
   cub::DeviceReduce::ReduceByKey(
-    nullptr, cub_bytes, d_keys, d_unique, d_values, d_aggregates, d_num_runs, cuda::std::plus<>{}, num_items, stream);
+    nullptr, cub_bytes, d_keys, d_unique, d_values, d_aggregates, d_num_runs, reduction_op, num_items, stream);
   const long long q_tiles = rbk_state_tiles<Config>((long long) num_items);
   // each carve is rounded up to 16B: the flag-words bulk prefetch requires a 16B-aligned base
   // (24B TileValueRecordT with 8B values left it 8-mod-16 -> misaligned address)
@@ -108,7 +113,7 @@ inline cudaError_t persistent_rbk_encode(
     return (b + 15) & ~(size_t) 15;
   };
   const size_t pers_bytes =
-    align16((size_t) q_tiles * sizeof(CountStateT)) + align16((size_t) q_tiles * sizeof(TileValueRecordT<ValueT, OffT>))
+    align16((size_t) q_tiles * sizeof(CountStateT)) + align16((size_t) q_tiles * sizeof(RecordT))
     + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>))
     + align16((size_t) q_tiles * (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned));
   const size_t required = cuda::std::max(cub_bytes, pers_bytes);
@@ -146,14 +151,13 @@ inline cudaError_t persistent_rbk_encode(
       d_values,
       d_aggregates,
       d_num_runs,
-      cuda::std::plus<>{},
+      reduction_op,
       num_items,
       stream);
   }
-  auto* count_states  = (CountStateT*) d_temp_storage;
-  auto* value_records = (TileValueRecordT<ValueT, OffT>*) ((char*) count_states + align16(tiles * sizeof(CountStateT)));
-  auto* tile_prefixes =
-    (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(TileValueRecordT<ValueT, OffT>)));
+  auto* count_states    = (CountStateT*) d_temp_storage;
+  auto* value_records   = (RecordT*) ((char*) count_states + align16(tiles * sizeof(CountStateT)));
+  auto* tile_prefixes   = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
   auto* flag_words      = (unsigned*) ((char*) tile_prefixes + align16(tiles * sizeof(TilePrefixT<OffT>)));
   const int init_blocks = (int) ((tiles + 255) / 256);
   // only the tagged COUNT states need clearing; the value records are plain outputs of the main
@@ -195,15 +199,17 @@ inline cudaError_t persistent_rbk_encode(
   // smem is values + flags per block.
   constexpr size_t kValBlockSmem =
     (size_t) Config::kTileSize * sizeof(ValueT) + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned);
-  const bool vals_staged = (((size_t) d_values & 15) == 0) && (size_t) smem_optin >= kValBlockSmem;
-  auto* vkernel          = rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT>;
+  // the generic-op body uses plain global loads: no staging, no dyn smem
+  const bool vals_staged = kIsPlus && (((size_t) d_values & 15) == 0) && (size_t) smem_optin >= kValBlockSmem;
+  auto* vkernel =
+    rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT, ReductionOpT>;
   error = cudaFuncSetAttribute(vkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kValBlockSmem);
   if (error != cudaSuccess)
   {
     return error;
   }
   vkernel<<<(int) tiles, Config::kNumCompWarps * 32, vals_staged ? kValBlockSmem : 0, stream>>>(
-    d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles, vals_staged);
+    d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles, vals_staged, reduction_op);
   error = cudaPeekAtLastError();
   if (error != cudaSuccess)
   {
@@ -211,8 +217,8 @@ inline cudaError_t persistent_rbk_encode(
   }
   // PASS 3: boundary cleanup (one warp per tile with a pending cross-tile close)
   const int cleanup_blocks = (int) ((tiles * 32 + 255) / 256);
-  rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<<<cleanup_blocks, 256, 0, stream>>>(
-    d_aggregates, value_records, (int) tiles);
+  rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<ValueT, OffT, ReductionOpT>
+    <<<cleanup_blocks, 256, 0, stream>>>(d_aggregates, value_records, (int) tiles, reduction_op);
   return cudaPeekAtLastError();
 }
 } // namespace rbk_impl
