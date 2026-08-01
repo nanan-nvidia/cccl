@@ -138,26 +138,8 @@ struct TileValueRecordT
   ValueT lead_agg; // sum before the tile's first head (whole-tile sum when head-free)
   OffT boundary_dst; // output index of the entering-run close this tile owes, or -1
   int boundary_from; // the last headed tile before this one (the close's window start)
+  int lead_has; // 0 when the lead span is empty (a general associative op has no identity)
 };
-
-// generic-op record: a general associative op has no identity, so an EMPTY lead span (tile's
-// first head at element 0) cannot be encoded as lead_agg = ValueT{}; the open span is never
-// empty (it always contains its own head element, or the whole tile when head-free)
-template <class ValueT, class OffT>
-struct TileValueRecordFlaggedT
-{
-  ValueT open_agg;
-  ValueT lead_agg;
-  OffT boundary_dst;
-  int boundary_from;
-  int lead_has; // 0 when the lead span is empty
-};
-
-template <class ValueT, class OffT, class ReductionOpT>
-using TileValueRecordForOpT =
-  ::cuda::std::conditional_t<::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>,
-                             TileValueRecordT<ValueT, OffT>,
-                             TileValueRecordFlaggedT<ValueT, OffT>>;
 
 template <class StateT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void publish_state(StateT* state_arr, int tile_idx, StateT st)
@@ -425,6 +407,29 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_up_sync_wide(T v, unsigned delta)
 }
 
 template <class T>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_down_sync_wide(T v, unsigned delta)
+{
+  if constexpr (sizeof(T) <= 8)
+  {
+    return __shfl_down_sync(full_mask, v, delta);
+  }
+  else
+  {
+    struct Halves
+    {
+      ::cuda::std::uint64_t h[sizeof(T) / 8];
+    };
+    auto hv = ::cuda::std::bit_cast<Halves>(v);
+#  pragma unroll
+    for (int i = 0; i < (int) (sizeof(T) / 8); ++i)
+    {
+      hv.h[i] = __shfl_down_sync(full_mask, hv.h[i], delta);
+    }
+    return ::cuda::std::bit_cast<T>(hv);
+  }
+}
+
+template <class T>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_xor_sync_wide(T v, int mask)
 {
   if constexpr (sizeof(T) <= 8)
@@ -587,7 +592,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT span_sum_prefetched(const ValueT* tile
 // row r IN PLACE by r makes the walk's column-step banks (e+l) mod 32 -- conflict-free with ZERO
 // extra smem, no shuffles, no padding. The walk itself stays pure FADD/FSEL + one predicated
 // store (SASS receipted branchless). MIO per warp tile ~= 96 plain smem ops; no collectives.
-template <int items_per_thread, class ValueT, class OffT>
+template <int items_per_thread, class ValueT, class OffT, class ReductionOpT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   ValueT* __restrict__ d_aggregates,
   ValueT* __restrict__ smem_vals, // the staged tile; rows get ROTATED in place
@@ -596,7 +601,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   int warp_tile_offset,
   int wt_end,
   int lane_id,
+  ReductionOpT op,
   ValueT& lead_out,
+  int& lead_has_out,
   ValueT& tail_out)
 {
   static_assert(items_per_thread == 32, "the rotated walk assumes 32x32 warp tiles");
@@ -627,10 +634,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   int heads_seen             = 0;
   const ValueT* const my_row = wt_base + lane_id * 32;
   ValueT* const out          = d_aggregates + gbase;
-  auto step                  = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
+  // e == 0 seeds both accumulators (e is an unroll constant: the seed costs nothing); after the
+  // seed both are non-empty whenever they are read, so no identity element is ever combined in
+  auto step = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
     const bool head      = (my_word >> e) & 1u;
-    const ValueT new_ssh = head ? v : (sum_since_head + v);
-    const ValueT new_pfx = (head || heads_seen > 0) ? prefix_sum : (prefix_sum + v);
+    const ValueT new_ssh = head ? v : ((e == 0) ? v : op(sum_since_head, v));
+    const ValueT new_pfx = (head || heads_seen > 0) ? prefix_sum : ((e == 0) ? v : op(prefix_sum, v));
     if (head && heads_seen > 0)
     {
       out[heads_seen - 1] = sum_since_head;
@@ -683,25 +692,31 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   for (int off = 1; off < 32; off <<= 1)
   {
     const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-    const ValueT from_left   = __shfl_up_sync(full_mask, sseg, off);
+    const ValueT from_left   = shfl_up_sync_wide(sseg, off);
     if (lane_id >= off && ((bmask & upto_l & ~upto_prev) == 0u))
     {
-      sseg += from_left;
+      sseg = op(from_left, sseg);
     }
   }
-  const ValueT s_prev = __shfl_up_sync(full_mask, sseg, 1);
+  const ValueT s_prev = shfl_up_sync_wide(sseg, 1);
+  // this lane's chunk-lead (prefix_sum) is empty exactly when its element 0 is a head: the
+  // pfx-has flag is a bit test, not a tracked register
+  const int pfx_has = !(my_word & 1u);
   ValueT incoming{};
+  int incoming_has = 0;
   if (has_head)
   {
-    incoming = prefix_sum + ((lane_id > 0) ? s_prev : ValueT{});
+    incoming     = (lane_id > 0) ? (pfx_has ? op(s_prev, prefix_sum) : s_prev) : prefix_sum;
+    incoming_has = (lane_id > 0) | pfx_has;
     if ((bmask & ((1u << lane_id) - 1)) != 0)
     {
       d_aggregates[gbase - 1] = incoming;
     }
   }
   const int first_head_lane = __ffs(bmask) - 1; // caller guarantees bmask != 0
-  lead_out                  = __shfl_sync(full_mask, incoming, first_head_lane);
-  tail_out                  = __shfl_sync(full_mask, sseg, 31);
+  lead_out                  = shfl_sync_wide(incoming, first_head_lane);
+  lead_has_out              = __shfl_sync(full_mask, incoming_has, first_head_lane);
+  tail_out                  = shfl_sync_wide(sseg, 31);
 }
 
 // TWO-LEVEL SEGMENTED SCAN band (the receipted design): pass A runs an independent 5-step
@@ -825,7 +840,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void scan_lookup_from_flags(
 // lane sums closes every cross-lane run and yields the warp tile's lead and tail as byproducts.
 // Replaces the whole-warp/wave/per-lane span-walk bands, whose serial latency chains AND
 // separate lead/tail re-reads (up to a full extra pass at seg1024) were the mid-regime tax.
-template <int items_per_thread, class ValueT, class OffT>
+template <int items_per_thread, class ValueT, class OffT, class ReductionOpT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_from_flags(
   ValueT* __restrict__ d_aggregates,
   const ValueT* __restrict__ tile_vals,
@@ -834,8 +849,11 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_from_flags(
   int warp_tile_offset,
   int wt_end,
   int lane_id,
+  ReductionOpT op,
   ValueT& lead_out,
-  ValueT& tail_out)
+  int& lead_has_out,
+  ValueT& tail_out,
+  int& tail_has_out)
 {
   static_assert(items_per_thread == 32, "the chunk band assumes 32x32 warp tiles");
   const int chunk_begin = warp_tile_offset + lane_id * 32;
@@ -853,10 +871,11 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_from_flags(
   // BRANCHLESS walk (SASS receipt: the if/elif/else form compiled to a BSSY/BRA/BSYNC divergent
   // block PER ELEMENT -- ~5700 cycles/warp tile for compute that costs ~300): selects + one
   // predicated store, nothing for lanes to diverge on
+  // e == 0 seeds both accumulators: no identity element is ever combined in
   auto step = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
     const bool head      = (my_word >> e) & 1u;
-    const ValueT new_ssh = head ? v : (sum_since_head + v);
-    const ValueT new_pfx = (head || heads_seen > 0) ? prefix_sum : (prefix_sum + v);
+    const ValueT new_ssh = head ? v : ((e == 0) ? v : op(sum_since_head, v));
+    const ValueT new_pfx = (head || heads_seen > 0) ? prefix_sum : ((e == 0) ? v : op(prefix_sum, v));
     if (head && heads_seen > 0)
     {
       out[heads_seen - 1] = sum_since_head; // interior run closes in-lane
@@ -887,41 +906,51 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_from_flags(
     }
   }
   const bool has_head   = heads_seen > 0;
-  const ValueT t        = has_head ? sum_since_head : prefix_sum; // sum since the last head at or before me
+  const ValueT t        = has_head ? sum_since_head : prefix_sum; // fold since the last head at or before me
   const unsigned bmask  = __ballot_sync(full_mask, has_head);
   const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
   ValueT s              = t;
+  int s_has             = valid > 0; // trailing lanes past wt_end hold no elements
 #  pragma unroll
   for (int off = 1; off < 32; off <<= 1)
   {
     const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-    const ValueT from_left   = __shfl_up_sync(full_mask, s, off);
-    if (lane_id >= off && ((bmask & upto_l & ~upto_prev) == 0u))
+    const ValueT from_left   = shfl_up_sync_wide(s, off);
+    const int from_has       = __shfl_up_sync(full_mask, s_has, off);
+    if (lane_id >= off && ((bmask & upto_l & ~upto_prev) == 0u) && from_has)
     {
-      s += from_left;
+      s     = s_has ? op(from_left, s) : from_left;
+      s_has = 1;
     }
   }
-  const ValueT s_prev = __shfl_up_sync(full_mask, s, 1);
+  const ValueT s_prev = shfl_up_sync_wide(s, 1);
+  // my chunk-lead (prefix_sum) is empty exactly when my element 0 is a head
+  const int pfx_has = !(my_word & 1u);
   ValueT incoming{};
+  int incoming_has = 0;
   if (has_head)
   {
-    // the run ENDING at my first head: its rank is one before my first owned run
-    incoming = prefix_sum + ((lane_id > 0) ? s_prev : ValueT{});
+    // the run ENDING at my first head: its rank is one before my first owned run. Lanes below a
+    // headed lane are never empty (chunks are contiguous), so s_prev is valid whenever lane > 0.
+    incoming     = (lane_id > 0) ? (pfx_has ? op(s_prev, prefix_sum) : s_prev) : prefix_sum;
+    incoming_has = (lane_id > 0) | pfx_has;
     if ((bmask & ((1u << lane_id) - 1)) != 0)
     {
       d_aggregates[gbase - 1] = incoming;
     }
   }
   const int first_head_lane = __ffs(bmask) - 1; // caller guarantees bmask != 0
-  lead_out                  = __shfl_sync(full_mask, incoming, first_head_lane);
-  tail_out                  = __shfl_sync(full_mask, s, 31); // sum since the warp tile's last head
+  lead_out                  = shfl_sync_wide(incoming, first_head_lane);
+  lead_has_out              = __shfl_sync(full_mask, incoming_has, first_head_lane);
+  tail_out                  = shfl_sync_wide(s, 31); // fold since the warp tile's last head
+  tail_has_out              = __shfl_sync(full_mask, s_has, 31);
 }
 
 // values-only streaming reduce over one warp tile, boundaries from REGISTER flag words (the
 // value warps snapshot the flags and run fully detached from the rings). Emits every
 // within-warp-tile-closed aggregate; the trailing open sum comes back as the carry. The scan
 // loop is the FROZEN form -- lead/tail ride separate passes, never inside it.
-template <int items_per_thread, bool full_tile, class ValueT, class OffT>
+template <int items_per_thread, bool full_tile, class ValueT, class OffT, class ReductionOpT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
   ValueT* __restrict__ d_aggregates,
   const ValueT* __restrict__ tile_vals,
@@ -930,7 +959,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
   int warp_tile_offset,
   int tile_len,
   int lane_id,
-  ValueT& tail_out)
+  ReductionOpT op,
+  ValueT& tail_out,
+  int& tail_has_out)
 {
   const int my_popc = __popc(my_word);
   typename WarpScan<int>::TempStorage warp_scan_storage;
@@ -943,6 +974,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
   // receipt: VEmit 16us/warp-tile of local-memory thrash). The scan carry crosses chunks freely.
   constexpr int chunk_rows = (items_per_thread < 8) ? items_per_thread : 8;
   ValueT carry{};
+  int carry_has = 0;
   for (int chunk = 0; chunk < items_per_thread; chunk += chunk_rows)
   {
     ValueT row_vals[chunk_rows];
@@ -970,6 +1002,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
       }
       const unsigned w = __shfl_sync(full_mask, my_word, iter);
       ValueT incl      = row_vals[cr];
+      // full tiles are all-valid by construction; only the partial variant tracks validity
+      int has = full_tile ? 1 : (int) (warp_tile_offset + iter * 32 + lane_id < tile_len);
       // ADAPTIVE scan depth (dense receipt: the fixed 5-step scan is the MIO wall at ~8 ops/row
       // x 256 rows/tile; step k only matters if some accumulation distance reaches 2^(k-1)).
       // Each lane's distance to its nearest head at-or-before covers spans, carry-in and
@@ -988,7 +1022,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
           {
             const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
             const ValueT from_left   = shfl_up_sync_wide(incl, off);
-            if constexpr (sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+            const int from_has       = full_tile ? 1 : __shfl_up_sync(full_mask, has, off);
+            if constexpr (full_tile && sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>
+                          && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
             {
               // force SETP + @p FADD (2 ops) over nvcc's FADD+FSEL+ISETP (3): the guard folds
               // into the test value with one LOP3 -- nonzero test blocks lanes below the step
@@ -999,9 +1035,10 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
             }
             else
             {
-              if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u))
+              if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u) && from_has)
               {
-                incl += from_left;
+                incl = has ? op(from_left, incl) : from_left;
+                has  = 1;
               }
             }
           }
@@ -1019,9 +1056,11 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
       {
         scan_steps(1, 16); // the full pipelined scan
       }
-      if ((w & upto_l) == 0u)
+      // iter 0 has no earlier row: the carry is empty there (no identity element is combined in)
+      if ((w & upto_l) == 0u && iter > 0 && carry_has)
       {
-        incl += carry;
+        incl = has ? op(carry, incl) : carry;
+        has  = 1;
       }
       const unsigned next_word = __shfl_sync(full_mask, my_word, (iter + 1) & 31);
       const bool is_end        = (lane_id < 31) ? (((w >> (lane_id + 1)) & 1u) != 0u)
@@ -1031,10 +1070,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
       {
         d_aggregates[global_runs_before_warp_tile + run_idx] = incl;
       }
-      carry = shfl_sync_wide(incl, 31);
+      carry     = shfl_sync_wide(incl, 31);
+      carry_has = full_tile ? 1 : __shfl_sync(full_mask, has, 31);
     }
   }
-  tail_out = carry; // sum since the warp tile's last head (whole tile when head-free)
+  tail_out     = carry; // fold since the warp tile's last head (whole tile when head-free)
+  tail_has_out = carry_has;
 }
 
 // QUAD-COMPRESSED STREAM (staged full tiles, 4-byte values): each lane owns FOUR consecutive
@@ -1284,20 +1325,41 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
 
 // warp-parallel strided sum over [begin, end) of the tile's values (lead/tail segments and the
 // long-span cooperative walks; every lane participates)
-template <class ValueT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT warp_span_sum(const ValueT* tile_vals, int begin, int end, int lane_id)
+// order-preserving warp fold of [begin, end): lane l folds a CONTIGUOUS chunk, then a
+// lane-ascending shfl_down tree combines the chunks. The chunk stride is forced ODD so the
+// per-lane smem walks stay bank-conflict-free (a 32-multiple stride lands every lane on one
+// bank). No identity element is assumed: empty chunks carry a has-flag. Every combine is
+// op(earlier indices, later indices) -- associativity is the only requirement.
+template <class ValueT, class ReductionOpT>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE void
+warp_span_fold(const ValueT* tile_vals, int begin, int end, int lane_id, ReductionOpT op, ValueT& out, int& out_has)
 {
+  const int len   = end - begin;
+  const int chunk = (len > 0) ? (((len + 31) / 32) | 1) : 1;
+  const int lo    = begin + lane_id * chunk;
+  const int hi    = min(lo + chunk, end);
   ValueT acc{};
-  for (int pos = begin + lane_id; pos < end; pos += 32)
+  int has = 0;
+  for (int pos = lo; pos < hi; ++pos)
   {
-    acc += tile_vals[pos];
+    acc = has ? op(acc, tile_vals[pos]) : tile_vals[pos];
+    has = 1;
   }
+  // ASCENDING offsets: after step k lane i covers the contiguous chunks [i, i + 2^k) -- a
+  // descending tree combines non-adjacent covers and breaks the ordering
 #  pragma unroll
-  for (int offset = 16; offset; offset >>= 1)
+  for (int offset = 1; offset < 32; offset <<= 1)
   {
-    acc += shfl_xor_sync_wide(acc, offset);
+    const ValueT from_right = shfl_down_sync_wide(acc, offset);
+    const int right_has     = __shfl_down_sync(full_mask, has, offset);
+    if (lane_id + offset < 32 && right_has)
+    {
+      acc = has ? op(acc, from_right) : from_right;
+      has = 1;
+    }
   }
-  return acc;
+  out     = shfl_sync_wide(acc, 0);
+  out_has = __shfl_sync(full_mask, has, 0);
 }
 
 struct RunSpanT
@@ -2030,240 +2092,6 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadInitKernel(StateT* states
   }
 }
 
-// ===== GENERIC-OP PATH (any associative ReductionOpT, commutativity NOT required) =====
-// Correctness-only forms: every combine is op(earlier indices, later indices), empty spans carry
-// an explicit has-flag (no identity element is assumed), and loads are validity-clamped (the
-// zero-fill-past-tile_len staging trick is a plus-identity trick and is NOT used here).
-
-// ordered flagged segmented scan over one warp tile; emits every interior run close and returns
-// the lead (fold before the first head) and tail (fold since the last head) with has-flags
-template <int items_per_thread, class ValueT, class OffT, class ReductionOpT>
-_CCCL_DEVICE_API void emit_runs_generic(
-  ValueT* __restrict__ d_aggregates,
-  const ValueT* __restrict__ tile_vals,
-  unsigned my_word,
-  OffT global_runs_before_warp_tile,
-  int warp_tile_offset,
-  int wt_end, // min(warp_tile_offset + warp_tile_size, tile_len)
-  int lane_id,
-  ReductionOpT op,
-  ValueT& lead_out,
-  int& lead_has_out,
-  ValueT& tail_out,
-  int& tail_has_out)
-{
-  const int my_popc = __popc(my_word);
-  typename WarpScan<int>::TempStorage warp_scan_storage;
-  int word_scan;
-  WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
-  const int my_runs_before_word = word_scan - my_popc;
-  const unsigned upto_l         = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
-  ValueT carry{};
-  int carry_has   = 0;
-  int my_lead_set = 0;
-  lead_has_out    = 0;
-  for (int iter = 0; iter < items_per_thread; ++iter)
-  {
-    const int loc    = warp_tile_offset + iter * 32 + lane_id;
-    const int valid  = loc < wt_end;
-    ValueT incl      = valid ? tile_vals[loc] : ValueT{};
-    int has          = valid;
-    const unsigned w = __shfl_sync(full_mask, my_word, iter);
-#  pragma unroll
-    for (int off = 1; off < 32; off <<= 1)
-    {
-      const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-      const ValueT from_left   = shfl_up_sync_wide(incl, off);
-      const int from_has       = __shfl_up_sync(full_mask, has, off);
-      // fold allowed when no head lies in (lane-off, lane]: from_left then covers the ordered
-      // prefix ending at lane-off, so op(from_left, incl) is an index-ordered combine
-      if (lane_id >= off && (w & upto_l & ~upto_prev) == 0u && from_has)
-      {
-        incl = has ? op(from_left, incl) : from_left;
-        has  = 1;
-      }
-    }
-    if ((w & upto_l) == 0u && carry_has)
-    {
-      incl = has ? op(carry, incl) : carry;
-      has  = 1;
-    }
-    const unsigned next_word = __shfl_sync(full_mask, my_word, (iter + 1) & 31);
-    const bool is_end        = (lane_id < 31) ? (((w >> (lane_id + 1)) & 1u) != 0u)
-                                              : ((iter + 1 < items_per_thread) && ((next_word & 1u) != 0u));
-    const int run_idx        = __shfl_sync(full_mask, my_runs_before_word, iter) + __popc(w & upto_l) - 1;
-    if (is_end)
-    {
-      if (run_idx >= 0)
-      {
-        d_aggregates[global_runs_before_warp_tile + run_idx] = incl;
-      }
-      else
-      {
-        // the element just before the warp tile's FIRST head: incl is the lead fold (broadcast
-        // to the whole warp after the loop -- only this lane holds it here)
-        lead_out     = incl;
-        lead_has_out = has;
-        my_lead_set  = 1;
-      }
-    }
-    carry     = shfl_sync_wide(incl, 31);
-    carry_has = __shfl_sync(full_mask, has, 31);
-  }
-  const unsigned lead_mask = __ballot_sync(full_mask, my_lead_set != 0);
-  if (lead_mask != 0u)
-  {
-    const int src = __ffs(lead_mask) - 1;
-    lead_out      = shfl_sync_wide(lead_out, src);
-    lead_has_out  = __shfl_sync(full_mask, lead_has_out, src);
-  }
-  tail_out     = carry;
-  tail_has_out = carry_has;
-}
-
-// generic-op tile body: same protocol as the plus value pass (flag words + persisted prefix in,
-// interior closes + boundary record out) with ordered flagged folds throughout. Global loads
-// only -- no staging.
-template <typename PolicySelector, class ValueT, class OffT, class ReductionOpT>
-_CCCL_DEVICE_API void rbk_value_tile_generic(
-  const ValueT* __restrict__ d_values,
-  ValueT* __restrict__ d_aggregates,
-  const unsigned* __restrict__ d_flag_words,
-  const PrefixT<OffT>* __restrict__ d_tile_prefix,
-  TileValueRecordFlaggedT<ValueT, OffT>* __restrict__ value_records,
-  OffT num_items,
-  int num_tiles,
-  ReductionOpT op)
-{
-  static constexpr RleLookaheadPolicy policy = current_policy<PolicySelector>().lookahead;
-  constexpr int items_per_thread             = policy.items_per_thread;
-  constexpr int compute_warps                = policy.compute_warps;
-  constexpr int warp_tile_size               = policy.warp_tile_size();
-  constexpr int tile_size                    = policy.tile_size();
-  __shared__ int wt_counts[compute_warps];
-  __shared__ ValueT wt_leads[compute_warps];
-  __shared__ ValueT wt_tails[compute_warps];
-  __shared__ int wt_leads_has[compute_warps];
-  __shared__ int wt_tails_has[compute_warps];
-
-  const int tile_id             = (int) blockIdx.x;
-  const int wt                  = (int) (threadIdx.x >> 5);
-  const int lane_id             = (int) (threadIdx.x & 31);
-  const int tile_len            = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
-  const unsigned my_word        = d_flag_words[(size_t) tile_id * (compute_warps * 32) + wt * 32 + lane_id];
-  const int warp_tile_run_count = __reduce_add_sync(full_mask, __popc(my_word));
-  if (lane_id == 0)
-  {
-    wt_counts[wt] = warp_tile_run_count;
-  }
-  __syncthreads();
-  const auto [lane_warp_tile_run_count, lane_runs_before_warp_tile] =
-    scan_warp_tile_run_counts<compute_warps>(wt_counts, lane_id);
-  const int runs_before_warp_tile         = __shfl_sync(full_mask, lane_runs_before_warp_tile, wt);
-  const OffT curr_prefix_run_count        = d_tile_prefix[tile_id].run_count();
-  const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
-  const int warp_tile_offset              = wt * warp_tile_size;
-  const int wt_end                        = min(warp_tile_offset + warp_tile_size, tile_len);
-
-  ValueT wt_lead{}, wt_tail{};
-  int lead_has = 0, tail_has = 0;
-  emit_runs_generic<items_per_thread>(
-    d_aggregates,
-    d_values + (size_t) tile_id * tile_size,
-    my_word,
-    global_runs_before_warp_tile,
-    warp_tile_offset,
-    wt_end,
-    lane_id,
-    op,
-    wt_lead,
-    lead_has,
-    wt_tail,
-    tail_has);
-  if (warp_tile_run_count == 0)
-  {
-    // head-free warp tile: the whole (possibly empty) span leads AND trails
-    wt_lead  = wt_tail;
-    lead_has = tail_has;
-  }
-  if (lane_id == 0)
-  {
-    wt_leads[wt]     = wt_lead;
-    wt_tails[wt]     = wt_tail;
-    wt_leads_has[wt] = lead_has;
-    wt_tails_has[wt] = tail_has;
-  }
-  __syncthreads();
-  if (wt == 0)
-  {
-    const int lane_count                    = (lane_id < compute_warps) ? wt_counts[lane_id] : 0;
-    const unsigned nonempty_warp_tiles_mask = __ballot_sync(full_mask, lane_count > 0);
-    const bool any_head                     = (nonempty_warp_tiles_mask != 0);
-    const bool is_last_tile                 = (tile_id == num_tiles - 1);
-    const int last_headed                   = any_head ? (31 - __clz(nonempty_warp_tiles_mask)) : 0;
-    const int first_headed                  = any_head ? (__ffs(nonempty_warp_tiles_mask) - 1) : compute_warps;
-    if (lane_id == 0)
-    {
-      // ordered serial folds (warp index ascending = element index ascending)
-      ValueT open_agg{}, lead_agg{};
-      int open_has = 0, lead_has_acc = 0;
-      for (int w2 = last_headed; w2 < compute_warps; ++w2)
-      {
-        if (wt_tails_has[w2])
-        {
-          open_agg = open_has ? op(open_agg, wt_tails[w2]) : wt_tails[w2];
-          open_has = 1;
-        }
-      }
-      for (int w2 = 0; w2 < first_headed && w2 < compute_warps; ++w2)
-      {
-        if (wt_tails_has[w2])
-        {
-          lead_agg     = lead_has_acc ? op(lead_agg, wt_tails[w2]) : wt_tails[w2];
-          lead_has_acc = 1;
-        }
-      }
-      if (any_head && wt_leads_has[first_headed])
-      {
-        lead_agg     = lead_has_acc ? op(lead_agg, wt_leads[first_headed]) : wt_leads[first_headed];
-        lead_has_acc = 1;
-      }
-      TileValueRecordFlaggedT<ValueT, OffT> rec;
-      rec.open_agg = open_agg; // never empty on a live tile: it always contains its last head
-      rec.lead_agg = lead_agg;
-      rec.lead_has = lead_has_acc;
-      rec.boundary_dst =
-        (curr_prefix_run_count > 0 && (any_head || is_last_tile)) ? (OffT) (curr_prefix_run_count - 1) : (OffT) -1;
-      rec.boundary_from      = d_tile_prefix[tile_id].last_tile_with_runs();
-      value_records[tile_id] = rec;
-    }
-    if (lane_id < compute_warps && lane_count > 0)
-    {
-      const unsigned later           = nonempty_warp_tiles_mask >> (lane_id + 1);
-      const OffT last_run_global_idx = curr_prefix_run_count + lane_runs_before_warp_tile + lane_count - 1;
-      const int close_to             = later ? (lane_id + 1 + __ffs(later) - 1) : (is_last_tile ? compute_warps : -1);
-      if (close_to >= 0)
-      {
-        // a headed warp tile's tail always has (it contains its own head element)
-        ValueT closing = wt_tails[lane_id];
-        for (int w2 = lane_id + 1; w2 < close_to && w2 < compute_warps; ++w2)
-        {
-          if (wt_tails_has[w2])
-          {
-            closing = op(closing, wt_tails[w2]); // head-free middles: whole spans
-          }
-        }
-        if (close_to < compute_warps && wt_leads_has[close_to])
-        {
-          closing = op(closing, wt_leads[close_to]);
-        }
-        d_aggregates[last_run_global_idx] = closing;
-      }
-      // else: open into the next tile -- the cleanup pass closes it
-    }
-  }
-}
-
 // THE VALUE PASS: pipeline-free. One 8-warp block per tile; the persisted flag words are the
 // whole run structure, the persisted tile prefix is the whole cross-tile coordination. No rings,
 // no barriers beyond __syncthreads, no lookahead, no work stealing -- latency hides behind plain
@@ -2275,21 +2103,12 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     ValueT* __restrict__ d_aggregates,
     const unsigned* __restrict__ d_flag_words,
     const PrefixT<OffT>* __restrict__ d_tile_prefix,
-    TileValueRecordForOpT<ValueT, OffT, ReductionOpT>* __restrict__ value_records,
+    TileValueRecordT<ValueT, OffT>* __restrict__ value_records,
     OffT num_items,
     int num_tiles,
     bool vals_staged,
     ReductionOpT reduction_op = {})
 {
-  constexpr bool kIsPlus = ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>;
-  if constexpr (!kIsPlus)
-  {
-    // any associative op, commutativity not required: the order-preserving flagged path
-    rbk_value_tile_generic<PolicySelector>(
-      d_values, d_aggregates, d_flag_words, d_tile_prefix, value_records, num_items, num_tiles, reduction_op);
-    return;
-  }
-  else
   {
     static constexpr RleLookaheadPolicy policy = current_policy<PolicySelector>().lookahead;
     constexpr int items_per_thread             = policy.items_per_thread;
@@ -2305,6 +2124,8 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     __shared__ int wt_counts[compute_warps];
     __shared__ ValueT wt_leads[compute_warps];
     __shared__ ValueT wt_tails[compute_warps];
+    __shared__ int wt_leads_has[compute_warps];
+    __shared__ int wt_tails_has[compute_warps];
     __shared__ ValueT wt_row_carry[compute_warps][32];
 
     const int tile_id = (int) blockIdx.x;
@@ -2403,12 +2224,16 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     // keeps the smem pointer compile-time provable (the LD.E-vs-LDS receipt from the keys drain)
     ValueT wt_lead{};
     ValueT wt_tail{};
-    auto emit_bands = [&](const ValueT* tile_vals, auto staged_tag) _CCCL_FORCEINLINE_LAMBDA {
+    int wt_lead_has    = 0;
+    int wt_tail_has    = 0;
+    const bool full_wt = (wt_end == warp_tile_offset + warp_tile_size);
+    auto emit_bands    = [&](const ValueT* tile_vals, auto staged_tag) _CCCL_FORCEINLINE_LAMBDA {
       constexpr bool from_smem = decltype(staged_tag)::value;
       if (warp_tile_run_count == 0)
       {
-        wt_lead = warp_span_sum(tile_vals, warp_tile_offset, wt_end, lane_id);
-        wt_tail = wt_lead; // head-free: the whole warp tile leads AND trails
+        warp_span_fold(tile_vals, warp_tile_offset, wt_end, lane_id, reduction_op, wt_lead, wt_lead_has);
+        wt_tail     = wt_lead; // head-free: the whole warp tile leads AND trails
+        wt_tail_has = wt_lead_has;
       }
       else if (from_smem && warp_tile_run_count < 4)
       {
@@ -2418,9 +2243,12 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         const RunSpanT lane_run = dec.decode_run(lane_id < warp_tile_run_count ? lane_id : 0);
         for (int run_idx = 0; run_idx + 1 < warp_tile_run_count; ++run_idx)
         {
-          const int head   = __shfl_sync(full_mask, lane_run.head_pos_in_warp_tile, run_idx);
-          const int next   = __shfl_sync(full_mask, lane_run.next_head_pos, run_idx);
-          const ValueT agg = warp_span_sum(tile_vals, warp_tile_offset + head, warp_tile_offset + next, lane_id);
+          const int head = __shfl_sync(full_mask, lane_run.head_pos_in_warp_tile, run_idx);
+          const int next = __shfl_sync(full_mask, lane_run.next_head_pos, run_idx);
+          ValueT agg;
+          int agg_has; // runs are never empty: has is structural here
+          warp_span_fold(
+            tile_vals, warp_tile_offset + head, warp_tile_offset + next, lane_id, reduction_op, agg, agg_has);
           if (lane_id == 0)
           {
             d_aggregates[global_runs_before_warp_tile + run_idx] = agg;
@@ -2428,14 +2256,28 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         }
         const RunSpanT first_run = dec.decode_run(0);
         const RunSpanT last_run  = dec.decode_run(warp_tile_run_count - 1);
-        wt_lead =
-          warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
-        wt_tail = warp_span_sum(tile_vals, warp_tile_offset + last_run.head_pos_in_warp_tile, wt_end, lane_id);
+        warp_span_fold(
+          tile_vals,
+          warp_tile_offset,
+          warp_tile_offset + first_run.head_pos_in_warp_tile,
+          lane_id,
+          reduction_op,
+          wt_lead,
+          wt_lead_has);
+        warp_span_fold(
+          tile_vals,
+          warp_tile_offset + last_run.head_pos_in_warp_tile,
+          wt_end,
+          lane_id,
+          reduction_op,
+          wt_tail,
+          wt_tail_has);
       }
-      else if (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32 && warp_tile_run_count < stream_threshold)
+      else if (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32 && full_wt
+               && warp_tile_run_count < stream_threshold)
       {
-        // (4-byte values, 32x32 warp tiles only: the quad rotate/loads cast through uint4 --
-        // hardening receipt: misaligned address with f64 values)
+        // (4-byte values, 32x32 FULL warp tiles only: the quad rotate/loads cast through uint4;
+        // partial warp tiles take the flagged row stream)
         if constexpr (sizeof(ValueT) == 4 && items_per_thread == 32)
         {
           chunk_reduce_rotated<items_per_thread>(
@@ -2446,53 +2288,95 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
             warp_tile_offset,
             wt_end,
             lane_id,
+            reduction_op,
             wt_lead,
+            wt_lead_has,
             wt_tail);
+          wt_tail_has = 1; // the tail fold always contains the warp tile's last head
         }
       }
-      else if (warp_tile_run_count >= stream_threshold || (from_smem && sizeof(ValueT) != 4) || items_per_thread != 32)
+      else if (warp_tile_run_count >= stream_threshold || (from_smem && sizeof(ValueT) != 4) || items_per_thread != 32
+               || !full_wt)
       {
         // stream density router (B200 receipts): quad wins to ~half density (seg4 -9.4%), pair
         // from there to ~3/4 (seg2, quad's interior-emission cost +14% there), the adaptive row
         // stream at near-all-heads (seg1)
         int stream_form = 0; // 0 = row
         if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32
-                      && ::cuda::std::is_same_v<ValueT, float>)
+                      && ::cuda::std::is_same_v<ValueT, float>
+                      && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
         {
+          // the quad/pair forms are plus<float> codegen (FADD asm, identity algebra); other ops
+          // and partial warp tiles take the row stream.
           // source counters (seg4): the run-count distribution tail spilled 7.9% of the kernel
           // into the row path; the pair form is receipted-good through this density
-          stream_form = (warp_tile_run_count < warp_tile_size / 2) ? 2
-                      : (warp_tile_run_count < (7 * warp_tile_size) / 8)
-                        ? 1
-                        : 0;
+          stream_form =
+            !full_wt                                     ? 0
+               : (warp_tile_run_count < warp_tile_size / 2) ? 2
+               : (warp_tile_run_count < (7 * warp_tile_size) / 8)
+                 ? 1
+                 : 0;
         }
         if (stream_form == 2)
         {
           if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32
-                        && ::cuda::std::is_same_v<ValueT, float>)
+                        && ::cuda::std::is_same_v<ValueT, float>
+                        && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
           {
             stream_values_quad<items_per_thread>(
               d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_tail);
+            wt_tail_has = 1;
           }
         }
         else if (stream_form == 1)
         {
           if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32
-                        && ::cuda::std::is_same_v<ValueT, float>)
+                        && ::cuda::std::is_same_v<ValueT, float>
+                        && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
           {
             stream_values_paired<items_per_thread>(
               d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_tail);
+            wt_tail_has = 1;
           }
+        }
+        else if (from_smem && full_wt)
+        {
+          stream_values_from_flags<items_per_thread, true>(
+            d_aggregates,
+            tile_vals,
+            my_word,
+            global_runs_before_warp_tile,
+            warp_tile_offset,
+            tile_len,
+            lane_id,
+            reduction_op,
+            wt_tail,
+            wt_tail_has);
         }
         else
         {
-          stream_values_from_flags<items_per_thread, from_smem>(
-            d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, wt_tail);
+          stream_values_from_flags<items_per_thread, false>(
+            d_aggregates,
+            tile_vals,
+            my_word,
+            global_runs_before_warp_tile,
+            warp_tile_offset,
+            tile_len,
+            lane_id,
+            reduction_op,
+            wt_tail,
+            wt_tail_has);
         }
         const HeadFlagDecodeT dec(my_word, lane_id);
         const RunSpanT first_run = dec.decode_run(0);
-        wt_lead =
-          warp_span_sum(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id);
+        warp_span_fold(
+          tile_vals,
+          warp_tile_offset,
+          warp_tile_offset + first_run.head_pos_in_warp_tile,
+          lane_id,
+          reduction_op,
+          wt_lead,
+          wt_lead_has);
       }
       else
       {
@@ -2506,8 +2390,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
             warp_tile_offset,
             wt_end,
             lane_id,
+            reduction_op,
             wt_lead,
-            wt_tail);
+            wt_lead_has,
+            wt_tail,
+            wt_tail_has);
         }
       }
     };
@@ -2547,8 +2434,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     if (lane_id == 0)
     {
-      wt_leads[wt] = wt_lead;
-      wt_tails[wt] = wt_tail;
+      wt_leads[wt]     = wt_lead;
+      wt_tails[wt]     = wt_tail;
+      wt_leads_has[wt] = wt_lead_has;
+      wt_tails_has[wt] = wt_tail_has;
     }
     if (ik_rec)
     {
@@ -2569,23 +2458,46 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       {
         const int last_headed  = any_head ? (31 - __clz(nonempty_warp_tiles_mask)) : 0;
         const int first_headed = any_head ? (__ffs(nonempty_warp_tiles_mask) - 1) : compute_warps;
-        ValueT open_agg        = (lane_id < compute_warps && lane_id >= last_headed) ? wt_tails[lane_id] : ValueT{};
-        ValueT lead_agg        = (lane_id < compute_warps && lane_id < first_headed) ? wt_tails[lane_id] : ValueT{};
-        if (any_head && lane_id == first_headed)
+        const int open_in      = lane_id < compute_warps && lane_id >= last_headed && wt_tails_has[lane_id];
+        const int lead_in      = lane_id < compute_warps && lane_id < first_headed && wt_tails_has[lane_id];
+        ValueT open_agg        = open_in ? wt_tails[lane_id] : ValueT{};
+        ValueT lead_agg        = lead_in ? wt_tails[lane_id] : ValueT{};
+        int open_has           = open_in;
+        int lead_has           = lead_in;
+        if (any_head && lane_id == first_headed && wt_leads_has[first_headed])
         {
-          lead_agg += wt_leads[first_headed];
+          lead_agg = lead_has ? reduction_op(lead_agg, wt_leads[first_headed]) : wt_leads[first_headed];
+          lead_has = 1;
         }
+        // lane-ascending ordered fold (warp index ascending = element index ascending):
+        // shfl_down tree, empty lanes are transparent
 #  pragma unroll
-        for (int offset = 16; offset; offset >>= 1)
+        for (int offset = 1; offset < 32; offset <<= 1)
         {
-          open_agg += shfl_xor_sync_wide(open_agg, offset);
-          lead_agg += shfl_xor_sync_wide(lead_agg, offset);
+          const ValueT open_r = shfl_down_sync_wide(open_agg, offset);
+          const int open_rh   = __shfl_down_sync(full_mask, open_has, offset);
+          const ValueT lead_r = shfl_down_sync_wide(lead_agg, offset);
+          const int lead_rh   = __shfl_down_sync(full_mask, lead_has, offset);
+          if (lane_id + offset < 32)
+          {
+            if (open_rh)
+            {
+              open_agg = open_has ? reduction_op(open_agg, open_r) : open_r;
+              open_has = 1;
+            }
+            if (lead_rh)
+            {
+              lead_agg = lead_has ? reduction_op(lead_agg, lead_r) : lead_r;
+              lead_has = 1;
+            }
+          }
         }
         if (lane_id == 0)
         {
           TileValueRecordT<ValueT, OffT> rec;
-          rec.open_agg = open_agg;
+          rec.open_agg = open_agg; // never empty on a live tile: it always contains its last head
           rec.lead_agg = lead_agg;
+          rec.lead_has = lead_has;
           rec.boundary_dst =
             (curr_prefix_run_count > 0 && (any_head || is_last_tile)) ? (OffT) (curr_prefix_run_count - 1) : (OffT) -1;
           rec.boundary_from      = d_tile_prefix[tile_id].last_tile_with_runs();
@@ -2600,12 +2512,19 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         if (later)
         {
           const int next_headed = lane_id + 1 + __ffs(later) - 1;
-          ValueT closing        = wt_tails[lane_id];
+          // a headed warp tile's own tail always has (it contains its last head)
+          ValueT closing = wt_tails[lane_id];
           for (int w2 = lane_id + 1; w2 < next_headed; ++w2)
           {
-            closing += wt_tails[w2]; // head-free middles: whole sums
+            if (wt_tails_has[w2])
+            {
+              closing = reduction_op(closing, wt_tails[w2]); // head-free middles: whole folds
+            }
           }
-          closing += wt_leads[next_headed];
+          if (wt_leads_has[next_headed])
+          {
+            closing = reduction_op(closing, wt_leads[next_headed]);
+          }
           d_aggregates[last_run_global_idx] = closing;
         }
         else if (is_last_tile)
@@ -2613,7 +2532,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
           ValueT closing = wt_tails[lane_id];
           for (int w2 = lane_id + 1; w2 < compute_warps; ++w2)
           {
-            closing += wt_tails[w2];
+            if (wt_tails_has[w2])
+            {
+              closing = reduction_op(closing, wt_tails[w2]);
+            }
           }
           d_aggregates[last_run_global_idx] = closing;
         }
@@ -2928,14 +2850,10 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
 // is disjoint, sums fold in fixed order (deterministic), total work is O(num_tiles) amortized.
 template <class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
 _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadCleanupKernel(
-  ValueT* d_aggregates,
-  TileValueRecordForOpT<ValueT, OffT, ReductionOpT>* value_records,
-  int num_tiles,
-  ReductionOpT reduction_op = {})
+  ValueT* d_aggregates, TileValueRecordT<ValueT, OffT>* value_records, int num_tiles, ReductionOpT reduction_op = {})
 {
-  constexpr bool kIsPlus = ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>;
-  const int warp_global  = (int) ((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
-  const int lane_id      = (int) (threadIdx.x & 31);
+  const int warp_global = (int) ((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+  const int lane_id     = (int) (threadIdx.x & 31);
   if (warp_global >= num_tiles)
   {
     return;
@@ -2946,39 +2864,41 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadCleanupKernel(
     return;
   }
   const int from = (rec.boundary_from >= 0) ? rec.boundary_from : 0;
-  if constexpr (kIsPlus)
+  ValueT carry{};
+  int carry_has = 0;
+  for (int base = from; base < warp_global; base += 32)
   {
-    ValueT carry{};
-    for (int base = from; base < warp_global; base += 32)
-    {
-      const int t = base + lane_id;
-      // open_agg of the window start is its tail chain; the head-free tiles after it contribute
-      // their whole-tile sums (== their open_agg)
-      ValueT part = (t < warp_global) ? value_records[t].open_agg : ValueT{};
+    const int t = base + lane_id;
+    // open_agg of the window start is its tail chain; the head-free tiles after it contribute
+    // their whole-tile folds (== their open_agg). open_agg is never empty on a live tile, so
+    // the only empty lanes are those past the window end. Lane-ascending shfl_down tree =
+    // tile-ascending ordered fold.
+    const int in = t < warp_global;
+    ValueT part  = in ? value_records[t].open_agg : ValueT{};
+    int part_has = in;
 #  pragma unroll
-      for (int offset = 16; offset; offset >>= 1)
-      {
-        part += shfl_xor_sync_wide(part, offset);
-      }
-      carry += part;
-    }
-    if (lane_id == 0)
+    for (int offset = 1; offset < 32; offset <<= 1)
     {
-      d_aggregates[rec.boundary_dst] = carry + rec.lead_agg;
+      const ValueT r = shfl_down_sync_wide(part, offset);
+      const int rh   = __shfl_down_sync(full_mask, part_has, offset);
+      if (lane_id + offset < 32 && rh)
+      {
+        part     = part_has ? reduction_op(part, r) : r;
+        part_has = 1;
+      }
     }
+    if (part_has)
+    {
+      carry     = carry_has ? reduction_op(carry, part) : part;
+      carry_has = 1;
+    }
+    carry     = shfl_sync_wide(carry, 0);
+    carry_has = __shfl_sync(full_mask, carry_has, 0);
   }
-  else
+  if (lane_id == 0)
   {
-    // ordered tile-ascending fold; open_agg is never empty on a live tile
-    if (lane_id == 0)
-    {
-      ValueT carry = value_records[from].open_agg;
-      for (int t = from + 1; t < warp_global; ++t)
-      {
-        carry = reduction_op(carry, value_records[t].open_agg);
-      }
-      d_aggregates[rec.boundary_dst] = rec.lead_has ? reduction_op(carry, rec.lead_agg) : carry;
-    }
+    // the window [from, warp_global) is never empty when boundary_dst >= 0
+    d_aggregates[rec.boundary_dst] = rec.lead_has ? reduction_op(carry, rec.lead_agg) : carry;
   }
 }
 

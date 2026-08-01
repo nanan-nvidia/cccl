@@ -17,8 +17,6 @@ namespace rbk_kernels = CUB_NS_QUALIFIER::detail::reduce_by_key::lookahead;
 using CountStateT = rbk_kernels::CountStateT;
 template <class ValueT, class OffT>
 using TileValueRecordT = rbk_kernels::TileValueRecordT<ValueT, OffT>;
-template <class ValueT, class OffT, class ReductionOpT>
-using TileValueRecordForOpT = rbk_kernels::TileValueRecordForOpT<ValueT, OffT, ReductionOpT>;
 template <class OffT>
 using TilePrefixT = rbk_kernels::PrefixT<OffT>;
 
@@ -100,8 +98,7 @@ inline cudaError_t persistent_rbk_encode(
   cudaStream_t stream       = 0,
   ReductionOpT reduction_op = {})
 {
-  constexpr bool kIsPlus = ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>;
-  using RecordT          = TileValueRecordForOpT<ValueT, OffT, ReductionOpT>;
+  using RecordT = TileValueRecordT<ValueT, OffT>;
   // size query must cover BOTH paths (the same allocation may serve either across calls)
   size_t cub_bytes = 0;
   cub::DeviceReduce::ReduceByKey(
@@ -199,8 +196,7 @@ inline cudaError_t persistent_rbk_encode(
   // smem is values + flags per block.
   constexpr size_t kValBlockSmem =
     (size_t) Config::kTileSize * sizeof(ValueT) + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned);
-  // the generic-op body uses plain global loads: no staging, no dyn smem
-  const bool vals_staged = kIsPlus && (((size_t) d_values & 15) == 0) && (size_t) smem_optin >= kValBlockSmem;
+  const bool vals_staged = (((size_t) d_values & 15) == 0) && (size_t) smem_optin >= kValBlockSmem;
   auto* vkernel =
     rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT, ReductionOpT>;
   error = cudaFuncSetAttribute(vkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kValBlockSmem);
