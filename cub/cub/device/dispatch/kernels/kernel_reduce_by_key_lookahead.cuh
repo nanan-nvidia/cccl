@@ -637,9 +637,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   // in); the e >= 1 step keeps the receipted two-ternary branchless body EXACTLY (an e == 0
   // check inside the step degenerated the predicated store: ncu receipt +44M instructions on
   // the emission line alone)
-  // RUNNING output pointer: out[heads_seen - 1] indexing made ptxas rematerialize the base from
-  // the const bank per emission at the 40-reg cap (ncu: 7 inst/emission incl. @P LDC.64) -- the
-  // running pointer is one predicated store + one predicated pointer bump
+  // RUNNING output pointer (A/B receipt: the r78 indexed form remats the base 62x from the
+  // const bank under today's pressure; the running pointer keeps the region at 925 SASS with
+  // zero LDC)
   ValueT* run_out = out;
   auto step       = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
     const bool head      = (my_word >> e) & 1u;
