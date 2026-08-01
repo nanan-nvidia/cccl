@@ -23,6 +23,20 @@
 #endif
 using KeyT   = K_KEY_T;
 using ValueT = K_VALUE_T;
+#ifdef K_OP_MIN
+struct BenchOp
+{
+  template <class T>
+  __host__ __device__ T operator()(T a, T b) const
+  {
+    return b < a ? b : a;
+  }
+};
+#  define K_OP_NAME "_min"
+#else
+using BenchOp = cuda::std::plus<>;
+#  define K_OP_NAME ""
+#endif
 
 namespace
 {
@@ -106,7 +120,7 @@ Bufs setup(long long n, int max_seg)
   cudaMalloc(&b.du, sizeof(KeyT) * (size_t) n);
   cudaMalloc(&b.da, sizeof(ValueT) * (size_t) n);
   cudaMalloc(&b.dn, sizeof(Bufs::NumRunsT));
-  rbk_impl::persistent_rbk_encode<config_t>(nullptr, b.tempb, b.dk, b.dv, b.du, b.da, b.dn, (int) n);
+  rbk_impl::persistent_rbk_encode<config_t>(nullptr, b.tempb, b.dk, b.dv, b.du, b.da, b.dn, (int) n, 0, BenchOp{});
   cudaMalloc(&b.dtemp, b.tempb);
   cudaMemset(b.dtemp, 0xAB, b.tempb);
   cudaMemcpy(b.dk, h.data(), sizeof(KeyT) * (size_t) n, cudaMemcpyHostToDevice);
@@ -114,7 +128,7 @@ Bufs setup(long long n, int max_seg)
 
   Bufs::NumRunsT got = 0;
   cudaMemset(b.dn, 0xEE, sizeof(Bufs::NumRunsT));
-  rbk_impl::persistent_rbk_encode<config_t>(b.dtemp, b.tempb, b.dk, b.dv, b.du, b.da, b.dn, (int) n);
+  rbk_impl::persistent_rbk_encode<config_t>(b.dtemp, b.tempb, b.dk, b.dv, b.du, b.da, b.dn, (int) n, 0, BenchOp{});
   cudaDeviceSynchronize();
   cudaMemcpy(&got, b.dn, sizeof(got), cudaMemcpyDeviceToHost);
   if ((long long) got != cpuR)
@@ -156,7 +170,7 @@ static void persistent_rbk_bench(nvbench::state& state)
   add_counters(state, b);
   state.exec(nvbench::exec_tag::no_batch, [&](nvbench::launch& launch) {
     rbk_impl::persistent_rbk_encode<config_t>(
-      b.dtemp, b.tempb, b.dk, b.dv, b.du, b.da, b.dn, (int) n, launch.get_stream());
+      b.dtemp, b.tempb, b.dk, b.dv, b.du, b.da, b.dn, (int) n, launch.get_stream(), BenchOp{});
   });
   teardown(b);
 }
@@ -169,22 +183,21 @@ static void cub_rbk_bench(nvbench::state& state)
   add_counters(state, b);
   void* tmp   = nullptr;
   size_t tbsz = 0;
-  cub::DeviceReduce::ReduceByKey(tmp, tbsz, b.dk, b.du, b.dv, b.da, b.dn, cuda::std::plus<>{}, (int) n);
+  cub::DeviceReduce::ReduceByKey(tmp, tbsz, b.dk, b.du, b.dv, b.da, b.dn, BenchOp{}, (int) n);
   cudaMalloc(&tmp, tbsz);
   state.exec(nvbench::exec_tag::no_batch, [&](nvbench::launch& launch) {
-    cub::DeviceReduce::ReduceByKey(
-      tmp, tbsz, b.dk, b.du, b.dv, b.da, b.dn, cuda::std::plus<>{}, (int) n, launch.get_stream());
+    cub::DeviceReduce::ReduceByKey(tmp, tbsz, b.dk, b.du, b.dv, b.da, b.dn, BenchOp{}, (int) n, launch.get_stream());
   });
   cudaFree(tmp);
   teardown(b);
 }
 
 NVBENCH_BENCH(persistent_rbk_bench)
-  .set_name("persistent_rbk_i32k_f32v")
+  .set_name("persistent_rbk_i32k_f32v" K_OP_NAME)
   .add_int64_power_of_two_axis("Elements{io}", {28})
   .add_int64_power_of_two_axis("MaxSegSize", {0, 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20});
 NVBENCH_BENCH(cub_rbk_bench)
-  .set_name("cub_DeviceReduce_ReduceByKey_i32k_f32v")
+  .set_name("cub_DeviceReduce_ReduceByKey_i32k_f32v" K_OP_NAME)
   .add_int64_power_of_two_axis("Elements{io}", {28})
   .add_int64_power_of_two_axis("MaxSegSize", {0, 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20});
 NVBENCH_MAIN;
