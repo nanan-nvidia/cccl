@@ -958,12 +958,13 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
   ReductionOpT op,
   ValueT& tail_out)
 {
-  const int my_popc = __popc(my_word);
-  typename WarpScan<int>::TempStorage warp_scan_storage;
-  int word_scan;
-  WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
-  const int my_runs_before_word = word_scan - my_popc;
-  const unsigned upto_l         = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1); // bits [0, lane]
+  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1); // bits [0, lane]
+  // ROW-LEVEL output pointer (replaces the entry WarpScan + a per-element SHFL+IADD of
+  // runs-before-word, and confines any base rematerialization to once per ROW): the row's
+  // emission slots are row_out[popc(w & upto_l) - 1]; rank -1 legally reaches the previous
+  // row's last slot (a run closing across the row boundary)
+  ValueT* row_out     = d_aggregates + global_runs_before_warp_tile;
+  int runs_before_row = 0; // scalar: gates the entering-run skip (global run_idx < 0)
   // CHUNKED preload: 8 rows in flight instead of the whole warp tile -- the full-tile buffer put
   // the kernel at 32+ live registers/lane and SPILLED TO LOCAL under high occupancy (B200
   // receipt: VEmit 16us/warp-tile of local-memory thrash). The scan carry crosses chunks freely.
@@ -1060,11 +1061,14 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
       const unsigned next_word = __shfl_sync(full_mask, my_word, (iter + 1) & 31);
       const bool is_end        = (lane_id < 31) ? (((w >> (lane_id + 1)) & 1u) != 0u)
                                                 : ((iter + 1 < items_per_thread) && ((next_word & 1u) != 0u));
-      const int run_idx        = __shfl_sync(full_mask, my_runs_before_word, iter) + __popc(w & upto_l) - 1;
-      if (is_end && run_idx >= 0)
+      const int rank_in_row    = __popc(w & upto_l) - 1;
+      if (is_end && runs_before_row + rank_in_row >= 0)
       {
-        d_aggregates[global_runs_before_warp_tile + run_idx] = incl;
+        row_out[rank_in_row] = incl;
       }
+      const int row_runs = __popc(w);
+      row_out += row_runs;
+      runs_before_row += row_runs;
       carry     = shfl_sync_wide(incl, 31);
       carry_has = full_tile ? 1 : __shfl_sync(full_mask, has, 31);
     }
@@ -1449,8 +1453,15 @@ struct HeadFlagDecodeT
 // bases) and the last tile's partial warp tiles. Row stream at every density -- keeping these
 // bands inline doubled the kernel body and wrecked the hot path's unroll budgets (receipt:
 // r78 5.9k -> 16.4k SASS = ~+10% on every dense/mid cell)
+template <class ValueT>
+struct WarpTileSumsT
+{
+  ValueT lead;
+  ValueT tail;
+};
+
 template <int items_per_thread, class ValueT, class OffT, class ReductionOpT>
-_CCCL_DEVICE_API __noinline__ void emit_warp_tile_cold(
+_CCCL_DEVICE_API __noinline__ WarpTileSumsT<ValueT> emit_warp_tile_cold(
   ValueT* __restrict__ d_aggregates,
   const ValueT* __restrict__ tile_vals,
   unsigned my_word,
@@ -1460,22 +1471,23 @@ _CCCL_DEVICE_API __noinline__ void emit_warp_tile_cold(
   int wt_end,
   int tile_len,
   int lane_id,
-  ReductionOpT op,
-  ValueT& lead_out,
-  ValueT& tail_out)
+  ReductionOpT op)
 {
+  // returned BY VALUE: reference out-params made the hot caller's wt_lead/wt_tail address-taken
+  // (stack slots + spills around every band)
+  WarpTileSumsT<ValueT> r{};
   if (warp_tile_run_count == 0)
   {
-    lead_out = warp_span_fold(tile_vals, warp_tile_offset, wt_end, lane_id, op);
-    tail_out = lead_out;
-    return;
+    r.lead = warp_span_fold(tile_vals, warp_tile_offset, wt_end, lane_id, op);
+    r.tail = r.lead;
+    return r;
   }
   stream_values_from_flags<items_per_thread, false>(
-    d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, op, tail_out);
+    d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, op, r.tail);
   const HeadFlagDecodeT dec(my_word, lane_id);
   const RunSpanT first_run = dec.decode_run(0);
-  lead_out =
-    warp_span_fold(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id, op);
+  r.lead = warp_span_fold(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id, op);
+  return r;
 }
 
 template <int window_size_cap, class PolicySelector, class OffT>
@@ -2263,7 +2275,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       if (!from_smem || !full_wt)
       {
         // cold: unstaged tiles (misaligned bases) and the last tile's partial warp tiles
-        emit_warp_tile_cold<items_per_thread>(
+        const WarpTileSumsT<ValueT> cold_sums = emit_warp_tile_cold<items_per_thread>(
           d_aggregates,
           tile_vals,
           my_word,
@@ -2273,9 +2285,9 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
           wt_end,
           tile_len,
           lane_id,
-          reduction_op,
-          wt_lead,
-          wt_tail);
+          reduction_op);
+        wt_lead = cold_sums.lead;
+        wt_tail = cold_sums.tail;
       }
       else if (warp_tile_run_count == 0)
       {
