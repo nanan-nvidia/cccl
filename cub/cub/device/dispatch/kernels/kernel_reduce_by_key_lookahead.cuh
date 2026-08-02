@@ -17,6 +17,7 @@
 #include <cub/device/dispatch/tuning/tuning_rle_encode.cuh>
 #include <cub/util_arch.cuh>
 #include <cub/util_macro.cuh>
+#include <cub/warp/warp_reduce.cuh>
 #include <cub/warp/warp_scan.cuh>
 
 #include <cuda/atomic>
@@ -1334,33 +1335,23 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT
 warp_span_fold(const ValueT* tile_vals, int begin, int end, int lane_id, ReductionOpT op)
 {
   const int len     = end - begin;
-  const int chunk   = (len > 0) ? (((len + 31) / 32) | 1) : 1;
+  const int chunk   = (len > 0) ? (((len + 31) / 32) | 1) : 1; // ODD stride: conflict-free lane walks
   const int lo      = begin + lane_id * chunk;
   const int hi      = min(lo + chunk, end);
   const int n_valid = (len > 0) ? ((len + chunk - 1) / chunk) : 0; // nonempty chunks are a PREFIX
   ValueT acc{};
   if (lo < hi)
   {
-    acc = tile_vals[lo]; // the first element seeds: the interior loop is a bare op
+    acc = tile_vals[lo]; // the first element seeds: no identity element exists for a general op
     for (int pos = lo + 1; pos < hi; ++pos)
     {
       acc = op(acc, tile_vals[pos]);
     }
   }
-  // CUB WarpReduceShfl shape: ASCENDING offsets (lane i covers the contiguous chunks
-  // [i, i + 2^k) after step k) with a COUNT predicate -- valid lanes are a contiguous prefix,
-  // so no validity flags ride the tree (a descending tree combines non-adjacent covers and
-  // requires commutativity)
-#  pragma unroll
-  for (int offset = 1; offset < 32; offset <<= 1)
-  {
-    const ValueT from_right = shfl_down_sync_wide(acc, offset);
-    if (lane_id + offset < n_valid)
-    {
-      acc = op(acc, from_right);
-    }
-  }
-  return shfl_sync_wide(acc, 0); // garbage on an empty span -- the caller derives has structurally
+  // cub::WarpReduce: ascending shfl_down tree over the first n_valid lanes, associativity-only
+  // (order-preserving; lane-ascending = element-ascending). Result is valid on lane 0.
+  typename WarpReduce<ValueT>::TempStorage storage;
+  return WarpReduce<ValueT>(storage).Reduce(acc, op, n_valid);
 }
 
 struct RunSpanT
@@ -2433,27 +2424,17 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         const int last_headed  = any_head ? (31 - __clz(nonempty_warp_tiles_mask)) : 0;
         const int first_headed = any_head ? (__ffs(nonempty_warp_tiles_mask) - 1) : compute_warps;
         // element-holding warp tiles are a PREFIX (trailing wts past tile_len are empty), so
-        // both folds are contiguous smem ranges: lane i takes the i-th element and the trees
-        // ride a count predicate (CUB WarpReduceShfl shape), no validity flags
+        // both folds are contiguous smem ranges: lane i takes the i-th element; cub::WarpReduce
+        // handles the valid prefix (order-preserving ascending tree, result on lane 0)
         const int n_wt_nonempty = min(compute_warps, (tile_len - 1) / warp_tile_size + 1);
         const int n_open        = n_wt_nonempty - last_headed; // >= 1 on a live tile
         const int n_lead        = min(first_headed, n_wt_nonempty);
-        ValueT open_agg         = (lane_id < n_open) ? wt_tails[last_headed + lane_id] : ValueT{};
-        ValueT lead_agg         = (lane_id < n_lead) ? wt_tails[lane_id] : ValueT{};
-#  pragma unroll
-        for (int offset = 1; offset < 32; offset <<= 1)
-        {
-          const ValueT open_r = shfl_down_sync_wide(open_agg, offset);
-          const ValueT lead_r = shfl_down_sync_wide(lead_agg, offset);
-          if (lane_id + offset < n_open)
-          {
-            open_agg = reduction_op(open_agg, open_r);
-          }
-          if (lane_id + offset < n_lead)
-          {
-            lead_agg = reduction_op(lead_agg, lead_r);
-          }
-        }
+        typename WarpReduce<ValueT>::TempStorage fold_storage;
+        ValueT open_agg =
+          WarpReduce<ValueT>(fold_storage)
+            .Reduce((lane_id < n_open) ? wt_tails[last_headed + lane_id] : ValueT{}, reduction_op, n_open);
+        ValueT lead_agg = WarpReduce<ValueT>(fold_storage)
+                            .Reduce((lane_id < n_lead) ? wt_tails[lane_id] : ValueT{}, reduction_op, n_lead);
         if (lane_id == 0)
         {
           int lead_has = n_lead > 0;
@@ -2841,17 +2822,10 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadCleanupKernel(
     // (CUB WarpReduceShfl shape).
     const int n_valid = min(32, warp_global - base);
     const int t       = base + lane_id;
-    ValueT part       = (lane_id < n_valid) ? value_records[t].open_agg : ValueT{};
-#  pragma unroll
-    for (int offset = 1; offset < 32; offset <<= 1)
-    {
-      const ValueT r = shfl_down_sync_wide(part, offset);
-      if (lane_id + offset < n_valid)
-      {
-        part = reduction_op(part, r);
-      }
-    }
-    part  = shfl_sync_wide(part, 0);
+    typename WarpReduce<ValueT>::TempStorage storage;
+    const ValueT part = WarpReduce<ValueT>(storage).Reduce(
+      (lane_id < n_valid) ? value_records[t].open_agg : ValueT{}, reduction_op, n_valid);
+    // part is valid on lane 0 only; so is carry -- lane 0 does the final store
     carry = (base == from) ? part : reduction_op(carry, part); // the window is never empty
   }
   if (lane_id == 0)

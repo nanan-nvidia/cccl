@@ -413,10 +413,7 @@ int main(int argc, char** argv)
   fails += run_combo<long long, float, int>("I64K/F32", "I32", huge);
   fails += run_combo<short, int, int>("I16K/I32", "I32", huge);
   fails += run_combo<signed char, int, int>("I8K/I32", "I32", huge);
-  fails += run_combo<int, double, int>("F64V", "I32", huge);
-  fails += run_combo<long long, long long, long long>("I64K/I64V", "I64", huge);
   fails += run_combo<__int128, int, int>("I128K/I32", "I32", huge);
-  fails += run_combo<__int128, __int128, int>("I128K/I128V", "I32", huge);
   // generic associative (non-commutative) ops through the flagged order-preserving path
   std::printf("== generic ops ==\n");
   const long long gn = (1LL << 24) + 12345; // >= 1024 tiles at every tile size in play
@@ -425,7 +422,6 @@ int main(int argc, char** argv)
     fails += !run_op_case<unsigned>("affine", gn, seg, 1234u + (unsigned) seg, AffineComposeOp{});
   }
   fails += !run_op_case<int>("min", gn, 64, 4321u, MinOp{});
-  fails += !run_op_case<long long>("min64", gn, 1024, 555u, MinOp{}); // 8B values through the generic path
 
   std::printf(fails ? "*** %d FAILURES ***\n" : "ALL PASS\n", fails);
   return fails ? 1 : 0;

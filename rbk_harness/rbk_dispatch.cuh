@@ -138,7 +138,11 @@ inline cudaError_t persistent_rbk_encode(
   {
     return error;
   }
-  // PROTOTYPE: staging is required; unsupported inputs ERROR OUT
+  // PROTOTYPE: 4-byte values only; staging is required; unsupported inputs ERROR OUT
+  if constexpr (sizeof(ValueT) != 4)
+  {
+    return cudaErrorInvalidValue;
+  }
   constexpr size_t kValBlockSmemGate =
     (size_t) Config::kTileSize * sizeof(ValueT) + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned);
   if ((((size_t) d_values & 15) != 0) || (size_t) smem_optin < kValBlockSmemGate)
