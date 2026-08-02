@@ -138,6 +138,13 @@ inline cudaError_t persistent_rbk_encode(
   {
     return error;
   }
+  // PROTOTYPE: staging is required; unsupported inputs ERROR OUT
+  constexpr size_t kValBlockSmemGate =
+    (size_t) Config::kTileSize * sizeof(ValueT) + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned);
+  if ((((size_t) d_values & 15) != 0) || (size_t) smem_optin < kValBlockSmemGate)
+  {
+    return cudaErrorInvalidValue;
+  }
   if (tiles < kStockDispatchTiles || tiles > 0x7fffffff || cc_major < 10 || (size_t) smem_optin < Config::kDynSmem)
   {
     return cub::DeviceReduce::ReduceByKey(
@@ -196,7 +203,6 @@ inline cudaError_t persistent_rbk_encode(
   // smem is values + flags per block.
   constexpr size_t kValBlockSmem =
     (size_t) Config::kTileSize * sizeof(ValueT) + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned);
-  const bool vals_staged = (((size_t) d_values & 15) == 0) && (size_t) smem_optin >= kValBlockSmem;
   auto* vkernel =
     rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT, ReductionOpT>;
   error = cudaFuncSetAttribute(vkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kValBlockSmem);
@@ -204,8 +210,8 @@ inline cudaError_t persistent_rbk_encode(
   {
     return error;
   }
-  vkernel<<<(int) tiles, Config::kNumCompWarps * 32, vals_staged ? kValBlockSmem : 0, stream>>>(
-    d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles, vals_staged, reduction_op);
+  vkernel<<<(int) tiles, Config::kNumCompWarps * 32, kValBlockSmem, stream>>>(
+    d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles, reduction_op);
   error = cudaPeekAtLastError();
   if (error != cudaSuccess)
   {

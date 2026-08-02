@@ -373,12 +373,13 @@ static int run_combo(const char* v_name, const char* off_name, bool huge)
       fails += run_case<T, ValueT, OffsetT>(c.n, c.max_seg, seed) ? 0 : 1;
     }
   }
-  // misaligned bases (element offsets off the 16B boundary), keys/values skewed independently
+  // misaligned KEY bases (element offsets off the 16B boundary); misaligned VALUES are
+  // unsupported in the prototype (dispatch errors out)
   struct OffCase
   {
     int koff, voff;
   };
-  for (const OffCase& o : {OffCase{1, 0}, OffCase{0, 3}, OffCase{3, 1}})
+  for (const OffCase& o : {OffCase{1, 0}, OffCase{3, 0}})
   {
     fails += run_case<T, ValueT, OffsetT>(3 * kTileSize + 7, 1, 1u, false, o.koff, o.voff) ? 0 : 1;
     fails += run_case<T, ValueT, OffsetT>((1 << 20) + 12345, 2, 42u, false, o.koff, o.voff) ? 0 : 1;
@@ -423,7 +424,6 @@ int main(int argc, char** argv)
   {
     fails += !run_op_case<unsigned>("affine", gn, seg, 1234u + (unsigned) seg, AffineComposeOp{});
   }
-  fails += !run_op_case<unsigned>("affine", gn, 4, 77u, AffineComposeOp{}, /*voff=*/1);
   fails += !run_op_case<int>("min", gn, 64, 4321u, MinOp{});
   fails += !run_op_case<long long>("min64", gn, 1024, 555u, MinOp{}); // 8B values through the generic path
 

@@ -1454,42 +1454,6 @@ struct HeadFlagDecodeT
 // bases) and the last tile's partial warp tiles. Row stream at every density -- keeping these
 // bands inline doubled the kernel body and wrecked the hot path's unroll budgets (receipt:
 // r78 5.9k -> 16.4k SASS = ~+10% on every dense/mid cell)
-template <class ValueT>
-struct WarpTileSumsT
-{
-  ValueT lead;
-  ValueT tail;
-};
-
-template <int items_per_thread, class ValueT, class OffT, class ReductionOpT>
-_CCCL_DEVICE_API __noinline__ WarpTileSumsT<ValueT> emit_warp_tile_cold(
-  ValueT* __restrict__ d_aggregates,
-  const ValueT* __restrict__ tile_vals,
-  unsigned my_word,
-  int warp_tile_run_count,
-  OffT global_runs_before_warp_tile,
-  int warp_tile_offset,
-  int wt_end,
-  int tile_len,
-  int lane_id,
-  ReductionOpT op)
-{
-  // returned BY VALUE: reference out-params made the hot caller's wt_lead/wt_tail address-taken
-  // (stack slots + spills around every band)
-  WarpTileSumsT<ValueT> r{};
-  if (warp_tile_run_count == 0)
-  {
-    r.lead = warp_span_fold(tile_vals, warp_tile_offset, wt_end, lane_id, op);
-    r.tail = r.lead;
-    return r;
-  }
-  stream_values_from_flags<items_per_thread, false>(
-    d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, tile_len, lane_id, op, r.tail);
-  const HeadFlagDecodeT dec(my_word, lane_id);
-  const RunSpanT first_run = dec.decode_run(0);
-  r.lead = warp_span_fold(tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id, op);
-  return r;
-}
 
 template <int window_size_cap, class PolicySelector, class OffT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void poll_fold_windows(
@@ -2152,7 +2116,6 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     TileValueRecordT<ValueT, OffT>* __restrict__ value_records,
     OffT num_items,
     int num_tiles,
-    bool vals_staged,
     ReductionOpT reduction_op = {})
 {
   {
@@ -2195,12 +2158,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     const int stage_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
     if (threadIdx.x == 0)
     {
-      if (vals_staged)
       {
         ptx::mbarrier_init(&staged_bar, 1);
         ptx::fence_proxy_async(ptx::space_shared);
       }
-      if (vals_staged && stage_run_threshold == 0)
+      if (stage_run_threshold == 0)
       {
         // always-stage shape: the TMA IS the fetch; issue it NOW so setup rides under the flight
         const unsigned vbytes = (unsigned) ((size_t) stage_len * sizeof(ValueT));
@@ -2385,7 +2347,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     // TILE-level hot gate, provably warp-uniform (kernel param + blockIdx-derived): a cold CALL
     // inside the band branch chain broke ptxas' convergence proof and dual-compiled every
     // collective band (WARPSYNC/ENDCOLLECTIVE safe copies = the +30% executed-instruction tax)
-    if (vals_staged && tile_len == tile_size && tile_total_runs >= stage_run_threshold)
+    if (tile_len == tile_size && tile_total_runs >= stage_run_threshold)
     {
       if (stage_run_threshold > 0 && threadIdx.x == 0)
       {
@@ -2415,20 +2377,31 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     else
     {
-      // cold tiles (misaligned bases; the last partial tile): whole tile through the outlined path
-      const WarpTileSumsT<ValueT> cold_sums = emit_warp_tile_cold<items_per_thread>(
-        d_aggregates,
-        d_values + (size_t) tile_id * tile_size,
-        my_word,
-        warp_tile_run_count,
-        global_runs_before_warp_tile,
-        warp_tile_offset,
-        wt_end,
-        tile_len,
-        lane_id,
-        reduction_op);
-      wt_lead = cold_sums.lead;
-      wt_tail = cold_sums.tail;
+      // the LAST (short) tile, still STAGED (the ignore-oob TMA clamps the copy): row stream at
+      // every density with tile_len validity, from smem. Block-uniform branch: no dual-compile.
+      wait_parity(&staged_bar, 0);
+      if (warp_tile_run_count == 0)
+      {
+        wt_lead = warp_span_fold(staged_vals, warp_tile_offset, wt_end, lane_id, reduction_op);
+        wt_tail = wt_lead;
+      }
+      else
+      {
+        stream_values_from_flags<items_per_thread, false>(
+          d_aggregates,
+          staged_vals,
+          my_word,
+          global_runs_before_warp_tile,
+          warp_tile_offset,
+          tile_len,
+          lane_id,
+          reduction_op,
+          wt_tail);
+        const HeadFlagDecodeT dec(my_word, lane_id);
+        const RunSpanT first_run = dec.decode_run(0);
+        wt_lead                  = warp_span_fold(
+          staged_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id, reduction_op);
+      }
     }
     if (lane_id == 0)
     {
