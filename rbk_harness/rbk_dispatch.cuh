@@ -111,9 +111,9 @@ inline cudaError_t persistent_rbk_encode(
     return (b + 15) & ~(size_t) 15;
   };
 #ifdef K_FUSED
-  const size_t pers_bytes = align16((size_t) q_tiles * sizeof(FusedStateT))
-                          + align16((size_t) q_tiles * sizeof(RecordT))
-                          + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>));
+  const size_t pers_bytes =
+    align16((size_t) q_tiles * sizeof(FusedStateT)) + align16((size_t) q_tiles * sizeof(RecordT))
+    + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>));
 #else
   const size_t pers_bytes =
     align16((size_t) q_tiles * sizeof(CountStateT)) + align16((size_t) q_tiles * sizeof(RecordT))
@@ -182,9 +182,13 @@ inline cudaError_t persistent_rbk_encode(
   const int init_blocks = (int) ((tiles + 255) / 256);
   rbk_init_states<<<init_blocks, 256, 0, stream>>>(fused_states, tiles);
   constexpr int kPadElems = 16 / (int) sizeof(KeyT);
-  constexpr size_t kFusedSmem =
-    ((((size_t) (Config::kTileSize + kPadElems) * sizeof(KeyT)) + 15) & ~(size_t) 15)
-    + (size_t) Config::kTileSize * sizeof(ValueT);
+  (void) kPadElems;
+#  ifdef RBK_FUSED_KEYS_GLOBAL
+  constexpr size_t kFusedSmem = (size_t) Config::kTileSize * sizeof(ValueT);
+#  else
+  constexpr size_t kFusedSmem = ((((size_t) (Config::kTileSize + kPadElems) * sizeof(KeyT)) + 15) & ~(size_t) 15)
+                              + (size_t) Config::kTileSize * sizeof(ValueT);
+#  endif
   if ((size_t) smem_optin < kFusedSmem)
   {
     return cudaErrorInvalidValue;

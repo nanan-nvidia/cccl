@@ -2904,8 +2904,14 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
 #  else
   constexpr int stream_threshold = warp_tile_size / 4;
 #  endif
-  constexpr int pad_elems     = 16 / (int) sizeof(KeyT); // 16B head pad: the tile-boundary predecessor
+  constexpr int pad_elems = 16 / (int) sizeof(KeyT); // 16B head pad: the tile-boundary predecessor
+#  ifdef RBK_FUSED_KEYS_GLOBAL
+  // occupancy variant: keys are read from GLOBAL (once, streaming; L1 pairs the i/i-1 reads).
+  // smem holds only the values tile -> ~33KB/block -> 6 blocks/SM (48 warps vs 24 staged-keys).
+  constexpr size_t keys_bytes = 0;
+#  else
   constexpr size_t keys_bytes = (((size_t) (tile_size + pad_elems) * sizeof(KeyT)) + 15) & ~(size_t) 15;
+#  endif
   extern __shared__ char fused_smem_raw[];
   KeyT* const staged_keys   = (KeyT*) fused_smem_raw;
   ValueT* const staged_vals = (ValueT*) (fused_smem_raw + keys_bytes);
@@ -2921,11 +2927,15 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
 
   const int tile_id  = (int) blockIdx.x;
   const int tile_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
+#  ifdef RBK_FUSED_KEYS_GLOBAL
+  const KeyT* const keys_tile = d_keys + (size_t) tile_id * tile_size;
+#  endif
   if (threadIdx.x == 0)
   {
     ptx::mbarrier_init(&keys_bar, 1);
     ptx::mbarrier_init(&vals_bar, 1);
     ptx::fence_proxy_async(ptx::space_shared);
+#  ifndef RBK_FUSED_KEYS_GLOBAL
     // keys with a 16B head pad holding the tile-boundary predecessor. Tile 0 has no
     // predecessor: it stages at dst+16 from an in-bounds source (its pad is uninitialized
     // smem; is_global_first forces the head at loc 0) -- a negative global src is NOT a
@@ -2953,6 +2963,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
         kspan - kb,
         &keys_bar);
     }
+#  endif // !RBK_FUSED_KEYS_GLOBAL
 #  ifdef RBK_FUSED_NOVALS
     ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &vals_bar, 0);
 #  else
@@ -2977,7 +2988,9 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
 #  ifdef RBK_FUSED_WAITSWAP
   wait_parity(&vals_bar, 0); // discriminator: is the staleness tied to the FIRST wait?
 #  endif
+#  ifndef RBK_FUSED_KEYS_GLOBAL
   wait_parity(&keys_bar, 0);
+#  endif
 #  ifdef RBK_FUSED_DELAY
   __nanosleep(4000); // experiment: does the first flag read go stale because the wait
                      // completes before the data (tx accounting) or because of ordering?
@@ -3003,11 +3016,18 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
   for (int iter = 0; iter < items_per_thread; ++iter)
   {
     const int loc             = wt * warp_tile_size + iter * 32 + lane_id;
-    const KeyT key            = staged_keys[pad_elems + loc];
-    const KeyT pred           = staged_keys[pad_elems + loc - 1];
     const int is_global_first = (tile_id == 0 && loc == 0);
-    const int head            = (loc < tile_len) ? (is_global_first ? 1 : !(key == pred)) : 0;
-    const unsigned flags      = __ballot_sync(full_mask, head);
+#  ifdef RBK_FUSED_KEYS_GLOBAL
+    const int in_bounds = loc < tile_len;
+    const KeyT key      = in_bounds ? keys_tile[loc] : KeyT{};
+    const KeyT pred     = (in_bounds && !is_global_first) ? keys_tile[loc - 1] : KeyT{};
+    const int head      = in_bounds ? (is_global_first ? 1 : !(key == pred)) : 0;
+#  else
+    const KeyT key  = staged_keys[pad_elems + loc];
+    const KeyT pred = staged_keys[pad_elems + loc - 1];
+    const int head  = (loc < tile_len) ? (is_global_first ? 1 : !(key == pred)) : 0;
+#  endif
+    const unsigned flags = __ballot_sync(full_mask, head);
 #  ifdef RBK_FUSED_DEBUG
     if (iter == 0 && tile_id == 1 && wt == 0)
     {
@@ -3148,7 +3168,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
       if ((w >> lane_id) & 1u)
       {
         d_unique[global_runs_before_warp_tile + rbw + __popc(w & below)] =
+#  ifdef RBK_FUSED_KEYS_GLOBAL
+          keys_tile[warp_tile_offset + iter * 32 + lane_id];
+#  else
           staged_keys[pad_elems + warp_tile_offset + iter * 32 + lane_id];
+#  endif
       }
     }
   }
