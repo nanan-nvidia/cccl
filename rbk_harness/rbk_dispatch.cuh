@@ -15,6 +15,7 @@ namespace rbk_impl
 namespace rbk_kernels = CUB_NS_QUALIFIER::detail::reduce_by_key::lookahead;
 
 using CountStateT = rbk_kernels::CountStateT;
+using FusedStateT = rbk_kernels::FusedStateT;
 template <class ValueT, class OffT>
 using TileValueRecordT = rbk_kernels::TileValueRecordT<ValueT, OffT>;
 template <class OffT>
@@ -109,10 +110,16 @@ inline cudaError_t persistent_rbk_encode(
   const auto align16 = [](size_t b) {
     return (b + 15) & ~(size_t) 15;
   };
+#ifdef K_FUSED
+  const size_t pers_bytes = align16((size_t) q_tiles * sizeof(FusedStateT))
+                          + align16((size_t) q_tiles * sizeof(RecordT))
+                          + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>));
+#else
   const size_t pers_bytes =
     align16((size_t) q_tiles * sizeof(CountStateT)) + align16((size_t) q_tiles * sizeof(RecordT))
     + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>))
     + align16((size_t) q_tiles * (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned));
+#endif
   const size_t required = cuda::std::max(cub_bytes, pers_bytes);
   if (d_temp_storage == nullptr)
   {
@@ -163,6 +170,54 @@ inline cudaError_t persistent_rbk_encode(
       num_items,
       stream);
   }
+#ifdef K_FUSED
+  // FUSED SINGLE PASS: one block-per-tile kernel, head flags never leave the SM; temp = O(tiles)
+  if ((((size_t) d_keys & 15) != 0)) // 16B head-pad TMA needs an aligned keys base (prototype)
+  {
+    return cudaErrorInvalidValue;
+  }
+  auto* fused_states    = (FusedStateT*) d_temp_storage;
+  auto* value_records   = (RecordT*) ((char*) fused_states + align16(tiles * sizeof(FusedStateT)));
+  auto* tile_prefixes   = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
+  const int init_blocks = (int) ((tiles + 255) / 256);
+  rbk_init_states<<<init_blocks, 256, 0, stream>>>(fused_states, tiles);
+  constexpr int kPadElems = 16 / (int) sizeof(KeyT);
+  constexpr size_t kFusedSmem =
+    ((((size_t) (Config::kTileSize + kPadElems) * sizeof(KeyT)) + 15) & ~(size_t) 15)
+    + (size_t) Config::kTileSize * sizeof(ValueT);
+  if ((size_t) smem_optin < kFusedSmem)
+  {
+    return cudaErrorInvalidValue;
+  }
+  auto* fkernel =
+    rbk_kernels::DeviceReduceByKeyFusedKernel<typename Config::Selector, KeyT, ValueT, NumRunsT, OffT, ReductionOpT>;
+  error = cudaFuncSetAttribute(fkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kFusedSmem);
+  if (error != cudaSuccess)
+  {
+    return error;
+  }
+  fkernel<<<(int) tiles, Config::kNumCompWarps * 32, kFusedSmem, stream>>>(
+    d_keys,
+    d_values,
+    d_unique,
+    d_aggregates,
+    d_num_runs,
+    fused_states,
+    tile_prefixes,
+    value_records,
+    num_items,
+    (int) tiles,
+    reduction_op);
+  error = cudaPeekAtLastError();
+  if (error != cudaSuccess)
+  {
+    return error;
+  }
+  const int cleanup_blocks = (int) ((tiles * 32 + 255) / 256);
+  rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<ValueT, OffT, ReductionOpT>
+    <<<cleanup_blocks, 256, 0, stream>>>(d_aggregates, value_records, (int) tiles, reduction_op);
+  return cudaPeekAtLastError();
+#else
   auto* count_states    = (CountStateT*) d_temp_storage;
   auto* value_records   = (RecordT*) ((char*) count_states + align16(tiles * sizeof(CountStateT)));
   auto* tile_prefixes   = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
@@ -226,5 +281,6 @@ inline cudaError_t persistent_rbk_encode(
   rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<ValueT, OffT, ReductionOpT>
     <<<cleanup_blocks, 256, 0, stream>>>(d_aggregates, value_records, (int) tiles, reduction_op);
   return cudaPeekAtLastError();
+#endif // K_FUSED
 }
 } // namespace rbk_impl
