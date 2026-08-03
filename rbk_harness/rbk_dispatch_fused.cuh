@@ -31,7 +31,7 @@ inline cudaError_t persistent_rbk_encode(
   cudaStream_t stream       = 0,
   ReductionOpT reduction_op = {})
 {
-  using RecordT = TileValueRecordT<ValueT, OffT>;
+  using RecordT = rbk_kernels::FusedValueRecordT<ValueT, OffT>;
   // size query must cover BOTH paths (the same allocation may serve either across calls)
   size_t cub_bytes = 0;
   cub::DeviceReduce::ReduceByKey(
@@ -142,7 +142,7 @@ inline cudaError_t persistent_rbk_encode(
     return error;
   }
   const int cleanup_blocks = (int) ((tiles * 32 + 255) / 256);
-  rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<ValueT, OffT, ReductionOpT>
+  rbk_kernels::DeviceReduceByKeyFusedCleanupKernel<ValueT, OffT, ReductionOpT>
     <<<cleanup_blocks, 256, 0, stream>>>(d_aggregates, value_records, (int) tiles, reduction_op);
   return cudaPeekAtLastError();
 }

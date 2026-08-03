@@ -57,8 +57,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void wait_parity(::cuda::std::uint64_t* bar, 
   }
 }
 
-// stages is a runtime value now (we pick the ring depths at launch). now a runtime divide is super expensive
-// and costs ~3-6% BWUtil, so now we have to maintain a "cursor" that is far more cheaper.
 struct RingCursorT
 {
   int slot        = 0;
@@ -74,11 +72,6 @@ struct RingCursorT
   }
 };
 
-// DISAGGREGATED TILE STATES (the reduce-by-key design): the COUNT state is published by the
-// compute warps at flag-fold ("publish as soon as possible" -- no value dependency), and paces
-// the poll/prefix/store chain. The VALUE state is published by the value warps whenever their
-// reduction lands, and is read LAZILY by the boundary closer only on tiles that actually close
-// an entering run. Nothing ever folds the value chain eagerly.
 constexpr unsigned tile_published = 1u;
 
 struct CountStateT
@@ -101,17 +94,13 @@ struct CountStateT
   }
 };
 
-// per-tile VALUE RECORD, written with plain stores by the value warps and read ONLY by the
-// cleanup kernel after the main kernel completes (the kernel boundary is the synchronization --
-// no tags, no atomics, no cross-tile value reads during the run)
-template <class ValueT, class OffT>
+// per-tile VALUE RECORD, written with plain stores by the value warps
+// and read by the cleanup kernel after the main kernel completes
+template <class ValueT>
 struct TileValueRecordT
 {
   ValueT open_agg; // sum after the tile's last head (whole-tile sum when head-free)
   ValueT lead_agg; // sum before the tile's first head (whole-tile sum when head-free)
-  OffT boundary_dst; // output index of the entering-run close this tile owes, or -1
-  int boundary_from; // the last headed tile before this one (the close's window start)
-  int lead_has; // 0 when the lead span is empty (a general associative op has no identity)
 };
 
 template <class StateT>
@@ -121,7 +110,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void publish_state(StateT* state_arr, int til
   a.store(st.dword, ::cuda::memory_order_relaxed);
 }
 
-// return the state (even if not yet published for this launch, caller checks it); no spinning here
 template <class StateT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE StateT load_state(StateT* state_arr, int tile_idx)
 {
@@ -129,9 +117,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE StateT load_state(StateT* state_arr, int tile
   return {a.load(::cuda::memory_order_relaxed)};
 }
 
-// CRITICAL: from choose_signed_offset, it is guaranteed that OffT covers the whole index space.
-// The second field carries the id of the last tile (before this one) known to contain a run
-// head: the boundary closer uses it to read the lazy value-state window without any poll help.
 template <class OffT, bool = (sizeof(OffT) > 4)>
 struct PrefixT;
 
@@ -2060,7 +2045,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     ValueT* __restrict__ d_aggregates,
     const unsigned* __restrict__ d_flag_words,
     const PrefixT<OffT>* __restrict__ d_tile_prefix,
-    TileValueRecordT<ValueT, OffT>* __restrict__ value_records,
+    TileValueRecordT<ValueT>* __restrict__ value_records,
     OffT num_items,
     int num_tiles,
     ReductionOpT reduction_op = {})
@@ -2392,13 +2377,9 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
             lead_agg = lead_has ? reduction_op(lead_agg, wt_leads[first_headed]) : wt_leads[first_headed];
             lead_has = 1;
           }
-          TileValueRecordT<ValueT, OffT> rec;
-          rec.open_agg = open_agg; // never empty on a live tile: it always contains its last head
-          rec.lead_agg = lead_agg;
-          rec.lead_has = lead_has;
-          rec.boundary_dst =
-            (curr_prefix_run_count > 0 && (any_head || is_last_tile)) ? (OffT) (curr_prefix_run_count - 1) : (OffT) -1;
-          rec.boundary_from      = d_tile_prefix[tile_id].last_tile_with_runs();
+          TileValueRecordT<ValueT> rec;
+          rec.open_agg           = open_agg; // never empty on a live tile: it always contains its last head
+          rec.lead_agg           = lead_agg;
           value_records[tile_id] = rec;
         }
       }
@@ -2459,7 +2440,7 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
   ValueT* __restrict__ d_aggregates,
   const unsigned* __restrict__ d_flag_words,
   const PrefixT<OffT>* __restrict__ d_tile_prefix,
-  TileValueRecordT<ValueT, OffT>* __restrict__ value_records,
+  TileValueRecordT<ValueT>* __restrict__ value_records,
   OffT num_items,
   int num_tiles,
   int val_ring_stages)
@@ -2680,13 +2661,9 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
               }
               if (lane_id == 0)
               {
-                TileValueRecordT<ValueT, OffT> rec;
+                TileValueRecordT<ValueT> rec;
                 rec.open_agg           = open_agg;
                 rec.lead_agg           = lead_agg;
-                rec.boundary_dst       = (curr_prefix_run_count > 0 && (any_head || is_last_tile))
-                                         ? (OffT) (curr_prefix_run_count - 1)
-                                         : (OffT) -1;
-                rec.boundary_from      = d_tile_prefix[tile_id].last_tile_with_runs();
                 value_records[tile_id] = rec;
               }
             }
@@ -2735,9 +2712,19 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
 // kernel (the launch boundary synchronizes), reads plain records, writes each cross-tile run's
 // aggregate = open(from) + whole-sums of the head-free tiles between + lead(this). Every window
 // is disjoint, sums fold in fixed order (deterministic), total work is O(num_tiles) amortized.
+// The record holds only the two value sums; the bookkeeping is derived here: a tile owes a
+// close iff runs exist before it AND it closes them (own head, or input end); the destination
+// is the entering run's rank; the window start is the prefix's last-tile-with-runs; the lead
+// span is empty iff the tile's first element is a head (flag word 0, bit 0).
 template <class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
 _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadCleanupKernel(
-  ValueT* d_aggregates, TileValueRecordT<ValueT, OffT>* value_records, int num_tiles, ReductionOpT reduction_op = {})
+  ValueT* d_aggregates,
+  const TileValueRecordT<ValueT>* value_records,
+  const PrefixT<OffT>* d_tile_prefix,
+  const unsigned* d_flag_words,
+  int flag_words_per_tile,
+  int num_tiles,
+  ReductionOpT reduction_op = {})
 {
   const int warp_global = (int) ((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
   const int lane_id     = (int) (threadIdx.x & 31);
@@ -2745,12 +2732,18 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadCleanupKernel(
   {
     return;
   }
-  const auto rec = value_records[warp_global];
-  if (rec.boundary_dst < 0)
+  const OffT runs_before = d_tile_prefix[warp_global].run_count();
+  if (runs_before == 0) // no entering run (covers tile 0)
   {
     return;
   }
-  const int from = (rec.boundary_from >= 0) ? rec.boundary_from : 0;
+  const bool is_last_tile = warp_global == num_tiles - 1;
+  if (!is_last_tile && d_tile_prefix[warp_global + 1].run_count() == runs_before)
+  {
+    return; // head-free middle tile: the run passes through, a later tile closes it
+  }
+  const int last_runs_tile = d_tile_prefix[warp_global].last_tile_with_runs();
+  const int from           = (last_runs_tile >= 0) ? last_runs_tile : 0;
   ValueT carry{};
   for (int base = from; base < warp_global; base += 32)
   {
@@ -2768,7 +2761,8 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadCleanupKernel(
   }
   if (lane_id == 0)
   {
-    d_aggregates[rec.boundary_dst] = rec.lead_has ? reduction_op(carry, rec.lead_agg) : carry;
+    const int lead_has            = !(d_flag_words[(size_t) warp_global * flag_words_per_tile] & 1u);
+    d_aggregates[runs_before - 1] = lead_has ? reduction_op(carry, value_records[warp_global].lead_agg) : carry;
   }
 }
 

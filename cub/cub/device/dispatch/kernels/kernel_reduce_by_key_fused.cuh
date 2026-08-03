@@ -44,8 +44,54 @@ struct FusedStateT
   }
 };
 
+// the fused prototype has no flag words in global memory, so its record carries the cleanup
+// bookkeeping that the two-pass cleanup derives from PrefixT + flag words
+template <class ValueT, class OffT>
+struct FusedValueRecordT
+{
+  ValueT open_agg; // sum after the tile's last head (whole-tile sum when head-free)
+  ValueT lead_agg; // sum before the tile's first head (whole-tile sum when head-free)
+  OffT boundary_dst; // output index of the entering-run close this tile owes, or -1
+  int boundary_from; // the last headed tile before this one (the close's window start)
+  int lead_has; // 0 when the lead span is empty (a general associative op has no identity)
+};
+
+// fused-path boundary cleanup: one warp per tile that owes an entering-run close; reads the
+// self-contained records only
+template <class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
+_CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyFusedCleanupKernel(
+  ValueT* d_aggregates, FusedValueRecordT<ValueT, OffT>* value_records, int num_tiles, ReductionOpT reduction_op = {})
+{
+  const int warp_global = (int) ((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+  const int lane_id     = (int) (threadIdx.x & 31);
+  if (warp_global >= num_tiles)
+  {
+    return;
+  }
+  const auto rec = value_records[warp_global];
+  if (rec.boundary_dst < 0)
+  {
+    return;
+  }
+  const int from = (rec.boundary_from >= 0) ? rec.boundary_from : 0;
+  ValueT carry{};
+  for (int base = from; base < warp_global; base += 32)
+  {
+    const int n_valid = min(32, warp_global - base);
+    const int t       = base + lane_id;
+    typename WarpReduce<ValueT>::TempStorage storage;
+    const ValueT part = WarpReduce<ValueT>(storage).Reduce(
+      (lane_id < n_valid) ? value_records[t].open_agg : ValueT{}, reduction_op, n_valid);
+    carry = (base == from) ? part : reduction_op(carry, part); // the window is never empty
+  }
+  if (lane_id == 0)
+  {
+    d_aggregates[rec.boundary_dst] = rec.lead_has ? reduction_op(carry, rec.lead_agg) : carry;
+  }
+}
+
 // ===== FUSED SINGLE PASS: keys + values in one block-per-tile kernel; head flags never leave
-// the SM (temp storage = O(tiles): FusedStateT + PrefixT + TileValueRecordT). Design doc:
+// the SM (temp storage = O(tiles): FusedStateT + PrefixT + FusedValueRecordT). Design doc:
 // ~/.claude/plans/rbk-fused-single-pass.md =====
 template <typename PolicySelector,
           class KeyT,
@@ -62,7 +108,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
     NumRunsT* __restrict__ d_num_runs,
     FusedStateT* fused_states,
     PrefixT<OffT>* d_tile_prefix,
-    TileValueRecordT<ValueT, OffT>* __restrict__ value_records,
+    FusedValueRecordT<ValueT, OffT>* __restrict__ value_records,
     OffT num_items,
     int num_tiles,
     ReductionOpT reduction_op = {})
@@ -543,7 +589,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
           lead_agg = lead_has ? reduction_op(lead_agg, wt_leads[first_headed]) : wt_leads[first_headed];
           lead_has = 1;
         }
-        TileValueRecordT<ValueT, OffT> rec;
+        FusedValueRecordT<ValueT, OffT> rec;
         rec.open_agg = open_agg; // never empty on a live tile: it always contains its last head
         rec.lead_agg = lead_agg;
         rec.lead_has = lead_has;

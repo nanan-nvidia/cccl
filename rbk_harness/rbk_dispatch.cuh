@@ -18,8 +18,8 @@ namespace rbk_impl
 namespace rbk_kernels = CUB_NS_QUALIFIER::detail::reduce_by_key::lookahead;
 
 using CountStateT = rbk_kernels::CountStateT;
-template <class ValueT, class OffT>
-using TileValueRecordT = rbk_kernels::TileValueRecordT<ValueT, OffT>;
+template <class ValueT>
+using TileValueRecordT = rbk_kernels::TileValueRecordT<ValueT>;
 template <class OffT>
 using TilePrefixT = rbk_kernels::PrefixT<OffT>;
 
@@ -92,7 +92,7 @@ inline cudaError_t persistent_rbk_encode(
   cudaStream_t stream       = 0,
   ReductionOpT reduction_op = {})
 {
-  using RecordT = TileValueRecordT<ValueT, OffT>;
+  using RecordT = TileValueRecordT<ValueT>;
   // size query must cover BOTH paths (the same allocation may serve either across calls)
   size_t cub_bytes = 0;
   cub::DeviceReduce::ReduceByKey(
@@ -218,8 +218,8 @@ inline cudaError_t persistent_rbk_encode(
   }
   // PASS 3: boundary cleanup (one warp per tile with a pending cross-tile close)
   const int cleanup_blocks = (int) ((tiles * 32 + 255) / 256);
-  rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<ValueT, OffT, ReductionOpT>
-    <<<cleanup_blocks, 256, 0, stream>>>(d_aggregates, value_records, (int) tiles, reduction_op);
+  rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<ValueT, OffT, ReductionOpT><<<cleanup_blocks, 256, 0, stream>>>(
+    d_aggregates, value_records, tile_prefixes, flag_words, Config::kNumCompWarps * 32, (int) tiles, reduction_op);
   return cudaPeekAtLastError();
 }
 #endif // K_FUSED
