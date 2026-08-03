@@ -2945,6 +2945,9 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
            kspan - kb,
            &keys_bar);
        }
+#  ifdef RBK_FUSED_NOVALS
+       ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &vals_bar, 0);
+#  else
        const unsigned vb    = (unsigned) ((size_t) tile_len * sizeof(ValueT));
        const unsigned vspan = (vb + 15u) & ~15u;
        ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &vals_bar, vspan);
@@ -2957,20 +2960,58 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
          0u,
          vspan - vb,
          &vals_bar);
+#  endif
      } __syncthreads();
 
      const int wt      = (int) (threadIdx.x >> 5);
      const int lane_id = (int) (threadIdx.x & 31);
+#  ifdef RBK_FUSED_WAITSWAP
+     wait_parity(&vals_bar, 0); // discriminator: is the staleness tied to the FIRST wait?
+#  endif
      wait_parity(&keys_bar, 0);
 #  ifdef RBK_FUSED_DELAY
      __nanosleep(4000); // experiment: does the first flag read go stale because the wait
                         // completes before the data (tx accounting) or because of ordering?
 #  endif
+#  ifdef RBK_FUSED_FENCE
+     __threadfence_block(); // experiment: ordering (async-proxy visibility), not timing
+#  endif
 #  ifdef RBK_FUSED_STOP1
      return; // gate: after keys TMA wait
 #  endif
-     const unsigned my_word =
-       compute_head_flags<items_per_thread, false>(staged_keys, wt * warp_tile_size, tile_len, tile_id, lane_id, pad_elems);
+#  ifdef RBK_FUSED_DEBUG
+     if (tile_id == 1 && wt == 0)
+     {
+       d_aggregates[96 + lane_id] = (ValueT) staged_keys[pad_elems + lane_id]; // FIRST reads
+     }
+#  endif
+     // buffer-predecessor flag pass (the RLE reference form): pred = key_buf[idx-1], legal via
+     // the staged 16B head pad. The shuffle-carry form MISCOMPILES here (nvcc 13.5/sm_120a:
+     // first inlined copy drops the iter-0 compare chain feeding the first ballot -- receipts
+     // in ~/.claude/plans/rbk-fused-single-pass.md)
+     unsigned my_word = 0;
+#  pragma unroll
+     for (int iter = 0; iter < items_per_thread; ++iter)
+     {
+       const int loc             = wt * warp_tile_size + iter * 32 + lane_id;
+       const KeyT key            = staged_keys[pad_elems + loc];
+       const KeyT pred           = staged_keys[pad_elems + loc - 1];
+       const int is_global_first = (tile_id == 0 && loc == 0);
+       const int head            = (loc < tile_len) ? (is_global_first ? 1 : !(key == pred)) : 0;
+       const unsigned flags      = __ballot_sync(full_mask, head);
+#  ifdef RBK_FUSED_DEBUG
+       if (iter == 0 && tile_id == 1 && wt == 0)
+       {
+         d_aggregates[160 + lane_id] = (ValueT) head;  // per-lane head at iter 0
+         d_aggregates[192 + lane_id] = (ValueT) flags; // ballot result at iter 0
+         d_aggregates[224 + lane_id] = (ValueT) key;   // the loop's OWN key read
+       }
+#  endif
+       if (lane_id == iter)
+       {
+         my_word = flags;
+       }
+     }
 #  ifdef RBK_FUSED_DEBUG
      if (tile_id == 1 && wt == 0)
      {
