@@ -14,6 +14,7 @@
 #endif // no system header
 
 #include <cub/detail/warpspeed/squad/squad.cuh>
+#include <cub/device/dispatch/kernels/kernel_rle_encode_lookahead.cuh>
 #include <cub/device/dispatch/tuning/tuning_rle_encode.cuh>
 #include <cub/util_arch.cuh>
 #include <cub/util_macro.cuh>
@@ -35,6 +36,17 @@ namespace detail::reduce_by_key::lookahead
 // requires PTX ISA 9.2 (CUDA 13.2): the load warp uses the cp.async.bulk .ignore_oob qualifier
 namespace ptx = ::cuda::ptx;
 
+// shared warpspeed machinery comes from the RLE lookahead kernel this one is derived from;
+// only the RBK-specific pieces are defined below
+using rle::encode::load_tile_keys;
+using rle::encode::nth_set_bit;
+using rle::encode::RingCursorT;
+using rle::encode::RunSpanT;
+using rle::encode::scan_warp_tile_run_counts;
+using rle::encode::swizzle_xor_stride32;
+using rle::encode::wait_parity;
+using rle::encode::WarpTileRunScanT;
+
 _CCCL_HOST_DEVICE_API constexpr int num_total_threads(const RleLookaheadPolicy& policy)
 {
   // keys-only pass: load + compute + poll + key stores (values run in their own kernel)
@@ -42,35 +54,7 @@ _CCCL_HOST_DEVICE_API constexpr int num_total_threads(const RleLookaheadPolicy& 
   return num_total_warps * 32;
 }
 
-// This is important for position staging on dense cases (16 way bank conflicts).
-_CCCL_DEVICE_API _CCCL_FORCEINLINE int swizzle_xor_stride32(int x)
-{
-  return x ^ (x >> 5);
-}
-
 constexpr unsigned full_mask = 0xffffffffu;
-
-_CCCL_DEVICE_API _CCCL_FORCEINLINE void wait_parity(::cuda::std::uint64_t* bar, unsigned parity)
-{
-  while (!ptx::mbarrier_try_wait_parity(bar, parity))
-  {
-  }
-}
-
-struct RingCursorT
-{
-  int slot        = 0;
-  unsigned parity = 0;
-
-  _CCCL_DEVICE_API _CCCL_FORCEINLINE void advance(int stages)
-  {
-    if (++slot == stages)
-    {
-      slot = 0;
-      parity ^= 1u;
-    }
-  }
-};
 
 constexpr unsigned tile_published = 1u;
 
@@ -162,107 +146,6 @@ struct alignas(16) PrefixT<OffT, true>
     return (int) (unsigned) packed_last_tile_with_runs;
   }
 };
-
-// position of the n-th set bit of flag_mask, requires popc(flag_mask) > rank. Implementation is binary search.
-// __fns(flag_mask, 0, rank+1) computes the same thing but has NO hardware op on sm_100a and is slower
-// TODO (Nan): as per discussion with Federico, this could be in libcudacxx
-_CCCL_DEVICE_API _CCCL_FORCEINLINE int nth_set_bit(unsigned flag_mask, int rank)
-{
-  // each step: if the wanted bit is not among the low half's set bits, skip that half entirely
-  int bit_position         = 0;
-  int set_bits_in_low_half = __popc(flag_mask & 0xffffu);
-  if (rank >= set_bits_in_low_half)
-  {
-    rank -= set_bits_in_low_half;
-    bit_position += 16;
-    flag_mask >>= 16;
-  }
-  set_bits_in_low_half = __popc(flag_mask & 0xffu);
-  if (rank >= set_bits_in_low_half)
-  {
-    rank -= set_bits_in_low_half;
-    bit_position += 8;
-    flag_mask >>= 8;
-  }
-  set_bits_in_low_half = __popc(flag_mask & 0xfu);
-  if (rank >= set_bits_in_low_half)
-  {
-    rank -= set_bits_in_low_half;
-    bit_position += 4;
-    flag_mask >>= 4;
-  }
-  set_bits_in_low_half = __popc(flag_mask & 0x3u);
-  if (rank >= set_bits_in_low_half)
-  {
-    rank -= set_bits_in_low_half;
-    bit_position += 2;
-    flag_mask >>= 2;
-  }
-  if (rank >= (int) (flag_mask & 1u))
-  {
-    bit_position += 1;
-  }
-  return bit_position;
-}
-
-struct WarpTileRunScanT
-{
-  int lane_run_count;
-  int lane_runs_before;
-};
-
-// we need this because STORE and BOOKKEEPER both recalculate from slot_warp_run_counts
-template <int compute_warps>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE WarpTileRunScanT
-scan_warp_tile_run_counts(const int* slot_warp_run_counts, int lane_id)
-{
-  const int lane_run_count = (lane_id < compute_warps) ? slot_warp_run_counts[lane_id] : 0;
-  typename WarpScan<int>::TempStorage warp_scan_storage;
-  int lane_scan;
-  WarpScan<int>(warp_scan_storage).InclusiveSum(lane_run_count, lane_scan);
-  return {lane_run_count, lane_scan - lane_run_count};
-}
-
-template <int tile_size, int slot_pad, class KeyT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE void load_tile_keys(
-  KeyT* slot,
-  const KeyT* d_keys,
-  int tile_id,
-  int tile_len,
-  bool first_tile,
-  bool last_tile,
-  unsigned base_skip,
-  ::cuda::std::uint64_t* full_bar,
-  int lane_id,
-  bool keys_staged)
-{
-  if (lane_id == 0)
-  {
-    if (!keys_staged)
-    {
-      // vvv regressed case: no TMA; full now only mrans  "tile_id_buf[slot] is valid" vvv
-      ptx::mbarrier_arrive(full_bar);
-      // ^^^ regressed case ^^^
-    }
-    else
-    {
-      // if it is not first tile, we overcopy 16B to the left to get last key from last tile
-      const unsigned nbytes     = (unsigned) (((size_t) tile_len + (first_tile ? 0 : slot_pad)) * sizeof(KeyT));
-      const unsigned span_bytes = (nbytes + base_skip + 15u) & ~15u;
-      ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, full_bar, span_bytes);
-      ptx::cp_async_bulk_ignore_oob(
-        ptx::space_shared,
-        ptx::space_global,
-        slot + (first_tile ? slot_pad : 0),
-        (const KeyT*) ((const char*) (d_keys + (size_t) tile_id * tile_size - (first_tile ? 0 : slot_pad)) - base_skip),
-        span_bytes,
-        first_tile ? base_skip : 0u,
-        last_tile ? (span_bytes - base_skip - nbytes) : 0u,
-        full_bar);
-    }
-  }
-  __syncwarp();
-}
 
 // values loader: plain ignore_oob TMA of the tile's values into the ring slot -- no pad, no
 // skip (values have no predecessor semantics); the last tile ZERO-FILLS past tile_len, so the
@@ -1310,12 +1193,6 @@ warp_span_fold(const ValueT* tile_vals, int begin, int end, int lane_id, Reducti
   typename WarpReduce<ValueT>::TempStorage storage;
   return WarpReduce<ValueT>(storage).Reduce(acc, op, n_valid);
 }
-
-struct RunSpanT
-{
-  int head_pos_in_warp_tile;
-  int next_head_pos;
-};
 
 // the compute warp may deem this warp tile too sparse to be worth the position-staging, and in that case it will write
 // only the 32 head-flag words. Then, it is up to the store warps to "decode" the positions from the headflags.
