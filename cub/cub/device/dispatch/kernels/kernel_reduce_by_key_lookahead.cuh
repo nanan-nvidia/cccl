@@ -3131,27 +3131,25 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
   }
   return;
 #  endif
-  // unique keys straight from staged smem -- ZERO-collective form: per-lane word counts go
-  // through smem scratch, each lane serially stores its own word's runs (bug hunt: every
-  // collective-using block misbehaves in this kernel; this removes the variable)
+  // unique keys straight from staged smem, row-major (coalesced ascending slots per row).
+  // LAW (the bug-3 receipt): warp collectives NEVER go inside divergent branches -- the rank
+  // shuffle runs unconditionally on all lanes; only the store is predicated.
   {
-    __shared__ int word_counts[compute_warps][33];
-    word_counts[wt][lane_id] = __popc(my_word);
-    __syncwarp();
-    int before = 0;
-    for (int l = 0; l < 32; ++l)
+    const int my_popc = __popc(my_word);
+    typename WarpScan<int>::TempStorage kws;
+    int word_scan;
+    WarpScan<int>(kws).InclusiveSum(my_popc, word_scan);
+    const int my_runs_before_word = word_scan - my_popc;
+    const unsigned below          = (1u << lane_id) - 1u;
+    for (int iter = 0; iter < items_per_thread; ++iter)
     {
-      before += (l < lane_id) ? word_counts[wt][l] : 0;
-    }
-    unsigned w = my_word;
-    int k      = 0;
-    while (w != 0u)
-    {
-      const int c = __ffs(w) - 1;
-      w &= w - 1u;
-      d_unique[global_runs_before_warp_tile + before + k] =
-        staged_keys[pad_elems + warp_tile_offset + lane_id * 32 + c];
-      ++k;
+      const unsigned w = __shfl_sync(full_mask, my_word, iter);
+      const int rbw    = __shfl_sync(full_mask, my_runs_before_word, iter); // ALL lanes: converged
+      if ((w >> lane_id) & 1u)
+      {
+        d_unique[global_runs_before_warp_tile + rbw + __popc(w & below)] =
+          staged_keys[pad_elems + warp_tile_offset + iter * 32 + lane_id];
+      }
     }
   }
 
