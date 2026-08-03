@@ -28,39 +28,11 @@
 #include <cuda/std/limits>
 #include <cuda/std/type_traits>
 
-#if defined(IKET_BUILD_ENABLED)
-#  include <iket/iket_device_apis.cuh>
-#  define RBK_IK_RANGE(n)  CREATE_IKET_START_END_RANGE_EX(n, uint32_t, iket::IketEventPairMode::kNameOnly)
-#  define RBK_IK_BEG(n, v) IKET_RANGE_START_EX(n, (uint32_t) (v))
-#  define RBK_IK_END(n, v) IKET_RANGE_END_EX(n, (uint32_t) (v))
-#else
-#  define RBK_IK_RANGE(n)
-#  define RBK_IK_BEG(n, v)
-#  define RBK_IK_END(n, v)
-#endif
-
-RBK_IK_RANGE(LoadWaitEmpty);
-RBK_IK_RANGE(LoadIssue);
-RBK_IK_RANGE(CompWaitFull);
-RBK_IK_RANGE(CompFlag);
-RBK_IK_RANGE(CompPublish);
-RBK_IK_RANGE(KWaitComputed);
-RBK_IK_RANGE(KWaitPrefixed);
-RBK_IK_RANGE(KWaitStaged);
-RBK_IK_RANGE(KDrain);
-RBK_IK_RANGE(VSetup);
-RBK_IK_RANGE(VEmit);
-RBK_IK_RANGE(VWaitFull);
-RBK_IK_RANGE(VStageWait);
-RBK_IK_RANGE(VBoundary);
-
 CUB_NAMESPACE_BEGIN
 
 namespace detail::reduce_by_key::lookahead
 {
-// the kernel (and everything it needs) only exists from PTX ISA 9.2 (CUDA 13.2): the load warp requires the
-// cp.async.bulk .ignore_oob qualifier. Below that, the dispatch layer compiles the lookahead path out entirely.
-#if __cccl_ptx_isa >= 920
+// requires PTX ISA 9.2 (CUDA 13.2): the load warp uses the cp.async.bulk .ignore_oob qualifier
 namespace ptx = ::cuda::ptx;
 
 _CCCL_HOST_DEVICE_API constexpr int num_total_threads(const RleLookaheadPolicy& policy)
@@ -375,7 +347,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_sync_wide(T v, int src_lane)
       ::cuda::std::uint64_t h[sizeof(T) / 8];
     };
     auto hv = ::cuda::std::bit_cast<Halves>(v);
-#  pragma unroll
+#pragma unroll
     for (int i = 0; i < (int) (sizeof(T) / 8); ++i)
     {
       hv.h[i] = __shfl_sync(full_mask, hv.h[i], src_lane);
@@ -398,7 +370,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_up_sync_wide(T v, unsigned delta)
       ::cuda::std::uint64_t h[sizeof(T) / 8];
     };
     auto hv = ::cuda::std::bit_cast<Halves>(v);
-#  pragma unroll
+#pragma unroll
     for (int i = 0; i < (int) (sizeof(T) / 8); ++i)
     {
       hv.h[i] = __shfl_up_sync(full_mask, hv.h[i], delta);
@@ -421,7 +393,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_down_sync_wide(T v, unsigned delta)
       ::cuda::std::uint64_t h[sizeof(T) / 8];
     };
     auto hv = ::cuda::std::bit_cast<Halves>(v);
-#  pragma unroll
+#pragma unroll
     for (int i = 0; i < (int) (sizeof(T) / 8); ++i)
     {
       hv.h[i] = __shfl_down_sync(full_mask, hv.h[i], delta);
@@ -444,7 +416,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_xor_sync_wide(T v, int mask)
       ::cuda::std::uint64_t h[sizeof(T) / 8];
     };
     auto hv = ::cuda::std::bit_cast<Halves>(v);
-#  pragma unroll
+#pragma unroll
     for (int i = 0; i < (int) (sizeof(T) / 8); ++i)
     {
       hv.h[i] = __shfl_xor_sync(full_mask, hv.h[i], mask);
@@ -465,7 +437,7 @@ compute_head_flags(const KeyT* key_buf, int warp_tile_offset, int tile_len, int 
   {
     // no __shfl_sync overload for 16B keys: the predecessor is a second buffer read (the RLE
     // encode lookahead reference form)
-#  pragma unroll
+#pragma unroll
     for (int iter = 0; iter < items_per_thread; ++iter)
     {
       const int loc = warp_tile_offset + iter * 32 + lane_id;
@@ -501,7 +473,7 @@ compute_head_flags(const KeyT* key_buf, int warp_tile_offset, int tile_len, int 
       first_pred_idx = max(first_pred_idx, 0);
     }
     KeyT row_carry = key_buf[first_pred_idx];
-#  pragma unroll
+#pragma unroll
     for (int iter = 0; iter < items_per_thread; ++iter)
     {
       const int loc = warp_tile_offset + iter * 32 + lane_id;
@@ -612,7 +584,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   // addressing + bit tests): rotate row r's eight 16B quads by (r & 7). Eight LDS.128/STS.128
   // pairs replace 32 scalar pairs; the walk then loads four elements per LDS.128 at quad index
   // (c + lane) & 7 -- 4-phase bank-optimal both ways.
-#  pragma unroll
+#pragma unroll
   for (int rr = 0; rr < 8; ++rr)
   {
     const int row = rr * 4 + (lane_id >> 3); // 4 rows per iteration, 8 lanes each
@@ -668,7 +640,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
     ValueT v[4];
     *(uint4*) v = *(const uint4*) (my_row + ((lane_id & 7) << 2));
     seed(v[0]);
-#  pragma unroll
+#pragma unroll
     for (int c = 0; c < 8; ++c)
     {
       ValueT vn[4];
@@ -676,12 +648,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
       {
         *(uint4*) vn = *(const uint4*) (my_row + (((c + 1 + lane_id) & 7) << 2));
       }
-#  pragma unroll
+#pragma unroll
       for (int j = (c == 0) ? 1 : 0; j < 4; ++j)
       {
         step(4 * c + j, v[j]);
       }
-#  pragma unroll
+#pragma unroll
       for (int j = 0; j < 4; ++j)
       {
         v[j] = vn[j];
@@ -693,7 +665,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   const unsigned bmask  = __ballot_sync(full_mask, has_head);
   const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
   ValueT sseg           = t;
-#  pragma unroll
+#pragma unroll
   for (int off = 1; off < 32; off <<= 1)
   {
     const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
@@ -746,13 +718,13 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void scan_lookup_from_flags(
   const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
   // ---- pass A: independent local row scans, in place; row totals collect one per lane ----
   ValueT my_row_total = ValueT{};
-#  pragma unroll
+#pragma unroll
   for (int r = 0; r < items_per_thread; ++r)
   {
     const unsigned w = __shfl_sync(full_mask, my_word, r);
     const int loc    = warp_tile_offset + r * 32 + lane_id;
     ValueT incl      = smem_vals[loc];
-#  pragma unroll
+#pragma unroll
     for (int off = 1; off < 32; off <<= 1)
     {
       const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
@@ -773,7 +745,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void scan_lookup_from_flags(
   const bool row_has_head = (my_word != 0);
   const unsigned rmask    = __ballot_sync(full_mask, row_has_head);
   ValueT rs               = my_row_total;
-#  pragma unroll
+#pragma unroll
   for (int off = 1; off < 32; off <<= 1)
   {
     const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
@@ -886,12 +858,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_from_flags(
   };
   if (valid == 32 && sizeof(ValueT) == 4 && (((size_t) chunk & 15) == 0))
   {
-#  pragma unroll
+#pragma unroll
     for (int c = 0; c < 8; ++c)
     {
       ValueT v4[4];
       *(uint4*) v4 = *(const uint4*) (chunk + 4 * c);
-#  pragma unroll
+#pragma unroll
       for (int j = 0; j < 4; ++j)
       {
         step(4 * c + j, v4[j]);
@@ -911,7 +883,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_from_flags(
   const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
   ValueT s              = t;
   int s_has             = valid > 0; // trailing lanes past wt_end hold no elements
-#  pragma unroll
+#pragma unroll
   for (int off = 1; off < 32; off <<= 1)
   {
     const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
@@ -976,7 +948,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
   for (int chunk = 0; chunk < items_per_thread; chunk += chunk_rows)
   {
     ValueT row_vals[chunk_rows];
-#  pragma unroll
+#pragma unroll
     for (int cr = 0; cr < chunk_rows; ++cr)
     {
       const int iter = chunk + cr;
@@ -990,7 +962,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
         row_vals[cr] = (iter < items_per_thread && loc < tile_len) ? tile_vals[loc] : ValueT{};
       }
     }
-#  pragma unroll
+#pragma unroll
     for (int cr = 0; cr < chunk_rows; ++cr)
     {
       const int iter = chunk + cr;
@@ -1013,7 +985,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
       // cost seg4, the fixed scan cost seg1/2 -- each form won different cells). Every path is
       // unrolled; running extra steps is always mask-safe, so the branch only affects speed.
       auto scan_steps = [&](int first_off, int last_off) _CCCL_FORCEINLINE_LAMBDA {
-#  pragma unroll
+#pragma unroll
         for (int off = 1; off < 32; off <<= 1)
         {
           if (off >= first_off && off <= last_off)
@@ -1098,7 +1070,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
   ValueT* const out = d_aggregates + global_runs_before_warp_tile;
   ValueT carry{}; // sum since the last head seen so far (exact, left-to-right)
   int word_base = 0; // heads in words before the current 128-element block (uniform)
-#  pragma unroll
+#pragma unroll
   for (int it = 0; it < items_per_thread / 4; ++it)
   {
     const unsigned w0   = __shfl_sync(full_mask, my_word, 4 * it);
@@ -1119,7 +1091,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
     ValueT pfx{};
     ValueT ssh{};
     int hs = 0;
-#  pragma unroll
+#pragma unroll
     for (int j = 0; j < 4; ++j)
     {
       const bool head      = (nib >> j) & 1u;
@@ -1143,7 +1115,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
     const int q_dist              = (q_at_or_before != 0u) ? (lane_id - (31 - __clz(q_at_or_before))) : (lane_id + 1);
     const int q_max               = __reduce_max_sync(full_mask, q_dist);
     auto quad_scan_steps          = [&](int first_off, int last_off) _CCCL_FORCEINLINE_LAMBDA {
-#  pragma unroll
+#pragma unroll
       for (int off = 1; off < 32; off <<= 1)
       {
         if (off >= first_off && off <= last_off)
@@ -1221,7 +1193,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
                                                                    // emission LDC rematerialization
   ValueT carry{}; // sum since the last head seen so far (exact, left-to-right)
   int word_base = 0; // heads in words before the current double-row (uniform)
-#  pragma unroll 4
+#pragma unroll 4
   for (int it = 0; it < items_per_thread / 2; ++it)
   {
     const unsigned w0 = __shfl_sync(full_mask, my_word, 2 * it);
@@ -1250,7 +1222,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
     const int p_dist              = (p_at_or_before != 0u) ? (lane_id - (31 - __clz(p_at_or_before))) : (lane_id + 1);
     const int p_max               = __reduce_max_sync(full_mask, p_dist);
     auto pair_scan_steps          = [&](int first_off, int last_off) _CCCL_FORCEINLINE_LAMBDA {
-#  pragma unroll
+#pragma unroll
       for (int off = 1; off < 32; off <<= 1)
       {
         if (off >= first_off && off <= last_off)
@@ -1389,7 +1361,7 @@ struct HeadFlagDecodeT
     // empty should be +infinity, since we use min
     lane_first_head_from_word = lane_word_run_count ? (lane_id * 32 + __ffs(lane_head_flag_word) - 1) : 0x7fffffff;
     // if not, we loop to find the next head in flag word [i, 32). this is just a fold with min
-#  pragma unroll
+#pragma unroll
     for (int offset = 1; offset < 32; offset <<= 1)
     {
       const int shuffled_first_head = __shfl_down_sync(full_mask, lane_first_head_from_word, offset);
@@ -1406,7 +1378,7 @@ struct HeadFlagDecodeT
     // the word containing run_dex is then the largest i with runs_before(i) that is <= j
     // we do binary search over the distributed lane_runs_before_word table held across the warp
     int flag_word_idx = 0;
-#  pragma unroll
+#pragma unroll
     for (int step = 16; step; step >>= 1)
     {
       // propose candidate
@@ -1472,7 +1444,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void poll_fold_windows(
     do
     {
       ready = true;
-#  pragma unroll
+#pragma unroll
       for (int i = 0; i < poll_loads_per_lane; ++i)
       {
         // we only try if that state is not published
@@ -1488,7 +1460,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void poll_fold_windows(
     } while (__ballot_sync(full_mask, !ready) != 0u);
     int lane_run_count = 0, lane_last_tile_with_runs_in_window = -1;
     // now, we fold the window
-#  pragma unroll
+#pragma unroll
     for (int i = 0; i < poll_loads_per_lane; ++i)
     {
       if (i < lane_tile_count)
@@ -1598,12 +1570,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   using PrefixT                = reduce_by_key::lookahead::PrefixT<OffT>;
   // the dense band's fused-stream crossover (runs per warp tile); below it, per-run span walks
   // are output-proportional and cheaper
-#  ifdef RBK_STREAM_DIV
+#ifdef RBK_STREAM_DIV
   constexpr int stream_threshold = policy.warp_tile_size() / RBK_STREAM_DIV;
-#  else
+#else
   // B200 receipt: /4 pulls the seg4 band into the stream and costs nothing anywhere else
   constexpr int stream_threshold = policy.warp_tile_size() / 4;
-#  endif
+#endif
   // [key_ring_stages][tile_size] input keys
   // [key_ring_stages][tile_size] int16 staged head positions
   extern __shared__ char smem_raw[];
@@ -1692,13 +1664,11 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           {
             if (ik_rec)
             {
-              RBK_IK_BEG(LoadWaitEmpty, pipeline_gen);
             }
             // need to wait for slot to be free
             wait_parity(&empty[slot_id], key_ring.parity ^ 1u);
             if (ik_rec)
             {
-              RBK_IK_END(LoadWaitEmpty, pipeline_gen);
             }
           }
           if (lane_id == 0)
@@ -1745,12 +1715,10 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           const bool ik_rec = (blk_id < 8) && pipeline_gen >= 5 && pipeline_gen < 15;
           if (ik_rec)
           {
-            RBK_IK_BEG(CompWaitFull, pipeline_gen);
           }
           wait_parity(&full[slot_id], key_ring.parity);
           if (ik_rec)
           {
-            RBK_IK_END(CompWaitFull, pipeline_gen);
           }
           const int tile_id = tile_id_buf[slot_id];
           if (tile_id >= num_tiles)
@@ -1769,7 +1737,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           int local_run_count = 0;
           if (ik_rec)
           {
-            RBK_IK_BEG(CompFlag, pipeline_gen);
           }
           unsigned my_flags;
           if (keys_staged)
@@ -1796,19 +1763,16 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           // then folds and publishes the tile's COUNT state
           if (ik_rec)
           {
-            RBK_IK_END(CompFlag, pipeline_gen);
           }
           if (compute_warp_id == 0)
           {
             if (ik_rec)
             {
-              RBK_IK_BEG(CompPublish, pipeline_gen);
             }
             wait_parity(&computed[slot_id], key_ring.parity);
             reduce_and_publish_count<compute_warps>(count_states, tile_id, warp_run_counts[slot_id], lane_id);
             if (ik_rec)
             {
-              RBK_IK_END(CompPublish, pipeline_gen);
             }
           }
           // no position staging: consumers decode run boundaries from the flag words. The words
@@ -1878,12 +1842,10 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           const bool ik_rec = (blk_id < 8) && pipeline_gen >= 5 && pipeline_gen < 15;
           if (ik_rec)
           {
-            RBK_IK_BEG(KWaitComputed, pipeline_gen);
           }
           wait_parity(&computed[slot_id], key_ring.parity);
           if (ik_rec)
           {
-            RBK_IK_END(KWaitComputed, pipeline_gen);
           }
           const int tile_id = tile_id_buf[slot_id];
           if (tile_id >= num_tiles)
@@ -1898,16 +1860,13 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
             scan_warp_tile_run_counts<compute_warps>(warp_run_counts[slot_id], lane_id);
           if (ik_rec)
           {
-            RBK_IK_BEG(KWaitPrefixed, pipeline_gen);
           }
           wait_parity(&prefixed[slot_id], key_ring.parity);
           if (ik_rec)
           {
-            RBK_IK_END(KWaitPrefixed, pipeline_gen);
           }
           if (ik_rec)
           {
-            RBK_IK_BEG(KDrain, pipeline_gen);
           }
           const OffT curr_prefix_run_count = prefix_packed[slot_id].run_count();
           // the count-side epilogue (total run count) rides with the key squad -- it is pure
@@ -1942,23 +1901,21 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
               }
               if (ik_rec)
               {
-                RBK_IK_BEG(KWaitStaged, pipeline_gen);
               }
               wait_parity(&staged_warp_tile[slot_id][warp_tile_id], key_ring.parity);
               if (ik_rec)
               {
-                RBK_IK_END(KWaitStaged, pipeline_gen);
               }
               const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
               const int warp_tile_offset              = warp_tile_id * warp_tile_size;
-#  ifdef K_DRAIN_THRESH
+#ifdef K_DRAIN_THRESH
               constexpr int word_serial_threshold = K_DRAIN_THRESH;
-#  else
+#else
             constexpr int word_serial_threshold = 256;
-#  endif
+#endif
               if (warp_tile_run_count >= staging_threshold && warp_tile_run_count <= word_serial_threshold)
               {
-                // word-serial band (IKET receipt: KDrain flat 1.38us/gen at seg4-16 = the broadcast
+                // word-serial band (profiler receipt: KDrain flat 1.38us/gen at seg4-16 = the broadcast
                 // band's fixed 2-shuffles-per-word loop on the MIO pipe): each lane owns its own
                 // flag word and extracts its runs serially -- no shuffles, no sync collectives, so
                 // the divergence is safe; one smem read + one store per RUN
@@ -1986,7 +1943,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
                 // iteration write consecutive unique slots = coalesced.
                 const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
                 int word_base         = 0;
-#  pragma unroll
+#pragma unroll
                 for (int iter = 0; iter < items_per_thread; ++iter)
                 {
                   const unsigned w = head_flag_buf[slot_id][warp_tile_id * 32 + iter];
@@ -2066,7 +2023,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           }
           if (ik_rec)
           {
-            RBK_IK_END(KDrain, pipeline_gen);
           }
           __syncwarp();
           if (lane_id == 0)
@@ -2094,11 +2050,11 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadInitKernel(StateT* states
 // no barriers beyond __syncthreads, no lookahead, no work stealing -- latency hides behind plain
 // occupancy. Emits every within-tile-closed aggregate + the boundary record for the cleanup pass.
 template <typename PolicySelector, class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
-#  ifdef RBK_VBLOCKS
+#ifdef RBK_VBLOCKS
 __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32, RBK_VBLOCKS)
-#  else
+#else
 __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32, 6)
-#  endif
+#endif
   _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValueKernel(
     const ValueT* __restrict__ d_values,
     ValueT* __restrict__ d_aggregates,
@@ -2115,12 +2071,12 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     constexpr int compute_warps                = policy.compute_warps;
     constexpr int warp_tile_size               = policy.warp_tile_size();
     constexpr int tile_size                    = policy.tile_size();
-#  ifdef RBK_STREAM_DIV
+#ifdef RBK_STREAM_DIV
     constexpr int stream_threshold = warp_tile_size / RBK_STREAM_DIV;
-#  else
+#else
     // B200 receipt: /4 pulls the seg4 band into the stream and costs nothing anywhere else
     constexpr int stream_threshold = warp_tile_size / 4;
-#  endif
+#endif
     __shared__ int wt_counts[compute_warps];
     __shared__ ValueT wt_leads[compute_warps];
     __shared__ ValueT wt_tails[compute_warps];
@@ -2133,7 +2089,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     {
       return;
     }
-    // STAGED mode (IKET receipt: the bands run 3.7x faster per warp tile from smem, and 6-block
+    // STAGED mode (profiler receipt: the bands run 3.7x faster per warp tile from smem, and 6-block
     // occupancy is the latency pipeline): one bulk TMA pulls the tile's values AND flag words into
     // this block's smem before the bands run. Unstaged (misaligned values base): the old global
     // path with the fire-and-forget L2 prefetch (v6b receipt).
@@ -2141,11 +2097,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     ValueT* const staged_vals    = (ValueT*) v_smem_raw;
     unsigned* const staged_flags = (unsigned*) (v_smem_raw + (size_t) tile_size * sizeof(ValueT));
     __shared__ ::cuda::std::uint64_t staged_bar;
-#  ifdef K_VSTAGE_T
+#ifdef K_VSTAGE_T
     constexpr int stage_run_threshold = K_VSTAGE_T;
-#  else
+#else
     constexpr int stage_run_threshold = 512;
-#  endif
+#endif
     const int stage_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
     if (threadIdx.x == 0)
     {
@@ -2192,7 +2148,6 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     const bool ik_rec = tile_id >= 1024 && tile_id < 1032;
     if (ik_rec)
     {
-      RBK_IK_BEG(VSetup, tile_id);
     }
     const int wt                  = (int) (threadIdx.x >> 5);
     const int lane_id             = (int) (threadIdx.x & 31);
@@ -2213,11 +2168,9 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     const int wt_end                        = min(warp_tile_offset + warp_tile_size, tile_len);
     if (ik_rec)
     {
-      RBK_IK_END(VSetup, tile_id);
     }
     if (ik_rec)
     {
-      RBK_IK_BEG(VEmit, tile_id);
     }
     // boundary sums + the banded within-warp-tile emission (the receipted forms). The tag lambda
     // keeps the smem pointer compile-time provable (the LD.E-vs-LDS receipt from the keys drain)
@@ -2357,12 +2310,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       }
       if (ik_rec)
       {
-        RBK_IK_BEG(VStageWait, tile_id);
       }
       wait_parity(&staged_bar, 0);
       if (ik_rec)
       {
-        RBK_IK_END(VStageWait, tile_id);
       }
       emit_bands(staged_vals, ::cuda::std::true_type{});
     }
@@ -2406,12 +2357,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     if (ik_rec)
     {
-      RBK_IK_END(VEmit, tile_id);
     }
     __syncthreads();
     if (ik_rec)
     {
-      RBK_IK_BEG(VBoundary, tile_id);
     }
     // warp 0: the record + the within-tile boundary closes (aggregate chains over the wt sums)
     if (wt == 0)
@@ -2493,7 +2442,6 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     }
     if (ik_rec)
     {
-      RBK_IK_END(VBoundary, tile_id);
     }
   }
 }
@@ -2522,11 +2470,11 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
   constexpr int warp_tile_size               = policy.warp_tile_size();
   constexpr int tile_size                    = policy.tile_size();
   constexpr int max_val_stages               = policy.key_ring_stages;
-#  ifdef RBK_STREAM_DIV
+#ifdef RBK_STREAM_DIV
   constexpr int stream_threshold = warp_tile_size / RBK_STREAM_DIV;
-#  else
+#else
   constexpr int stream_threshold = warp_tile_size / 4;
-#  endif
+#endif
   extern __shared__ char smem_raw[];
   ValueT* const val_ring = (ValueT*) smem_raw; // [stages][tile_size], no pad
   __shared__ int tile_id_buf[max_val_stages];
@@ -2575,12 +2523,10 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
           {
             if (ik_rec)
             {
-              RBK_IK_BEG(LoadWaitEmpty, gen);
             }
             wait_parity(&empty[slot_id], ring.parity ^ 1u);
             if (ik_rec)
             {
-              RBK_IK_END(LoadWaitEmpty, gen);
             }
           }
           if (lane_id == 0)
@@ -2619,12 +2565,10 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
           const bool ik_rec = (blk_id < 8) && gen >= 5 && gen < 15;
           if (ik_rec)
           {
-            RBK_IK_BEG(VWaitFull, gen);
           }
           wait_parity(&full[slot_id], ring.parity);
           if (ik_rec)
           {
-            RBK_IK_END(VWaitFull, gen);
           }
           const int tile_id = tile_id_buf[slot_id];
           if (tile_id >= num_tiles)
@@ -2633,7 +2577,6 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
           }
           if (ik_rec)
           {
-            RBK_IK_BEG(VSetup, gen);
           }
           const unsigned my_word        = d_flag_words[(size_t) tile_id * (compute_warps * 32) + wt * 32 + lane_id];
           const int warp_tile_run_count = __reduce_add_sync(full_mask, __popc(my_word));
@@ -2651,11 +2594,9 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
           const ValueT* tile_vals                 = val_ring + (size_t) slot_id * tile_size; // provably SMEM
           if (ik_rec)
           {
-            RBK_IK_END(VSetup, gen);
           }
           if (ik_rec)
           {
-            RBK_IK_BEG(VEmit, gen);
           }
           ValueT wt_lead{};
           ValueT wt_tail{};
@@ -2709,13 +2650,11 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
           }
           if (ik_rec)
           {
-            RBK_IK_END(VEmit, gen);
           }
           if (wt == 0)
           {
             if (ik_rec)
             {
-              RBK_IK_BEG(VBoundary, gen);
             }
             wait_parity(&emitted[slot_id], ring.parity);
             const int lane_count                    = (lane_id < compute_warps) ? s_counts[slot_id][lane_id] : 0;
@@ -2733,7 +2672,7 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
               {
                 lead_agg += s_leads[slot_id][first_headed];
               }
-#  pragma unroll
+#pragma unroll
               for (int offset = 16; offset; offset >>= 1)
               {
                 open_agg += shfl_xor_sync_wide(open_agg, offset);
@@ -2780,7 +2719,6 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
             }
             if (ik_rec)
             {
-              RBK_IK_END(VBoundary, gen);
             }
           }
           __syncwarp();
@@ -2880,7 +2818,6 @@ __launch_bounds__(device_reduce_by_key_lookahead_launch_bounds<PolicySelector>, 
        pos_ring_stages,
        keys_staged);))
 }
-#endif // __cccl_ptx_isa >= 920
 } // namespace detail::reduce_by_key::lookahead
 
 CUB_NAMESPACE_END
