@@ -3225,7 +3225,38 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
       // outline above)
     };
 
-     emit_bands(staged_vals, ::cuda::std::true_type{});
+     if (tile_len == tile_size)
+     {
+       emit_bands(staged_vals, ::cuda::std::true_type{});
+     }
+     else
+     {
+       // the SHORT LAST TILE (the missing if): the band ladder assumes full tiles; route the
+       // partial tile through the flagged row stream from staged smem, exactly like the value
+       // kernel's tile-level gate
+       if (warp_tile_run_count == 0)
+       {
+         wt_lead = warp_span_fold(staged_vals, warp_tile_offset, wt_end, lane_id, reduction_op);
+         wt_tail = wt_lead;
+       }
+       else
+       {
+         stream_values_from_flags<items_per_thread, false>(
+           d_aggregates,
+           staged_vals,
+           my_word,
+           global_runs_before_warp_tile,
+           warp_tile_offset,
+           tile_len,
+           lane_id,
+           reduction_op,
+           wt_tail);
+         const HeadFlagDecodeT dec(my_word, lane_id);
+         const RunSpanT first_run = dec.decode_run(0);
+         wt_lead                  = warp_span_fold(
+           staged_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id, reduction_op);
+       }
+     }
 #  ifdef RBK_FUSED_STOP5
      return; // gate: after bands
 #  endif
