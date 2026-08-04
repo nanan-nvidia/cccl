@@ -105,7 +105,11 @@ inline cudaError_t persistent_rbk_encode(
   };
   const size_t pers_bytes =
     align16((size_t) q_tiles * sizeof(CountStateT)) + align16((size_t) q_tiles * sizeof(RecordT))
-    + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>));
+    + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>))
+#  ifdef RBK_PERSIST_FLAGS
+    + align16((size_t) q_tiles * (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned))
+#  endif
+    ;
 
   const size_t required = cuda::std::max(cub_bytes, pers_bytes);
   if (d_temp_storage == nullptr)
@@ -137,13 +141,7 @@ inline cudaError_t persistent_rbk_encode(
   {
     return cudaErrorInvalidValue;
   }
-#  ifdef RBK_VK_KEYS_GLOBAL
   constexpr size_t kValBlockSmemGate = (size_t) Config::kTileSize * sizeof(ValueT);
-#  else
-  constexpr size_t kValBlockSmemGate =
-    ((((size_t) Config::kTileSize * sizeof(ValueT)) + 15) & ~(size_t) 15)
-    + (size_t) Config::kPolicy.slot_stride((int) sizeof(KeyT), (int) alignof(KeyT)) * sizeof(KeyT);
-#  endif
   if ((((size_t) d_values & 15) != 0) || (size_t) smem_optin < kValBlockSmemGate)
   {
     return cudaErrorInvalidValue;
@@ -162,9 +160,12 @@ inline cudaError_t persistent_rbk_encode(
       num_items,
       stream);
   }
-  auto* count_states    = (CountStateT*) d_temp_storage;
-  auto* value_records   = (RecordT*) ((char*) count_states + align16(tiles * sizeof(CountStateT)));
-  auto* tile_prefixes   = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
+  auto* count_states  = (CountStateT*) d_temp_storage;
+  auto* value_records = (RecordT*) ((char*) count_states + align16(tiles * sizeof(CountStateT)));
+  auto* tile_prefixes = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
+#  ifdef RBK_PERSIST_FLAGS
+  auto* flag_words = (unsigned*) ((char*) tile_prefixes + align16(tiles * sizeof(TilePrefixT<OffT>)));
+#  endif
   const int init_blocks = (int) ((tiles + 255) / 256);
   // only the tagged COUNT states need clearing; the value records are plain outputs of the main
   // kernel, synchronized by the launch boundary
@@ -185,6 +186,9 @@ inline cudaError_t persistent_rbk_encode(
     d_aggregates,
     d_num_runs,
     count_states,
+#  ifdef RBK_PERSIST_FLAGS
+    flag_words,
+#  endif
     tile_prefixes,
     num_items,
     (int) tiles,
@@ -211,7 +215,17 @@ inline cudaError_t persistent_rbk_encode(
     return error;
   }
   vkernel<<<(int) tiles, Config::kNumCompWarps * 32, kValBlockSmem, stream>>>(
-    d_keys, d_values, d_aggregates, tile_prefixes, value_records, num_items, (int) tiles, reduction_op);
+    d_keys,
+    d_values,
+    d_aggregates,
+#  ifdef RBK_PERSIST_FLAGS
+    flag_words,
+#  endif
+    tile_prefixes,
+    value_records,
+    num_items,
+    (int) tiles,
+    reduction_op);
   error = cudaPeekAtLastError();
   if (error != cudaSuccess)
   {
