@@ -336,9 +336,11 @@ compute_head_flags(const KeyT* key_buf, int warp_tile_offset, int tile_len, int 
     int first_pred_idx = warp_tile_offset + skip_elems - 1; // slot_pad makes this legal when staged
     if constexpr (clamp_tail)
     {
-      first_pred_idx =
-        (tile_id == 0) ? max(min(warp_tile_offset, tile_len - 1) - 1, 0) : min(warp_tile_offset, tile_len - 1) - 1;
-      first_pred_idx = max(first_pred_idx, 0);
+      // tile-0-ONLY clamp: for any later tile, index -1 is the previous tile's last key, an
+      // in-bounds global read the boundary head depends on (clamping it made elem 0 its own
+      // predecessor and dropped tile-boundary heads)
+      const int first_loc = min(warp_tile_offset, tile_len - 1);
+      first_pred_idx      = (tile_id == 0) ? max(first_loc - 1, 0) : first_loc - 1;
     }
     KeyT row_carry = key_buf[first_pred_idx];
 #pragma unroll
@@ -1961,6 +1963,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     KeyT* const staged_keys     = (KeyT*) (v_smem_raw + vals_bytes);
     const unsigned base_skip    = (alignof(KeyT) < 16) ? ((unsigned) (size_t) d_keys & 15u) : 0u;
     const int skip_elems        = (int) (base_skip / sizeof(KeyT));
+#ifdef RBK_VK_KEYS_GLOBAL
+    (void) staged_keys;
+    (void) base_skip;
+    (void) skip_elems;
+#endif
     __shared__ ::cuda::std::uint64_t staged_bar;
     __shared__ ::cuda::std::uint64_t keys_bar;
 #ifdef K_VSTAGE_T
@@ -2013,6 +2020,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         }
       }
     }
+#ifndef RBK_VK_KEYS_GLOBAL
     if (stage_run_threshold == 0 && threadIdx.x < 32)
     {
       // warp 0 issues the keys TMA behind the values one (load_tile_keys owns the pad/skip
@@ -2029,6 +2037,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         (int) threadIdx.x,
         true);
     }
+#endif
     __syncthreads(); // barrier inits are visible to every warp past this point
     // trace STEADY-STATE blocks, not the first wave: tiles < 8 run on an uncontended GPU and
     // understate every range by ~1.4x (background-agent receipt: block lifetimes 11.4us steady vs
@@ -2041,6 +2050,12 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     const int lane_id  = (int) (threadIdx.x & 31);
     const int tile_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
     unsigned my_word;
+#ifdef RBK_VK_KEYS_GLOBAL
+    // keys via LDG: single-use streaming reads don't earn smem residency; the values tile keeps
+    // the whole budget (6 blocks/SM)
+    my_word = compute_head_flags<items_per_thread, true>(
+      d_keys + (size_t) tile_id * tile_size, wt * warp_tile_size, tile_len, tile_id, lane_id, 0);
+#else
     if constexpr (stage_run_threshold == 0)
     {
       wait_parity(&keys_bar, 0); // flags compute rides under the values TMA flight
@@ -2052,6 +2067,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       my_word = compute_head_flags<items_per_thread, true>(
         d_keys + (size_t) tile_id * tile_size, wt * warp_tile_size, tile_len, tile_id, lane_id, 0);
     }
+#endif
     const int warp_tile_run_count = __reduce_add_sync(full_mask, __popc(my_word));
     if (lane_id == 0)
     {

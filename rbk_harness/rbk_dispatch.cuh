@@ -137,9 +137,13 @@ inline cudaError_t persistent_rbk_encode(
   {
     return cudaErrorInvalidValue;
   }
+#  ifdef RBK_VK_KEYS_GLOBAL
+  constexpr size_t kValBlockSmemGate = (size_t) Config::kTileSize * sizeof(ValueT);
+#  else
   constexpr size_t kValBlockSmemGate =
     ((((size_t) Config::kTileSize * sizeof(ValueT)) + 15) & ~(size_t) 15)
     + (size_t) Config::kPolicy.slot_stride((int) sizeof(KeyT), (int) alignof(KeyT)) * sizeof(KeyT);
+#  endif
   if ((((size_t) d_values & 15) != 0) || (size_t) smem_optin < kValBlockSmemGate)
   {
     return cudaErrorInvalidValue;
