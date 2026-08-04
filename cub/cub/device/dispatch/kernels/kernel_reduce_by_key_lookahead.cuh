@@ -328,7 +328,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           if (keys_staged)
           {
             const KeyT* key_buf = tile_buf + (size_t) slot_id * slot_stride + slot_pad;
-            my_flags            = rle::encode::compute_head_flags<items_per_thread, false>(
+            my_flags            = compute_head_flags<items_per_thread, false>(
               key_buf, warp_tile_offset, tile_len, tile_id, lane_id, skip_elems);
           }
           else
@@ -336,7 +336,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
             // vvv regressed case: we load compute flags straight from global vvv
             const KeyT* key_buf = d_keys + (size_t) tile_id * tile_size;
             my_flags =
-              rle::encode::compute_head_flags<items_per_thread, true>(key_buf, warp_tile_offset, tile_len, tile_id, lane_id, 0);
+              compute_head_flags<items_per_thread, true>(key_buf, warp_tile_offset, tile_len, tile_id, lane_id, 0);
             // ^^^ regressed case ^^^
           }
           local_run_count = __reduce_add_sync(full_mask, __popc(my_flags));

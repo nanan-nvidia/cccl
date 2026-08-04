@@ -38,6 +38,7 @@ namespace ptx = ::cuda::ptx;
 
 // shared warpspeed machinery comes from the RLE lookahead kernel this one is derived from;
 // only the RBK-specific pieces are defined below
+using rle::encode::compute_head_flags;
 using rle::encode::load_tile_keys;
 using rle::encode::nth_set_bit;
 using rle::encode::RingCursorT;
@@ -290,87 +291,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_xor_sync_wide(T v, int mask)
       hv.h[i] = __shfl_xor_sync(full_mask, hv.h[i], mask);
     }
     return ::cuda::std::bit_cast<T>(hv);
-  }
-}
-
-// calculate head_flags: each iter is 32 consecutive elements (lane L owns loc = warp_tile_offset + iter*32 + L)
-// head = (key != predecessor)
-template <int items_per_thread, bool clamp_tail, class KeyT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE unsigned
-compute_head_flags(const KeyT* key_buf, int warp_tile_offset, int tile_len, int tile_id, int lane_id, int skip_elems)
-{
-  static_assert(items_per_thread <= 32, "one lane per iter requires items_per_thread<=32");
-  unsigned my_flags = 0;
-  if constexpr (sizeof(KeyT) > 8)
-  {
-    // no __shfl_sync overload for 16B keys: the predecessor is a second buffer read (the RLE
-    // encode lookahead reference form)
-#pragma unroll
-    for (int iter = 0; iter < items_per_thread; ++iter)
-    {
-      const int loc = warp_tile_offset + iter * 32 + lane_id;
-      int key_idx   = loc + skip_elems;
-      int pred_idx  = loc + skip_elems - 1; // loc==0 reads the over fetched slot[slot_pad-1]
-      if constexpr (clamp_tail)
-      {
-        key_idx  = min(key_idx, tile_len - 1);
-        pred_idx = (tile_id == 0) ? max(key_idx - 1, 0) : key_idx - 1;
-      }
-      const KeyT key            = key_buf[key_idx];
-      const KeyT pred           = key_buf[pred_idx];
-      const int is_global_first = (tile_id == 0 && loc == 0);
-      const int head            = (loc < tile_len) ? (is_global_first ? 1 : !(key == pred)) : 0;
-      const unsigned flags      = __ballot_sync(full_mask, head);
-      if (lane_id == iter)
-      {
-        my_flags = flags;
-      }
-    }
-    return my_flags;
-  }
-  else
-  {
-    // ONE read per element: the predecessor comes from a lane shuffle (row-internal) or the
-    // previous row's last lane; only the first row's lane 0 reads its predecessor from memory
-    // (receipted +10% at the long regimes in the standalone campaign)
-    int first_pred_idx = warp_tile_offset + skip_elems - 1; // slot_pad makes this legal when staged
-    if constexpr (clamp_tail)
-    {
-      // tile-0-ONLY clamp: for any later tile, index -1 is the previous tile's last key, an
-      // in-bounds global read the boundary head depends on (clamping it made elem 0 its own
-      // predecessor and dropped tile-boundary heads)
-      const int first_loc = min(warp_tile_offset, tile_len - 1);
-      first_pred_idx      = (tile_id == 0) ? max(first_loc - 1, 0) : first_loc - 1;
-    }
-    KeyT row_carry = key_buf[first_pred_idx];
-#pragma unroll
-    for (int iter = 0; iter < items_per_thread; ++iter)
-    {
-      const int loc = warp_tile_offset + iter * 32 + lane_id;
-      int key_idx   = loc + skip_elems;
-      if constexpr (clamp_tail)
-      {
-        // vvv regressed case: plain global loads have no ignore_oob, so clamp the tail reads into the input.
-        // the clamped values are garbage, but (loc < tile_len) below already zeroes those heads vvv
-        key_idx = min(key_idx, tile_len - 1);
-        // ^^^ regressed case ^^^
-      }
-      const KeyT key = key_buf[key_idx];
-      KeyT pred      = __shfl_up_sync(full_mask, key, 1);
-      if (lane_id == 0)
-      {
-        pred = row_carry;
-      }
-      const int is_global_first = (tile_id == 0 && loc == 0);
-      const int head            = (loc < tile_len) ? (is_global_first ? 1 : !(key == pred)) : 0;
-      const unsigned flags      = __ballot_sync(full_mask, head);
-      if (lane_id == iter)
-      {
-        my_flags = flags;
-      }
-      row_carry = __shfl_sync(full_mask, key, 31);
-    }
-    return my_flags;
   }
 }
 
