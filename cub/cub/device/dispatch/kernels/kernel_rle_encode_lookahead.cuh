@@ -403,8 +403,13 @@ struct HeadFlagDecodeT
   int lane_first_head_from_word;
 
   _CCCL_DEVICE_API _CCCL_FORCEINLINE HeadFlagDecodeT(const unsigned* slot_head_flags, int warp_tile_id, int lane_id)
+      : HeadFlagDecodeT(slot_head_flags[warp_tile_id * 32 + lane_id], lane_id)
+  {}
+
+  // register-word form: consumers that snapshot flag words decode with no smem dependency
+  _CCCL_DEVICE_API _CCCL_FORCEINLINE HeadFlagDecodeT(unsigned lane_word, int lane_id)
   {
-    lane_head_flag_word           = slot_head_flags[warp_tile_id * 32 + lane_id];
+    lane_head_flag_word           = lane_word;
     const int lane_word_run_count = __popc(lane_head_flag_word);
     typename WarpScan<int>::TempStorage warp_scan_storage;
     int lane_word_run_count_scan;

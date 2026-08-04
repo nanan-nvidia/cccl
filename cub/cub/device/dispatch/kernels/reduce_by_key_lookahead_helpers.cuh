@@ -34,6 +34,7 @@ namespace ptx = ::cuda::ptx;
 
 using rle::encode::clc_next_tile_id;
 using rle::encode::compute_head_flags;
+using rle::encode::HeadFlagDecodeT;
 using rle::encode::load_tile_keys;
 using rle::encode::nth_set_bit;
 using rle::encode::poll_and_fold;
