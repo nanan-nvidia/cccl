@@ -1,7 +1,3 @@
-// Standalone harness shim over the reduce-by-key lookahead kernel (the sibling of the rle encode
-// lookahead kernel; RBK = RLE with an open AGGREGATE instead of an open length). Presents the
-// campaign harness interface (rbk_impl::winner_config + persistent_rbk_encode) so the bench,
-// verify, and hammer drivers run unchanged.
 #pragma once
 
 #include <cub/device/device_reduce.cuh>
@@ -20,13 +16,9 @@ using TileValueRecordT = rbk_kernels::TileValueRecordT<ValueT>;
 template <class OffT>
 using TilePrefixT = rbk_kernels::PrefixT<OffT>;
 
-// tile count below which stock CUB runs
-constexpr int kStockDispatchTiles = 1024;
-
 template <class KeyT, class ValueT, int kIptOverride = 0, int kStagesOverride = 0>
 struct winner_config
 {
-  // ring bytes stay constant across key widths (RLE lookahead selector: 8192x4B = 4096x8B = 2048x16B)
   static constexpr int kIPT =
     (kIptOverride != 0) ? kIptOverride : (sizeof(KeyT) >= 16 ? 8 : (sizeof(KeyT) == 8 ? 16 : 32));
   static constexpr int kNumCompWarps = 8;
@@ -61,8 +53,6 @@ struct winner_config
     }
   };
 
-  // positions are gone: the dyn smem is the keys ring only; the policy's own accounting still
-  // charges the dead pos ring (it routed the S=6 arm to stock via the opt-in gate)
   static constexpr size_t kDynSmem =
     (size_t) kStages * kPolicy.slot_stride((int) sizeof(KeyT), (int) alignof(KeyT)) * sizeof(KeyT);
 };
@@ -86,15 +76,12 @@ inline cudaError_t persistent_rbk_encode(
   cudaStream_t stream       = 0,
   ReductionOpT reduction_op = {})
 {
-  using RecordT = TileValueRecordT<ValueT>;
-  // size query must cover BOTH paths (the same allocation may serve either across calls)
+  using RecordT    = TileValueRecordT<ValueT>;
   size_t cub_bytes = 0;
   cub::DeviceReduce::ReduceByKey(
     nullptr, cub_bytes, d_keys, d_unique, d_values, d_aggregates, d_num_runs, reduction_op, num_items, stream);
   const long long q_tiles = rbk_state_tiles<Config>((long long) num_items);
-  // each carve is rounded up to 16B: the flag-words bulk prefetch requires a 16B-aligned base
-  // (24B TileValueRecordT with 8B values left it 8-mod-16 -> misaligned address)
-  const auto align16 = [](size_t b) {
+  const auto align16      = [](size_t b) {
     return (b + 15) & ~(size_t) 15;
   };
   const size_t pers_bytes =
@@ -137,7 +124,7 @@ inline cudaError_t persistent_rbk_encode(
   {
     return cudaErrorInvalidValue;
   }
-  if (tiles < kStockDispatchTiles || tiles > 0x7fffffff || cc_major < 10 || (size_t) smem_optin < Config::kDynSmem)
+  if (tiles > 0x7fffffff || cc_major < 10 || (size_t) smem_optin < Config::kDynSmem)
   {
     return cub::DeviceReduce::ReduceByKey(
       d_temp_storage,
@@ -156,8 +143,6 @@ inline cudaError_t persistent_rbk_encode(
   auto* tile_prefixes   = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
   auto* flag_words      = (unsigned*) ((char*) tile_prefixes + align16(tiles * sizeof(TilePrefixT<OffT>)));
   const int init_blocks = (int) ((tiles + 255) / 256);
-  // only the tagged COUNT states need clearing; the value records are plain outputs of the main
-  // kernel, synchronized by the launch boundary
   rbk_kernels::DeviceReduceByKeyLookaheadInitKernel<typename Config::Selector>
     <<<init_blocks, 256, 0, stream>>>(count_states, tiles);
 
@@ -187,12 +172,8 @@ inline cudaError_t persistent_rbk_encode(
   {
     return error;
   }
-  // PASS 2: values. Persistent TMA-ring kernel when the values base is 16B-aligned and the ring
-  // fits the opt-in smem; the block-per-tile kernel is the fallback (misaligned bases, small smem)
-  constexpr size_t kValDynSmem = (size_t) Config::kStages * Config::kTileSize * sizeof(ValueT);
-  // staged mode: one bulk TMA per block pulls the tile's values + flag words into smem (IKET
-  // receipt: bands 3.7x faster from smem; the 6-block occupancy is the latency pipeline). The
-  // smem is values + flags per block.
+  // PASS 2: values
+  constexpr size_t kValDynSmem   = (size_t) Config::kStages * Config::kTileSize * sizeof(ValueT);
   constexpr size_t kValBlockSmem = kValBlockSmemGate;
   auto* vkernel =
     rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT, ReductionOpT>;

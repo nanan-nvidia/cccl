@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-
 #pragma once
 
 #include <cub/config.cuh>
@@ -33,7 +30,6 @@ CUB_NAMESPACE_BEGIN
 
 namespace detail::reduce_by_key::lookahead
 {
-// requires PTX ISA 9.2 (CUDA 13.2): the load warp uses the cp.async.bulk .ignore_oob qualifier
 namespace ptx = ::cuda::ptx;
 
 // shared warpspeed machinery comes from the RLE lookahead kernel this one is derived from;
