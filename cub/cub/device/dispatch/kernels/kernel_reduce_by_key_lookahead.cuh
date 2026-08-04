@@ -635,15 +635,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     ValueT wt_tail{};
     auto emit_bands = [&](const ValueT* tile_vals, auto staged_tag) _CCCL_FORCEINLINE_LAMBDA {
       constexpr bool from_smem = decltype(staged_tag)::value;
-      if (warp_tile_run_count == 0)
+      if (warp_tile_run_count == 0 || (from_smem && warp_tile_run_count < 4))
       {
-        wt_lead = warp_span_fold(tile_vals, warp_tile_offset, wt_end, lane_id, reduction_op);
-        wt_tail = wt_lead; // head-free: the whole warp tile leads AND trails
-      }
-      else if (from_smem && warp_tile_run_count < 4)
-      {
-        // whole-warp span band (restored): a 2-run warp tile paid the full rotate + ~390-inst walk
-        // (SASS census); two coalesced span sums cost ~60. All 32 lanes walk each span together.
+        // whole-warp span band: a 2-run warp tile paid the full rotate + ~390-inst walk (SASS
+        // census); two coalesced span sums cost ~60. All 32 lanes walk each span together. The
+        // head-free warp tile is the degenerate case: one span that leads AND trails (one fold).
         const HeadFlagDecodeT dec(my_word, lane_id);
         const RunSpanT lane_run = dec.decode_run(lane_id < warp_tile_run_count ? lane_id : 0);
         for (int run_idx = 0; run_idx + 1 < warp_tile_run_count; ++run_idx)
@@ -657,12 +653,17 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
             d_aggregates[global_runs_before_warp_tile + run_idx] = agg;
           }
         }
-        const RunSpanT first_run = dec.decode_run(0);
-        const RunSpanT last_run  = dec.decode_run(warp_tile_run_count - 1);
-        wt_lead                  = warp_span_fold(
-          tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id, reduction_op);
+        const int first_head =
+          warp_tile_run_count ? dec.decode_run(0).head_pos_in_warp_tile : (wt_end - warp_tile_offset);
+        wt_lead = warp_span_fold(tile_vals, warp_tile_offset, warp_tile_offset + first_head, lane_id, reduction_op);
         wt_tail =
-          warp_span_fold(tile_vals, warp_tile_offset + last_run.head_pos_in_warp_tile, wt_end, lane_id, reduction_op);
+          warp_tile_run_count
+            ? warp_span_fold(tile_vals,
+                             warp_tile_offset + dec.decode_run(warp_tile_run_count - 1).head_pos_in_warp_tile,
+                             wt_end,
+                             lane_id,
+                             reduction_op)
+            : wt_lead; // head-free: the whole warp tile leads AND trails
       }
       else if (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32 && warp_tile_run_count < stream_threshold)
       {
