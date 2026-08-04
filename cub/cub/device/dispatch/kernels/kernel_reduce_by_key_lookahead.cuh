@@ -690,16 +690,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       {
         // stream density router (B200 receipts): quad wins to ~half density (seg4 -9.4%), pair
         // from there to ~3/4 (seg2, quad's interior-emission cost +14% there), the adaptive row
-        // stream at near-all-heads (seg1)
+        // stream at near-all-heads (seg1). Any 4-byte type, any associative op (the plus<float>
+        // asm inside is instruction selection; partial warp tiles take the row stream)
         int stream_form = 0; // 0 = row
-        if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32
-                      && ::cuda::std::is_same_v<ValueT, float>
-                      && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
+        if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32)
         {
-          // the quad/pair forms are plus<float> codegen (FADD asm, identity algebra); other ops
-          // and partial warp tiles take the row stream.
-          // source counters (seg4): the run-count distribution tail spilled 7.9% of the kernel
-          // into the row path; the pair form is receipted-good through this density
           stream_form = (warp_tile_run_count < warp_tile_size / 2) ? 2
                       : (warp_tile_run_count < (7 * warp_tile_size) / 8)
                         ? 1
@@ -707,22 +702,32 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         }
         if (stream_form == 2)
         {
-          if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32
-                        && ::cuda::std::is_same_v<ValueT, float>
-                        && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
+          if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32)
           {
             stream_values_quad<items_per_thread>(
-              d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_tail);
+              d_aggregates,
+              tile_vals,
+              my_word,
+              global_runs_before_warp_tile,
+              warp_tile_offset,
+              lane_id,
+              reduction_op,
+              wt_tail);
           }
         }
         else if (stream_form == 1)
         {
-          if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32
-                        && ::cuda::std::is_same_v<ValueT, float>
-                        && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
+          if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32)
           {
             stream_values_paired<items_per_thread>(
-              d_aggregates, tile_vals, my_word, global_runs_before_warp_tile, warp_tile_offset, lane_id, wt_tail);
+              d_aggregates,
+              tile_vals,
+              my_word,
+              global_runs_before_warp_tile,
+              warp_tile_offset,
+              lane_id,
+              reduction_op,
+              wt_tail);
           }
         }
         else

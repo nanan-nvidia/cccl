@@ -169,7 +169,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
 // possible incoming close per quad defers to after the cross-quad scan (P_in), exactly the
 // pair form's shape. At short-span densities the quad-distance bound collapses the scan to
 // 0-1 steps. Emissions are bare predicated stores off a hoisted base (SASS receipts).
-template <int items_per_thread, class ValueT, class OffT>
+template <int items_per_thread, class ValueT, class OffT, class ReductionOpT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
   ValueT* __restrict__ d_aggregates,
   const ValueT* __restrict__ tile_vals, // staged smem, zero-filled past tile_len
@@ -177,12 +177,14 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
   OffT global_runs_before_warp_tile,
   int warp_tile_offset,
   int lane_id,
+  ReductionOpT op,
   ValueT& tail_out)
 {
   static_assert(items_per_thread == 32, "the quad stream assumes 32x32 warp tiles");
   ValueT* const out = d_aggregates + global_runs_before_warp_tile;
-  ValueT carry{}; // sum since the last head seen so far (exact, left-to-right)
-  int word_base = 0; // heads in words before the current 128-element block (uniform)
+  ValueT carry{}; // fold since the last head seen so far (exact, left-to-right)
+  bool carry_has = false; // empty until the first block completes (no identity for a general op)
+  int word_base  = 0; // heads in words before the current 128-element block (uniform)
 #pragma unroll
   for (int it = 0; it < items_per_thread / 4; ++it)
   {
@@ -201,15 +203,17 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
     const int rank_base = wb + __popc(wsel & ((1u << bofs) - 1u));
     // branchless quad-local walk: interior runs emit NOW (local values); the incoming close
     // defers to post-scan
-    ValueT pfx{};
-    ValueT ssh{};
-    int hs = 0;
+    // element 0 SEEDS both accumulators (no identity element is ever combined in)
+    ValueT pfx        = v[0];
+    ValueT ssh        = v[0];
+    const int pfx_has = !(nib & 1u); // the pre-first-head piece is empty iff element 0 is a head
+    int hs            = (int) (nib & 1u);
 #pragma unroll
-    for (int j = 0; j < 4; ++j)
+    for (int j = 1; j < 4; ++j)
     {
       const bool head      = (nib >> j) & 1u;
-      const ValueT new_ssh = head ? v[j] : (ssh + v[j]);
-      const ValueT new_pfx = (head || hs > 0) ? pfx : (pfx + v[j]);
+      const ValueT new_ssh = head ? v[j] : op(ssh, v[j]);
+      const ValueT new_pfx = (head || hs > 0) ? pfx : op(pfx, v[j]);
       if (head && hs > 0)
       {
         out[rank_base + hs - 1] = ssh;
@@ -234,9 +238,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
         if (off >= first_off && off <= last_off)
         {
           const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-          const ValueT from_left   = __shfl_up_sync(full_mask, S, off);
-          if constexpr (sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+          const ValueT from_left   = shfl_up_sync_wide(S, off);
+          if constexpr (::cuda::std::is_same_v<ValueT, float>
+                        && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
           {
+            // plus<float> instruction selection (B200 receipt: the compiled conditional cost
+            // +1.8% at 2^2); the general path below is the semantics
             const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
             asm volatile("{ .reg .pred p; setp.eq.u32 p, %1, 0; @p add.f32 %0, %0, %2; }"
                          : "+f"(S)
@@ -246,7 +253,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
           {
             if (lane_id >= off && ((pmask & upto_l & ~upto_prev) == 0u))
             {
-              S += from_left;
+              S = op(from_left, S);
             }
           }
         }
@@ -267,18 +274,20 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
     {
       quad_scan_steps(1, 16);
     }
-    // deferred incoming close: everything since the last head strictly before this quad
-    const ValueT S_prev   = __shfl_up_sync(full_mask, S, 1);
+    // deferred incoming close: everything since the last head strictly before this quad.
+    // in_emit (a head exists before this quad) guarantees the pieces below are nonempty
+    const ValueT S_prev   = shfl_up_sync_wide(S, 1);
     const unsigned before = pmask & ((1u << lane_id) - 1u);
-    const ValueT P_in     = ((lane_id > 0) ? S_prev : ValueT{}) + ((before == 0u) ? carry : ValueT{});
+    const ValueT P_in     = (lane_id > 0) ? ((before != 0u || !carry_has) ? S_prev : op(carry, S_prev)) : carry;
     const bool in_emit    = brk && (rank_base >= 1);
-    const ValueT in_val   = P_in + pfx;
+    const ValueT in_val   = pfx_has ? op(P_in, pfx) : P_in;
     if (in_emit)
     {
       out[rank_base - 1] = in_val;
     }
-    const ValueT S31 = __shfl_sync(full_mask, S, 31);
-    carry            = (pmask == 0u) ? (carry + S31) : S31;
+    const ValueT S31 = shfl_sync_wide(S, 31);
+    carry            = (pmask == 0u && carry_has) ? op(carry, S31) : S31;
+    carry_has        = true;
     word_base += __popc(w0) + __popc(w1) + __popc(w2) + __popc(w3);
   }
   tail_out = carry;
@@ -291,7 +300,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
 // emit when h0 starts it, incoming-close via the scan otherwise); e1 ends iff the NEXT pair
 // opens with a head (its incoming-close handles it). Ranks come from word bit positions, no
 // per-lane scans. Emission ranks and the carry are exact left-to-right sums.
-template <int items_per_thread, class ValueT, class OffT>
+template <int items_per_thread, class ValueT, class OffT, class ReductionOpT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
   ValueT* __restrict__ d_aggregates,
   const ValueT* __restrict__ tile_vals, // staged smem, zero-filled past tile_len
@@ -299,13 +308,15 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
   OffT global_runs_before_warp_tile,
   int warp_tile_offset,
   int lane_id,
+  ReductionOpT op,
   ValueT& tail_out)
 {
   static_assert(items_per_thread == 32, "the paired stream assumes 32x32 warp tiles");
   ValueT* const out = d_aggregates + global_runs_before_warp_tile; // register base: no per-
                                                                    // emission LDC rematerialization
-  ValueT carry{}; // sum since the last head seen so far (exact, left-to-right)
-  int word_base = 0; // heads in words before the current double-row (uniform)
+  ValueT carry{}; // fold since the last head seen so far (exact, left-to-right)
+  bool carry_has = false; // empty until the first double-row completes
+  int word_base  = 0; // heads in words before the current double-row (uniform)
 #pragma unroll 4
   for (int it = 0; it < items_per_thread / 2; ++it)
   {
@@ -321,8 +332,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
     const ValueT v0 = v01[0];
     const ValueT v1 = v01[1];
     // pair-local pieces
-    const ValueT pre  = h0 ? ValueT{} : v0; // before the pair's first head
-    const ValueT tail = h1 ? v1 : (h0 ? (v0 + v1) : (v0 + v1)); // since the pair's last head (whole pair if headless)
+    const ValueT tail = h1 ? v1 : op(v0, v1); // since the pair's last head (whole pair if headless)
     const bool brk    = h0 || h1;
     // masked inclusive scan over pair tails, breaks at pairs with heads: S = sum since the last
     // head at-or-before this pair (within this double-row). ADAPTIVE depth (the row-stream
@@ -341,9 +351,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
         if (off >= first_off && off <= last_off)
         {
           const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-          const ValueT from_left   = __shfl_up_sync(full_mask, S, off);
-          if constexpr (sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>)
+          const ValueT from_left   = shfl_up_sync_wide(S, off);
+          if constexpr (::cuda::std::is_same_v<ValueT, float>
+                        && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
           {
+            // plus<float> instruction selection (B200 receipt: the compiled conditional cost
+            // +1.8% at 2^2); the general path below is the semantics
             const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
             asm volatile("{ .reg .pred p; setp.eq.u32 p, %1, 0; @p add.f32 %0, %0, %2; }"
                          : "+f"(S)
@@ -353,7 +366,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
           {
             if (lane_id >= off && ((pmask & upto_l & ~upto_prev) == 0u))
             {
-              S += from_left;
+              S = op(from_left, S);
             }
           }
         }
@@ -377,9 +390,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
     }
     // P_in: the exact sum since the last head STRICTLY before this pair (previous pair's scan
     // value, plus the inter-row carry when no break precedes in this double-row)
-    const ValueT S_prev   = __shfl_up_sync(full_mask, S, 1);
+    const ValueT S_prev   = shfl_up_sync_wide(S, 1);
     const unsigned before = pmask & ((1u << lane_id) - 1u);
-    const ValueT P_in     = ((lane_id > 0) ? S_prev : ValueT{}) + ((before == 0u) ? carry : ValueT{});
+    const ValueT P_in     = (lane_id > 0) ? ((before != 0u || !carry_has) ? S_prev : op(carry, S_prev)) : carry;
     // ranks from word bit positions (base = heads before my element's word)
     const int wb      = word_base + ((lane_id < 16) ? 0 : __popc(w0));
     const int rank_e0 = wb + __popc(wsel & ((1u << bofs) - 1u)); // heads before e0 in the wt
@@ -390,7 +403,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
     const bool e0_emit  = h0 && (rank_e0 >= 1);
     const int r1        = rank_e0 + (h0 ? 1 : 0) - 1;
     const bool e1_emit  = h1 && (r1 >= 0);
-    const ValueT e1_val = h0 ? v0 : (P_in + v0);
+    const ValueT e1_val = h0 ? v0 : op(P_in, v0);
     if (e0_emit)
     {
       out[rank_e0 - 1] = P_in;
@@ -401,8 +414,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
     }
     // carry update: sum since the last head after this double-row = S at lane 31 (+ carry if the
     // row had no breaks at all)
-    const ValueT S31 = __shfl_sync(full_mask, S, 31);
-    carry            = (pmask == 0u) ? (carry + S31) : S31;
+    const ValueT S31 = shfl_sync_wide(S, 31);
+    carry            = (pmask == 0u && carry_has) ? op(carry, S31) : S31;
+    carry_has        = true;
     word_base += __popc(w0) + __popc(w1);
   }
   tail_out = carry;
