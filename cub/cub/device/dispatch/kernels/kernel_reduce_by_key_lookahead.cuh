@@ -1386,7 +1386,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   ValueT* __restrict__ d_aggregates,
   NumRunsT* __restrict__ d_num_runs,
   CountStateT* __restrict__ count_states,
-  unsigned* __restrict__ d_flag_words, // [num_tiles][compute_warps*32]: the persisted run structure
   PrefixT<OffT>* __restrict__ d_tile_prefix, // [num_tiles]: packed (run prefix, last headed tile)
   OffT num_items,
   int num_tiles,
@@ -1637,12 +1636,10 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
             {
             }
           }
-          // no position staging: consumers decode run boundaries from the flag words. The words
-          // also PERSIST to global -- they are the whole run structure the value pass needs, so
-          // values never share this kernel at all (the two-pass design)
-          head_flag_buf[slot_id][compute_warp_id * 32 + lane_id]                                 = my_flags;
-          d_flag_words[(size_t) tile_id * (compute_warps * 32) + compute_warp_id * 32 + lane_id] = my_flags;
-          const unsigned nonempty_words = __ballot_sync(full_mask, my_flags != 0);
+          // no position staging: consumers decode run boundaries from the flag words (the value
+          // pass re-derives its own flags from the staged keys; nothing persists to global)
+          head_flag_buf[slot_id][compute_warp_id * 32 + lane_id] = my_flags;
+          const unsigned nonempty_words                          = __ballot_sync(full_mask, my_flags != 0);
           if (lane_id == 0)
           {
             word_mask[slot_id][compute_warp_id] = nonempty_words;
@@ -1911,16 +1908,16 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadInitKernel(StateT* states
 // whole run structure, the persisted tile prefix is the whole cross-tile coordination. No rings,
 // no barriers beyond __syncthreads, no lookahead, no work stealing -- latency hides behind plain
 // occupancy. Emits every within-tile-closed aggregate + the boundary record for the cleanup pass.
-template <typename PolicySelector, class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
+template <typename PolicySelector, class KeyT, class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
 #ifdef RBK_VBLOCKS
 __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32, RBK_VBLOCKS)
 #else
 __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32, 6)
 #endif
   _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValueKernel(
+    const KeyT* __restrict__ d_keys,
     const ValueT* __restrict__ d_values,
     ValueT* __restrict__ d_aggregates,
-    const unsigned* __restrict__ d_flag_words,
     const PrefixT<OffT>* __restrict__ d_tile_prefix,
     TileValueRecordT<ValueT>* __restrict__ value_records,
     OffT num_items,
@@ -1956,9 +1953,16 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     // this block's smem before the bands run. Unstaged (misaligned values base): the old global
     // path with the fire-and-forget L2 prefetch (v6b receipt).
     extern __shared__ char v_smem_raw[];
-    ValueT* const staged_vals    = (ValueT*) v_smem_raw;
-    unsigned* const staged_flags = (unsigned*) (v_smem_raw + (size_t) tile_size * sizeof(ValueT));
+    ValueT* const staged_vals = (ValueT*) v_smem_raw;
+    // keys stage too: this pass re-derives the head flags from the staged keys instead of
+    // reading persisted flag words (temp storage = O(tiles), the n/8 flag array is gone)
+    constexpr int slot_pad      = policy.slot_pad((int) sizeof(KeyT));
+    constexpr size_t vals_bytes = (((size_t) tile_size * sizeof(ValueT)) + 15) & ~(size_t) 15;
+    KeyT* const staged_keys     = (KeyT*) (v_smem_raw + vals_bytes);
+    const unsigned base_skip    = (alignof(KeyT) < 16) ? ((unsigned) (size_t) d_keys & 15u) : 0u;
+    const int skip_elems        = (int) (base_skip / sizeof(KeyT));
     __shared__ ::cuda::std::uint64_t staged_bar;
+    __shared__ ::cuda::std::uint64_t keys_bar;
 #ifdef K_VSTAGE_T
     constexpr int stage_run_threshold = K_VSTAGE_T;
 #else
@@ -1969,6 +1973,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     {
       {
         ptx::mbarrier_init(&staged_bar, 1);
+        ptx::mbarrier_init(&keys_bar, 1);
         ptx::fence_proxy_async(ptx::space_shared);
       }
       if (stage_run_threshold == 0)
@@ -1998,12 +2003,33 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
           asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vbase16), "r"(vpf_bytes) : "memory");
         }
       }
-      const char* fbase = (const char*) (d_flag_words + (size_t) tile_id * (compute_warps * 32));
-      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fbase),
-                   "r"((unsigned) (compute_warps * 32 * sizeof(unsigned)))
-                   : "memory");
+      if (stage_run_threshold != 0)
+      {
+        const char* kbase        = (const char*) ((size_t) (d_keys + (size_t) tile_id * tile_size) & ~(size_t) 15);
+        const unsigned kpf_bytes = (unsigned) (((size_t) stage_len * sizeof(KeyT)) & ~(size_t) 15);
+        if (kpf_bytes > 0)
+        {
+          asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(kbase), "r"(kpf_bytes) : "memory");
+        }
+      }
     }
-    __syncthreads(); // staged_bar init is visible to every warp past this point
+    if (stage_run_threshold == 0 && threadIdx.x < 32)
+    {
+      // warp 0 issues the keys TMA behind the values one (load_tile_keys owns the pad/skip
+      // legality: tile 0 stages at dst+pad from an in-bounds source)
+      load_tile_keys<tile_size, slot_pad>(
+        staged_keys,
+        d_keys,
+        tile_id,
+        stage_len,
+        tile_id == 0,
+        tile_id == num_tiles - 1,
+        base_skip,
+        &keys_bar,
+        (int) threadIdx.x,
+        true);
+    }
+    __syncthreads(); // barrier inits are visible to every warp past this point
     // trace STEADY-STATE blocks, not the first wave: tiles < 8 run on an uncontended GPU and
     // understate every range by ~1.4x (background-agent receipt: block lifetimes 11.4us steady vs
     // 7.3 first-wave; effective concurrency 5.43/SM)
@@ -2011,10 +2037,21 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     if (ik_rec)
     {
     }
-    const int wt                  = (int) (threadIdx.x >> 5);
-    const int lane_id             = (int) (threadIdx.x & 31);
-    const int tile_len            = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
-    const unsigned my_word        = d_flag_words[(size_t) tile_id * (compute_warps * 32) + wt * 32 + lane_id];
+    const int wt       = (int) (threadIdx.x >> 5);
+    const int lane_id  = (int) (threadIdx.x & 31);
+    const int tile_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
+    unsigned my_word;
+    if constexpr (stage_run_threshold == 0)
+    {
+      wait_parity(&keys_bar, 0); // flags compute rides under the values TMA flight
+      my_word = compute_head_flags<items_per_thread, false>(
+        staged_keys + slot_pad, wt * warp_tile_size, tile_len, tile_id, lane_id, skip_elems);
+    }
+    else
+    {
+      my_word = compute_head_flags<items_per_thread, true>(
+        d_keys + (size_t) tile_id * tile_size, wt * warp_tile_size, tile_len, tile_id, lane_id, 0);
+    }
     const int warp_tile_run_count = __reduce_add_sync(full_mask, __popc(my_word));
     if (lane_id == 0)
     {
@@ -2592,14 +2629,14 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValuePersistentKernel(
 // The record holds only the two value sums; the bookkeeping is derived here: a tile owes a
 // close iff runs exist before it AND it closes them (own head, or input end); the destination
 // is the entering run's rank; the window start is the prefix's last-tile-with-runs; the lead
-// span is empty iff the tile's first element is a head (flag word 0, bit 0).
-template <class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
+// span is empty iff the tile's first element is a head (its key differs from its predecessor).
+template <class KeyT, class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
 _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadCleanupKernel(
   ValueT* d_aggregates,
   const TileValueRecordT<ValueT>* value_records,
   const PrefixT<OffT>* d_tile_prefix,
-  const unsigned* d_flag_words,
-  int flag_words_per_tile,
+  const KeyT* d_keys,
+  int tile_size,
   int num_tiles,
   ReductionOpT reduction_op = {})
 {
@@ -2638,7 +2675,8 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadCleanupKernel(
   }
   if (lane_id == 0)
   {
-    const int lead_has            = !(d_flag_words[(size_t) warp_global * flag_words_per_tile] & 1u);
+    // lead span empty iff the tile's first element is a head: compare it with its predecessor
+    const int lead_has = (d_keys[(size_t) warp_global * tile_size] == d_keys[(size_t) warp_global * tile_size - 1]);
     d_aggregates[runs_before - 1] = lead_has ? reduction_op(carry, value_records[warp_global].lead_agg) : carry;
   }
 }
@@ -2664,7 +2702,6 @@ __launch_bounds__(device_reduce_by_key_lookahead_launch_bounds<PolicySelector>, 
     ValueT* __restrict__ d_aggregates,
     NumRunsT* __restrict__ d_num_runs,
     CountStateT* count_states,
-    unsigned* d_flag_words,
     PrefixT<OffT>* d_tile_prefix,
     OffT num_items,
     int num_tiles,
@@ -2681,7 +2718,6 @@ __launch_bounds__(device_reduce_by_key_lookahead_launch_bounds<PolicySelector>, 
        d_aggregates,
        d_num_runs,
        count_states,
-       d_flag_words,
        d_tile_prefix,
        num_items,
        num_tiles,

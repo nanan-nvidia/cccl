@@ -105,8 +105,7 @@ inline cudaError_t persistent_rbk_encode(
   };
   const size_t pers_bytes =
     align16((size_t) q_tiles * sizeof(CountStateT)) + align16((size_t) q_tiles * sizeof(RecordT))
-    + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>))
-    + align16((size_t) q_tiles * (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned));
+    + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>));
 
   const size_t required = cuda::std::max(cub_bytes, pers_bytes);
   if (d_temp_storage == nullptr)
@@ -139,7 +138,8 @@ inline cudaError_t persistent_rbk_encode(
     return cudaErrorInvalidValue;
   }
   constexpr size_t kValBlockSmemGate =
-    (size_t) Config::kTileSize * sizeof(ValueT) + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned);
+    ((((size_t) Config::kTileSize * sizeof(ValueT)) + 15) & ~(size_t) 15)
+    + (size_t) Config::kPolicy.slot_stride((int) sizeof(KeyT), (int) alignof(KeyT)) * sizeof(KeyT);
   if ((((size_t) d_values & 15) != 0) || (size_t) smem_optin < kValBlockSmemGate)
   {
     return cudaErrorInvalidValue;
@@ -161,7 +161,6 @@ inline cudaError_t persistent_rbk_encode(
   auto* count_states    = (CountStateT*) d_temp_storage;
   auto* value_records   = (RecordT*) ((char*) count_states + align16(tiles * sizeof(CountStateT)));
   auto* tile_prefixes   = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
-  auto* flag_words      = (unsigned*) ((char*) tile_prefixes + align16(tiles * sizeof(TilePrefixT<OffT>)));
   const int init_blocks = (int) ((tiles + 255) / 256);
   // only the tagged COUNT states need clearing; the value records are plain outputs of the main
   // kernel, synchronized by the launch boundary
@@ -182,7 +181,6 @@ inline cudaError_t persistent_rbk_encode(
     d_aggregates,
     d_num_runs,
     count_states,
-    flag_words,
     tile_prefixes,
     num_items,
     (int) tiles,
@@ -200,17 +198,16 @@ inline cudaError_t persistent_rbk_encode(
   // staged mode: one bulk TMA per block pulls the tile's values + flag words into smem (IKET
   // receipt: bands 3.7x faster from smem; the 6-block occupancy is the latency pipeline). The
   // smem is values + flags per block.
-  constexpr size_t kValBlockSmem =
-    (size_t) Config::kTileSize * sizeof(ValueT) + (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned);
+  constexpr size_t kValBlockSmem = kValBlockSmemGate;
   auto* vkernel =
-    rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT, ReductionOpT>;
+    rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, KeyT, ValueT, OffT, ReductionOpT>;
   error = cudaFuncSetAttribute(vkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kValBlockSmem);
   if (error != cudaSuccess)
   {
     return error;
   }
   vkernel<<<(int) tiles, Config::kNumCompWarps * 32, kValBlockSmem, stream>>>(
-    d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles, reduction_op);
+    d_keys, d_values, d_aggregates, tile_prefixes, value_records, num_items, (int) tiles, reduction_op);
   error = cudaPeekAtLastError();
   if (error != cudaSuccess)
   {
@@ -218,8 +215,9 @@ inline cudaError_t persistent_rbk_encode(
   }
   // PASS 3: boundary cleanup (one warp per tile with a pending cross-tile close)
   const int cleanup_blocks = (int) ((tiles * 32 + 255) / 256);
-  rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<ValueT, OffT, ReductionOpT><<<cleanup_blocks, 256, 0, stream>>>(
-    d_aggregates, value_records, tile_prefixes, flag_words, Config::kNumCompWarps * 32, (int) tiles, reduction_op);
+  rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<KeyT, ValueT, OffT, ReductionOpT>
+    <<<cleanup_blocks, 256, 0, stream>>>(
+      d_aggregates, value_records, tile_prefixes, d_keys, Config::kTileSize, (int) tiles, reduction_op);
   return cudaPeekAtLastError();
 }
 #endif // K_FUSED
