@@ -106,10 +106,7 @@ inline cudaError_t persistent_rbk_encode(
   const size_t pers_bytes =
     align16((size_t) q_tiles * sizeof(TilePartialStateT)) + align16((size_t) q_tiles * sizeof(RecordT))
     + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>))
-#  ifdef RBK_PERSIST_FLAGS
-    + align16((size_t) q_tiles * (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned))
-#  endif
-    ;
+    + align16((size_t) q_tiles * (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned));
 
   const size_t required = cuda::std::max(cub_bytes, pers_bytes);
   if (d_temp_storage == nullptr)
@@ -160,12 +157,10 @@ inline cudaError_t persistent_rbk_encode(
       num_items,
       stream);
   }
-  auto* count_states  = (TilePartialStateT*) d_temp_storage;
-  auto* value_records = (RecordT*) ((char*) count_states + align16(tiles * sizeof(TilePartialStateT)));
-  auto* tile_prefixes = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
-#  ifdef RBK_PERSIST_FLAGS
-  auto* flag_words = (unsigned*) ((char*) tile_prefixes + align16(tiles * sizeof(TilePrefixT<OffT>)));
-#  endif
+  auto* count_states    = (TilePartialStateT*) d_temp_storage;
+  auto* value_records   = (RecordT*) ((char*) count_states + align16(tiles * sizeof(TilePartialStateT)));
+  auto* tile_prefixes   = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
+  auto* flag_words      = (unsigned*) ((char*) tile_prefixes + align16(tiles * sizeof(TilePrefixT<OffT>)));
   const int init_blocks = (int) ((tiles + 255) / 256);
   // only the tagged COUNT states need clearing; the value records are plain outputs of the main
   // kernel, synchronized by the launch boundary
@@ -186,9 +181,7 @@ inline cudaError_t persistent_rbk_encode(
     d_aggregates,
     d_num_runs,
     count_states,
-#  ifdef RBK_PERSIST_FLAGS
     flag_words,
-#  endif
     tile_prefixes,
     num_items,
     (int) tiles,
@@ -208,24 +201,14 @@ inline cudaError_t persistent_rbk_encode(
   // smem is values + flags per block.
   constexpr size_t kValBlockSmem = kValBlockSmemGate;
   auto* vkernel =
-    rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, KeyT, ValueT, OffT, ReductionOpT>;
+    rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT, ReductionOpT>;
   error = cudaFuncSetAttribute(vkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kValBlockSmem);
   if (error != cudaSuccess)
   {
     return error;
   }
   vkernel<<<(int) tiles, Config::kNumCompWarps * 32, kValBlockSmem, stream>>>(
-    d_keys,
-    d_values,
-    d_aggregates,
-#  ifdef RBK_PERSIST_FLAGS
-    flag_words,
-#  endif
-    tile_prefixes,
-    value_records,
-    num_items,
-    (int) tiles,
-    reduction_op);
+    d_values, d_aggregates, flag_words, tile_prefixes, value_records, num_items, (int) tiles, reduction_op);
   error = cudaPeekAtLastError();
   if (error != cudaSuccess)
   {

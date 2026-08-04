@@ -28,9 +28,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   ValueT* __restrict__ d_aggregates,
   NumRunsT* __restrict__ d_num_runs,
   TilePartialStateT* __restrict__ count_states,
-#ifdef RBK_PERSIST_FLAGS
   unsigned* __restrict__ d_flag_words, // [num_tiles][compute_warps*32]: the persisted run structure
-#endif
   PrefixT<OffT>* __restrict__ d_tile_prefix, // [num_tiles]: packed (run prefix, last headed tile)
   OffT num_items,
   int num_tiles,
@@ -268,13 +266,11 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
             reduce_and_publish_tile_state<compute_warps>(
               count_states, tile_id, tile_len, warp_run_counts[slot_id], warp_last_heads[slot_id], lane_id);
           }
-          // no position staging: consumers decode run boundaries from the flag words. Under
-          // RBK_PERSIST_FLAGS they also persist to global (the original two-pass: the value pass
-          // reads them back, n/8 bytes of temp); default: the value pass recomputes flags from keys
-          head_flag_buf[slot_id][compute_warp_id * 32 + lane_id] = my_flags;
-#ifdef RBK_PERSIST_FLAGS
+          // no position staging: consumers decode run boundaries from the flag words. They also
+          // PERSIST to global: they are the whole run structure the value pass needs (n/8 bytes
+          // of temp, the documented cost of the two-pass design)
+          head_flag_buf[slot_id][compute_warp_id * 32 + lane_id]                                 = my_flags;
           d_flag_words[(size_t) tile_id * (compute_warps * 32) + compute_warp_id * 32 + lane_id] = my_flags;
-#endif
           const unsigned nonempty_words = __ballot_sync(full_mask, my_flags != 0);
           if (lane_id == 0)
           {
@@ -521,19 +517,16 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadInitKernel(StateT* states
 // whole run structure, the persisted tile prefix is the whole cross-tile coordination. No rings,
 // no barriers beyond __syncthreads, no lookahead, no work stealing -- latency hides behind plain
 // occupancy. Emits every within-tile-closed aggregate + the boundary record for the cleanup pass.
-template <typename PolicySelector, class KeyT, class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
+template <typename PolicySelector, class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
 #ifdef RBK_VBLOCKS
 __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32, RBK_VBLOCKS)
 #else
 __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32, 6)
 #endif
   _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValueKernel(
-    const KeyT* __restrict__ d_keys,
     const ValueT* __restrict__ d_values,
     ValueT* __restrict__ d_aggregates,
-#ifdef RBK_PERSIST_FLAGS
     const unsigned* __restrict__ d_flag_words,
-#endif
     const PrefixT<OffT>* __restrict__ d_tile_prefix,
     TileValueRecordT<ValueT>* __restrict__ value_records,
     OffT num_items,
@@ -610,39 +603,19 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
           asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vbase16), "r"(vpf_bytes) : "memory");
         }
       }
-#ifdef RBK_PERSIST_FLAGS
       const char* fbase = (const char*) (d_flag_words + (size_t) tile_id * (compute_warps * 32));
       asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fbase),
                    "r"((unsigned) (compute_warps * 32 * sizeof(unsigned)))
                    : "memory");
-#else
-      if (stage_run_threshold != 0)
-      {
-        const char* kbase        = (const char*) ((size_t) (d_keys + (size_t) tile_id * tile_size) & ~(size_t) 15);
-        const unsigned kpf_bytes = (unsigned) (((size_t) stage_len * sizeof(KeyT)) & ~(size_t) 15);
-        if (kpf_bytes > 0)
-        {
-          asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(kbase), "r"(kpf_bytes) : "memory");
-        }
-      }
-#endif
     }
     __syncthreads(); // staged_bar init is visible to every warp past this point
     // trace STEADY-STATE blocks, not the first wave: tiles < 8 run on an uncontended GPU and
     // understate every range by ~1.4x (background-agent receipt: block lifetimes 11.4us steady vs
     // 7.3 first-wave; effective concurrency 5.43/SM)
-    const int wt       = (int) (threadIdx.x >> 5);
-    const int lane_id  = (int) (threadIdx.x & 31);
-    const int tile_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
-#ifdef RBK_PERSIST_FLAGS
-    const unsigned my_word = d_flag_words[(size_t) tile_id * (compute_warps * 32) + wt * 32 + lane_id];
-#else
-    // recompute the flags from the keys via LDG: single-use streaming reads don't earn smem
-    // residency (the values tile keeps the whole budget, 6 blocks/SM), and the loads ride
-    // under the values TMA flight -- nothing waits on values until band time
-    const unsigned my_word = compute_head_flags<items_per_thread, true>(
-      d_keys + (size_t) tile_id * tile_size, wt * warp_tile_size, tile_len, tile_id, lane_id, 0);
-#endif
+    const int wt                  = (int) (threadIdx.x >> 5);
+    const int lane_id             = (int) (threadIdx.x & 31);
+    const int tile_len            = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
+    const unsigned my_word        = d_flag_words[(size_t) tile_id * (compute_warps * 32) + wt * 32 + lane_id];
     const int warp_tile_run_count = __reduce_add_sync(full_mask, __popc(my_word));
     if (lane_id == 0)
     {
@@ -994,9 +967,7 @@ __launch_bounds__(device_reduce_by_key_lookahead_launch_bounds<PolicySelector>, 
     ValueT* __restrict__ d_aggregates,
     NumRunsT* __restrict__ d_num_runs,
     TilePartialStateT* count_states,
-#ifdef RBK_PERSIST_FLAGS
     unsigned* d_flag_words,
-#endif
     PrefixT<OffT>* d_tile_prefix,
     OffT num_items,
     int num_tiles,
@@ -1013,9 +984,7 @@ __launch_bounds__(device_reduce_by_key_lookahead_launch_bounds<PolicySelector>, 
        d_aggregates,
        d_num_runs,
        count_states,
-#ifdef RBK_PERSIST_FLAGS
        d_flag_words,
-#endif
        d_tile_prefix,
        num_items,
        num_tiles,
