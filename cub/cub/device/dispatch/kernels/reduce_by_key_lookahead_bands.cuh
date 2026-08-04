@@ -16,46 +16,34 @@ CUB_NAMESPACE_BEGIN
 
 namespace detail::reduce_by_key
 {
-// warp-parallel strided sum over [begin, end) of the tile's values (lead/tail segments and the
-// long-span cooperative walks; every lane participates)
-// order-preserving warp fold of [begin, end): lane l folds a CONTIGUOUS chunk, then a
-// lane-ascending shfl_down tree combines the chunks. The chunk stride is forced ODD so the
-// per-lane smem walks stay bank-conflict-free (a 32-multiple stride lands every lane on one
-// bank). No identity element is assumed: empty chunks carry a has-flag. Every combine is
-// op(earlier indices, later indices) -- associativity is the only requirement.
+// when there is less than 4 runs in this warptile, we just do warp reduce one by one
 template <class ValueT, class ReductionOpT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT
 warp_span_fold(const ValueT* tile_vals, int begin, int end, int lane_id, ReductionOpT op)
 {
   const int len     = end - begin;
-  const int chunk   = (len > 0) ? (((len + 31) / 32) | 1) : 1; // ODD stride: conflict-free lane walks
+  const int chunk   = (len > 0) ? (((len + 31) / 32) | 1) : 1;
   const int lo      = begin + lane_id * chunk;
   const int hi      = min(lo + chunk, end);
-  const int n_valid = (len > 0) ? ((len + chunk - 1) / chunk) : 0; // nonempty chunks are a PREFIX
+  const int n_valid = (len > 0) ? ((len + chunk - 1) / chunk) : 0;
   ValueT acc{};
   if (lo < hi)
   {
-    acc = tile_vals[lo]; // the first element seeds: no identity element exists for a general op
+    acc = tile_vals[lo];
     for (int pos = lo + 1; pos < hi; ++pos)
     {
       acc = op(acc, tile_vals[pos]);
     }
   }
-  // cub::WarpReduce: ascending shfl_down tree over the first n_valid lanes, associativity-only
-  // (order-preserving; lane-ascending = element-ascending). Result is valid on lane 0.
   typename WarpReduce<ValueT>::TempStorage storage;
   return WarpReduce<ValueT>(storage).Reduce(acc, op, n_valid);
 }
 
-// ROTATED REGISTER-WALK band: the branchless chunk walk with its one receipted flaw removed.
-// Lane-contiguous chunks (chunk l == row l) bank-conflict 32-way on every load; rotating each
-// row r IN PLACE by r makes the walk's column-step banks (e+l) mod 32 -- conflict-free with ZERO
-// extra smem, no shuffles, no padding. The walk itself stays pure FADD/FSEL + one predicated
-// store (SASS receipted branchless). MIO per warp tile ~= 96 plain smem ops; no collectives.
+// when we have 4-255 runs per warp tile: each lane processes its own 32 elements
 template <int items_per_thread, class ValueT, class OffT, class ReductionOpT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   ValueT* __restrict__ d_aggregates,
-  ValueT* __restrict__ smem_vals, // the staged tile; rows get ROTATED in place
+  ValueT* __restrict__ smem_vals, // the staged tile
   unsigned my_word,
   OffT global_runs_before_warp_tile,
   int warp_tile_offset,
@@ -65,12 +53,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   ValueT& lead_out,
   ValueT& tail_out)
 {
-  static_assert(items_per_thread == 32, "the rotated walk assumes 32x32 warp tiles");
   ValueT* const wt_base = smem_vals + warp_tile_offset;
-  // QUAD-granularity rotation (SASS census: the scalar form spent 222 integer ops/wt on rotated
-  // addressing + bit tests): rotate row r's eight 16B quads by (r & 7). Eight LDS.128/STS.128
-  // pairs replace 32 scalar pairs; the walk then loads four elements per LDS.128 at quad index
-  // (c + lane) & 7 -- 4-phase bank-optimal both ways.
+  // first, rotate to avoid bank conflicts
 #pragma unroll
   for (int rr = 0; rr < 8; ++rr)
   {
@@ -87,7 +71,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   int rank_scan;
   WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, rank_scan);
   const OffT gbase = global_runs_before_warp_tile + (rank_scan - my_popc);
-  const int valid  = min(max(wt_end - (warp_tile_offset + lane_id * 32), 0), 32);
   ValueT prefix_sum{};
   ValueT sum_since_head{};
   bool seen = false; // any head so far: the COUNT is dead since the indexed
