@@ -28,12 +28,10 @@
 
 CUB_NAMESPACE_BEGIN
 
-namespace detail::reduce_by_key::lookahead
+namespace detail::reduce_by_key
 {
 namespace ptx = ::cuda::ptx;
 
-// shared warpspeed machinery comes from the RLE lookahead kernel this one is derived from;
-// only the RBK-specific pieces are defined below
 using rle::encode::clc_next_tile_id;
 using rle::encode::compute_head_flags;
 using rle::encode::load_tile_keys;
@@ -162,6 +160,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_xor_sync_wide(T v, int mask)
     return ::cuda::std::bit_cast<T>(hv);
   }
 }
-} // namespace detail::reduce_by_key::lookahead
+} // namespace detail::reduce_by_key
 
 CUB_NAMESPACE_END

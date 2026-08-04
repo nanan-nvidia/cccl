@@ -1,6 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-
 #pragma once
 
 #include <cub/config.cuh>
@@ -17,21 +14,8 @@
 
 CUB_NAMESPACE_BEGIN
 
-namespace detail::reduce_by_key::lookahead
+namespace detail::reduce_by_key
 {
-// pre-seeded plain span walk: nvcc pipelines the loads across the FADD chain on its own
-// (the blocked-prefetch variant measured SLOWER: round-6 receipt)
-template <class ValueT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT span_sum_prefetched(const ValueT* tile_vals, int pos, const int end)
-{
-  ValueT agg = tile_vals[pos];
-  for (++pos; pos < end; ++pos)
-  {
-    agg += tile_vals[pos];
-  }
-  return agg;
-}
-
 // ROTATED REGISTER-WALK band: the branchless chunk walk with its one receipted flaw removed.
 // Lane-contiguous chunks (chunk l == row l) bank-conflict 32-way on every load; rotating each
 // row r IN PLACE by r makes the walk's column-step banks (e+l) mod 32 -- conflict-free with ZERO
@@ -163,229 +147,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   const int first_head_lane = __ffs(bmask) - 1; // caller guarantees bmask != 0
   lead_out                  = shfl_sync_wide(incoming, first_head_lane);
   tail_out                  = shfl_sync_wide(sseg, 31);
-}
-
-// TWO-LEVEL SEGMENTED SCAN band (the receipted design): pass A runs an independent 5-step
-// masked scan per ROW (row-major = conflict-free; NO cross-row carry, so the shuffle chains of
-// consecutive rows overlap and the pass is issue-bound), writing local prefixes back over the
-// staged values IN PLACE and collecting row totals one-per-lane. Pass B is ONE masked scan over
-// the 32 row totals (segment breaks at rows containing heads) = each row's incoming carry.
-// Emission is pure lookups, R-proportional: the run ending at position p is
-// S_local[p] + (carry[row] iff p precedes the row's first head). Left-to-right numerics.
-// The two receipted serializers this replaces: the chunk walk's 32-way bank-conflicted lane
-// chunks, and the streaming scan's row-to-row carry chain.
-template <int items_per_thread, class ValueT, class OffT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE void scan_lookup_from_flags(
-  ValueT* __restrict__ d_aggregates,
-  ValueT* smem_vals, // the staged warp tile; OVERWRITTEN with local prefixes
-  unsigned my_word,
-  OffT global_runs_before_warp_tile,
-  int warp_tile_offset,
-  int lane_id,
-  ValueT* row_carry, // [32] per-warp-tile scratch
-  ValueT& lead_out,
-  ValueT& tail_out)
-{
-  static_assert(items_per_thread == 32, "the scan band assumes 32x32 warp tiles");
-  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
-  // ---- pass A: independent local row scans, in place; row totals collect one per lane ----
-  ValueT my_row_total = ValueT{};
-#pragma unroll
-  for (int r = 0; r < items_per_thread; ++r)
-  {
-    const unsigned w = __shfl_sync(full_mask, my_word, r);
-    const int loc    = warp_tile_offset + r * 32 + lane_id;
-    ValueT incl      = smem_vals[loc];
-#pragma unroll
-    for (int off = 1; off < 32; off <<= 1)
-    {
-      const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-      const ValueT from_left   = __shfl_up_sync(full_mask, incl, off);
-      if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u))
-      {
-        incl += from_left;
-      }
-    }
-    smem_vals[loc]         = incl; // local prefix (no incoming carry yet)
-    const ValueT row_total = __shfl_sync(full_mask, incl, 31); // sum since the row's last head
-    if (lane_id == r)
-    {
-      my_row_total = row_total;
-    }
-  }
-  // ---- pass B: one masked scan across row totals; break at rows that contain a head ----
-  const bool row_has_head = (my_word != 0);
-  const unsigned rmask    = __ballot_sync(full_mask, row_has_head);
-  ValueT rs               = my_row_total;
-#pragma unroll
-  for (int off = 1; off < 32; off <<= 1)
-  {
-    const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-    const ValueT from_left   = __shfl_up_sync(full_mask, rs, off);
-    if (lane_id >= off && ((rmask & upto_l & ~upto_prev) == 0u))
-    {
-      rs += from_left;
-    }
-  }
-  // carry INTO row l = rs of row l-1 (sum since the last head at or before row l-1)
-  const ValueT my_carry = __shfl_up_sync(full_mask, rs, 1);
-  row_carry[lane_id]    = (lane_id > 0) ? my_carry : ValueT{};
-  __syncwarp();
-  // ---- emission: lane l owns row l's heads; the run ENDING at head bit b lives at p = b-1 ----
-  const int my_popc = __popc(my_word);
-  typename WarpScan<int>::TempStorage warp_scan_storage;
-  int rank_scan;
-  WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, rank_scan);
-  const OffT gbase      = global_runs_before_warp_tile + (rank_scan - my_popc);
-  const unsigned w_prev = __shfl_up_sync(full_mask, my_word, 1); // row l-1's word (row -1: garbage, unused)
-  ValueT* const out     = d_aggregates + gbase;
-  auto s_final          = [&](int p) _CCCL_FORCEINLINE_LAMBDA { // p = absolute pos within the warp tile
-    const int prow       = p >> 5;
-    const int pbit       = p & 31;
-    const unsigned pword = (prow == lane_id) ? my_word : w_prev; // emission only touches rows l and l-1
-    const bool pre_head  = (pword & ((2u << pbit) - 1)) == 0u; // no head at or before p in its row
-    return smem_vals[warp_tile_offset + p] + (pre_head ? row_carry[prow] : ValueT{});
-  };
-  const int runs_before_lane = rank_scan - my_popc;
-  unsigned rem               = my_word;
-  int i                      = 0;
-  while (rem != 0)
-  {
-    const int b = __ffs(rem) - 1;
-    rem &= rem - 1;
-    // my i-th head is the wt's head number (runs_before_lane + i); every head but the wt's FIRST
-    // closes the run ranked one before my base (the first head's incoming span is the wt lead)
-    if (runs_before_lane + i > 0)
-    {
-      out[i - 1] = s_final(lane_id * 32 + b - 1);
-    }
-    ++i;
-  }
-  // wt lead: the span before the wt's first head, looked up BY the lane owning that row (the
-  // s_final word registers are per-lane)
-  const unsigned head_rows  = __ballot_sync(full_mask, my_word != 0);
-  const int first_head_lane = __ffs(head_rows) - 1; // caller guarantees runs >= 1
-  int fh_bit                = (lane_id == first_head_lane) ? (__ffs(my_word) - 1) : 0;
-  fh_bit                    = __shfl_sync(full_mask, fh_bit, first_head_lane);
-  const int lead_end        = first_head_lane * 32 + fh_bit - 1;
-  const int lead_row        = lead_end >> 5;
-  ValueT lead_val{};
-  if (lead_end >= 0 && lane_id == lead_row)
-  {
-    const bool pre = (my_word & ((2u << (lead_end & 31)) - 1)) == 0u;
-    lead_val       = smem_vals[warp_tile_offset + lead_end] + (pre ? row_carry[lead_row] : ValueT{});
-  }
-  lead_out = (lead_end >= 0) ? __shfl_sync(full_mask, lead_val, lead_row & 31) : ValueT{};
-  // tail: rs at lane 31 = sum since the wt's last head (rows past the last head have no breaks)
-  tail_out = __shfl_sync(full_mask, rs, 31);
-}
-
-// single-read per-lane chunk band: lane l owns elements [32l, 32l+32) of the warp tile, which
-// is EXACTLY flag word l. Loads are 512B/instruction coalesced (LDG.128 per lane); each lane
-// closes its interior runs straight from the register walk; ONE masked segmented scan over the
-// lane sums closes every cross-lane run and yields the warp tile's lead and tail as byproducts.
-// Replaces the whole-warp/wave/per-lane span-walk bands, whose serial latency chains AND
-// separate lead/tail re-reads (up to a full extra pass at seg1024) were the mid-regime tax.
-template <int items_per_thread, class ValueT, class OffT, class ReductionOpT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_from_flags(
-  ValueT* __restrict__ d_aggregates,
-  const ValueT* __restrict__ tile_vals,
-  unsigned my_word,
-  OffT global_runs_before_warp_tile,
-  int warp_tile_offset,
-  int wt_end,
-  int lane_id,
-  ReductionOpT op,
-  ValueT& lead_out,
-  ValueT& tail_out)
-{
-  static_assert(items_per_thread == 32, "the chunk band assumes 32x32 warp tiles");
-  const int chunk_begin = warp_tile_offset + lane_id * 32;
-  const int valid       = min(max(wt_end - chunk_begin, 0), 32);
-  const int my_popc     = __popc(my_word);
-  typename WarpScan<int>::TempStorage warp_scan_storage;
-  int rank_scan;
-  WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, rank_scan);
-  const OffT gbase = global_runs_before_warp_tile + (rank_scan - my_popc);
-  ValueT prefix_sum{}; // sum of my elements before my first head
-  ValueT sum_since_head{};
-  int heads_seen      = 0;
-  const ValueT* chunk = tile_vals + chunk_begin;
-  ValueT* const out   = d_aggregates + gbase; // register base: no per-step LDC rematerialization
-  // BRANCHLESS walk (SASS receipt: the if/elif/else form compiled to a BSSY/BRA/BSYNC divergent
-  // block PER ELEMENT -- ~5700 cycles/warp tile for compute that costs ~300): selects + one
-  // predicated store, nothing for lanes to diverge on
-  // e == 0 seeds both accumulators: no identity element is ever combined in
-  auto step = [&](int e, ValueT v) _CCCL_FORCEINLINE_LAMBDA {
-    const bool head      = (my_word >> e) & 1u;
-    const ValueT new_ssh = head ? v : ((e == 0) ? v : op(sum_since_head, v));
-    const ValueT new_pfx = (head || heads_seen > 0) ? prefix_sum : ((e == 0) ? v : op(prefix_sum, v));
-    if (head && heads_seen > 0)
-    {
-      out[heads_seen - 1] = sum_since_head; // interior run closes in-lane
-    }
-    heads_seen += (int) head;
-    sum_since_head = new_ssh;
-    prefix_sum     = new_pfx;
-  };
-  if (valid == 32 && sizeof(ValueT) == 4 && (((size_t) chunk & 15) == 0))
-  {
-#pragma unroll
-    for (int c = 0; c < 8; ++c)
-    {
-      ValueT v4[4];
-      *(uint4*) v4 = *(const uint4*) (chunk + 4 * c);
-#pragma unroll
-      for (int j = 0; j < 4; ++j)
-      {
-        step(4 * c + j, v4[j]);
-      }
-    }
-  }
-  else
-  {
-    for (int e = 0; e < valid; ++e)
-    {
-      step(e, chunk[e]);
-    }
-  }
-  const bool has_head   = heads_seen > 0;
-  const ValueT t        = has_head ? sum_since_head : prefix_sum; // fold since the last head at or before me
-  const unsigned bmask  = __ballot_sync(full_mask, has_head);
-  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
-  ValueT s              = t;
-  int s_has             = valid > 0; // trailing lanes past wt_end hold no elements
-#pragma unroll
-  for (int off = 1; off < 32; off <<= 1)
-  {
-    const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-    const ValueT from_left   = shfl_up_sync_wide(s, off);
-    const int from_has       = __shfl_up_sync(full_mask, s_has, off);
-    if (lane_id >= off && ((bmask & upto_l & ~upto_prev) == 0u) && from_has)
-    {
-      s     = s_has ? op(from_left, s) : from_left;
-      s_has = 1;
-    }
-  }
-  const ValueT s_prev = shfl_up_sync_wide(s, 1);
-  // my chunk-lead (prefix_sum) is empty exactly when my element 0 is a head
-  const int pfx_has = !(my_word & 1u);
-  ValueT incoming{};
-  int incoming_has = 0;
-  if (has_head)
-  {
-    // the run ENDING at my first head: its rank is one before my first owned run. Lanes below a
-    // headed lane are never empty (chunks are contiguous), so s_prev is valid whenever lane > 0.
-    incoming     = (lane_id > 0) ? (pfx_has ? op(s_prev, prefix_sum) : s_prev) : prefix_sum;
-    incoming_has = (lane_id > 0) | pfx_has;
-    if ((bmask & ((1u << lane_id) - 1)) != 0)
-    {
-      d_aggregates[gbase - 1] = incoming;
-    }
-  }
-  const int first_head_lane = __ffs(bmask) - 1; // caller guarantees bmask != 0
-  lead_out                  = shfl_sync_wide(incoming, first_head_lane);
-  tail_out                  = shfl_sync_wide(s, 31); // fold since the warp tile's last head
 }
 
 // values-only streaming reduce over one warp tile, boundaries from REGISTER flag words (the
@@ -878,6 +639,6 @@ struct HeadFlagDecodeT
     return {head_pos_in_warp_tile, next_head_pos};
   }
 };
-} // namespace detail::reduce_by_key::lookahead
+} // namespace detail::reduce_by_key
 
 CUB_NAMESPACE_END

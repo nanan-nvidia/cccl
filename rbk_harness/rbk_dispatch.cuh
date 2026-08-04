@@ -8,7 +8,7 @@
 
 namespace rbk_impl
 {
-namespace rbk_kernels = CUB_NS_QUALIFIER::detail::reduce_by_key::lookahead;
+namespace rbk_kernels = CUB_NS_QUALIFIER::detail::reduce_by_key;
 
 using TilePartialStateT = rbk_kernels::TilePartialStateT;
 template <class ValueT>

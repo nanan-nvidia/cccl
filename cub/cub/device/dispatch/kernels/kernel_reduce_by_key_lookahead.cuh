@@ -17,7 +17,7 @@
 
 CUB_NAMESPACE_BEGIN
 
-namespace detail::reduce_by_key::lookahead
+namespace detail::reduce_by_key
 {
 // we aim for 1 block/SM since it is easier to manage resources: we do not need to worry about occupancy anymore
 template <typename PolicySelector, class KeyT, class ValueT, class NumRunsT, class OffT>
@@ -71,7 +71,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   constexpr int tile_size      = policy.tile_size();
   constexpr int slot_pad       = policy.slot_pad((int) sizeof(KeyT));
   constexpr int slot_stride    = policy.slot_stride((int) sizeof(KeyT), (int) alignof(KeyT));
-  using PrefixT                = reduce_by_key::lookahead::PrefixT<OffT>;
+  using PrefixT                = reduce_by_key::PrefixT<OffT>;
   // the dense band's fused-stream crossover (runs per warp tile); below it, per-run span walks
   // are output-proportional and cheaper
 #ifdef RBK_STREAM_DIV
@@ -992,6 +992,6 @@ __launch_bounds__(device_reduce_by_key_lookahead_launch_bounds<PolicySelector>, 
        pos_ring_stages,
        keys_staged);))
 }
-} // namespace detail::reduce_by_key::lookahead
+} // namespace detail::reduce_by_key
 
 CUB_NAMESPACE_END
