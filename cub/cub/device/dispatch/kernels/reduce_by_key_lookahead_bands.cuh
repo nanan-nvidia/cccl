@@ -16,6 +16,118 @@ CUB_NAMESPACE_BEGIN
 
 namespace detail::reduce_by_key
 {
+// warp-parallel strided sum over [begin, end) of the tile's values (lead/tail segments and the
+// long-span cooperative walks; every lane participates)
+// order-preserving warp fold of [begin, end): lane l folds a CONTIGUOUS chunk, then a
+// lane-ascending shfl_down tree combines the chunks. The chunk stride is forced ODD so the
+// per-lane smem walks stay bank-conflict-free (a 32-multiple stride lands every lane on one
+// bank). No identity element is assumed: empty chunks carry a has-flag. Every combine is
+// op(earlier indices, later indices) -- associativity is the only requirement.
+template <class ValueT, class ReductionOpT>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT
+warp_span_fold(const ValueT* tile_vals, int begin, int end, int lane_id, ReductionOpT op)
+{
+  const int len     = end - begin;
+  const int chunk   = (len > 0) ? (((len + 31) / 32) | 1) : 1; // ODD stride: conflict-free lane walks
+  const int lo      = begin + lane_id * chunk;
+  const int hi      = min(lo + chunk, end);
+  const int n_valid = (len > 0) ? ((len + chunk - 1) / chunk) : 0; // nonempty chunks are a PREFIX
+  ValueT acc{};
+  if (lo < hi)
+  {
+    acc = tile_vals[lo]; // the first element seeds: no identity element exists for a general op
+    for (int pos = lo + 1; pos < hi; ++pos)
+    {
+      acc = op(acc, tile_vals[pos]);
+    }
+  }
+  // cub::WarpReduce: ascending shfl_down tree over the first n_valid lanes, associativity-only
+  // (order-preserving; lane-ascending = element-ascending). Result is valid on lane 0.
+  typename WarpReduce<ValueT>::TempStorage storage;
+  return WarpReduce<ValueT>(storage).Reduce(acc, op, n_valid);
+}
+
+// the compute warp may deem this warp tile too sparse to be worth the position-staging, and in that case it will write
+// only the 32 head-flag words. Then, it is up to the store warps to "decode" the positions from the headflags.
+// one warp tile is 32 chunks x 32 elements, so lane i owns word i.
+// This buys 2.5% BWUtil in the MaxSegSize{2^4, 2^6, 2^8}
+struct HeadFlagDecodeT
+{
+  unsigned lane_head_flag_word;
+  int lane_runs_before_word;
+  int lane_first_head_from_word;
+
+  _CCCL_DEVICE_API _CCCL_FORCEINLINE HeadFlagDecodeT(const unsigned* slot_head_flags, int warp_tile_id, int lane_id)
+      : HeadFlagDecodeT(slot_head_flags[warp_tile_id * 32 + lane_id], lane_id)
+  {}
+
+  // register-word form: the value warps snapshot flag words and decode with no smem dependency
+  _CCCL_DEVICE_API _CCCL_FORCEINLINE HeadFlagDecodeT(unsigned lane_word, int lane_id)
+  {
+    lane_head_flag_word           = lane_word;
+    const int lane_word_run_count = __popc(lane_head_flag_word);
+    typename WarpScan<int>::TempStorage warp_scan_storage;
+    int lane_word_run_count_scan;
+    WarpScan<int>(warp_scan_storage).InclusiveSum(lane_word_run_count, lane_word_run_count_scan);
+    // lane i: # of runs starting in head_flag words [0, i), i.e. in elements [0, i*32)
+    lane_runs_before_word = lane_word_run_count_scan - lane_word_run_count;
+    // lane i -> first head position in head flag words [i, 32)
+    // if our own run_count is >0, the head is here!
+    // empty should be +infinity, since we use min
+    lane_first_head_from_word = lane_word_run_count ? (lane_id * 32 + __ffs(lane_head_flag_word) - 1) : 0x7fffffff;
+    // if not, we loop to find the next head in flag word [i, 32). this is just a fold with min
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1)
+    {
+      const int shuffled_first_head = __shfl_down_sync(full_mask, lane_first_head_from_word, offset);
+      lane_first_head_from_word =
+        min(lane_first_head_from_word, (lane_id + offset < 32) ? shuffled_first_head : 0x7fffffff);
+    }
+    // now, lane i holds the next head in [i, 32). we precalculate this in parallel
+  }
+
+  _CCCL_DEVICE_API _CCCL_FORCEINLINE RunSpanT decode_run(int run_idx) const
+  {
+    // first question: which head_flag word contains my run's (run_idx) head?
+    // lane_runs_before_word's row i = number of heads in words [0, i)
+    // the word containing run_dex is then the largest i with runs_before(i) that is <= j
+    // we do binary search over the distributed lane_runs_before_word table held across the warp
+    int flag_word_idx = 0;
+#pragma unroll
+    for (int step = 16; step; step >>= 1)
+    {
+      // propose candidate
+      const int candidate_word_idx = flag_word_idx + step;
+      // read the i'th row
+      const int candidate_runs_before = __shfl_sync(full_mask, lane_runs_before_word, candidate_word_idx & 31);
+      if (candidate_word_idx < 32 && candidate_runs_before <= run_idx)
+      {
+        flag_word_idx = candidate_word_idx;
+      }
+    }
+    // the lane now knows the index of the word containing its head
+    // we need to convert it to the element position
+    // where is my head in the word?
+    const int run_rank_in_word = run_idx - __shfl_sync(full_mask, lane_runs_before_word, flag_word_idx);
+    // get the actual word
+    const unsigned flag_word = __shfl_sync(full_mask, lane_head_flag_word, flag_word_idx);
+    // where's the first head in any word after mine?
+    const int first_head_after_word = __shfl_sync(full_mask, lane_first_head_from_word, (flag_word_idx + 1) & 31);
+    // how many heads my word has?
+    const int flag_word_run_count = __popc(flag_word);
+    // position of my head inside the word
+    const int head_bit_in_word =
+      nth_set_bit(flag_word, (run_rank_in_word < flag_word_run_count) ? run_rank_in_word : 0);
+    const int head_pos_in_warp_tile = flag_word_idx * 32 + head_bit_in_word;
+    // where does my run end? try find the position of next head in word
+    const int next_head_in_word = flag_word_idx * 32 + __ffs(flag_word & (~1u << head_bit_in_word)) - 1;
+    // does my word contain a head after mine? if not, next_head_in_word is garbage, and we use first_head_after_word
+    const int next_head_pos = (run_rank_in_word + 1 < flag_word_run_count) ? next_head_in_word : first_head_after_word;
+    // NOTE: for the last run head in warp tile, next_head_pos is garbage
+    return {head_pos_in_warp_tile, next_head_pos};
+  }
+};
+
 // ROTATED REGISTER-WALK band: the branchless chunk walk with its one receipted flaw removed.
 // Lane-contiguous chunks (chunk l == row l) bank-conflict 32-way on every load; rotating each
 // row r IN PLACE by r makes the walk's column-step banks (e+l) mod 32 -- conflict-free with ZERO
@@ -147,140 +259,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void chunk_reduce_rotated(
   const int first_head_lane = __ffs(bmask) - 1; // caller guarantees bmask != 0
   lead_out                  = shfl_sync_wide(incoming, first_head_lane);
   tail_out                  = shfl_sync_wide(sseg, 31);
-}
-
-// values-only streaming reduce over one warp tile, boundaries from REGISTER flag words (the
-// value warps snapshot the flags and run fully detached from the rings). Emits every
-// within-warp-tile-closed aggregate; the trailing open sum comes back as the carry. The scan
-// loop is the FROZEN form -- lead/tail ride separate passes, never inside it.
-template <int items_per_thread, bool full_tile, class ValueT, class OffT, class ReductionOpT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
-  ValueT* __restrict__ d_aggregates,
-  const ValueT* __restrict__ tile_vals,
-  unsigned my_word,
-  OffT global_runs_before_warp_tile,
-  int warp_tile_offset,
-  int tile_len,
-  int lane_id,
-  ReductionOpT op,
-  ValueT& tail_out)
-{
-  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1); // bits [0, lane]
-  // ROW-LEVEL output pointer (replaces the entry WarpScan + a per-element SHFL+IADD of
-  // runs-before-word, and confines any base rematerialization to once per ROW): the row's
-  // emission slots are row_out[popc(w & upto_l) - 1]; rank -1 legally reaches the previous
-  // row's last slot (a run closing across the row boundary)
-  ValueT* row_out     = d_aggregates + global_runs_before_warp_tile;
-  int runs_before_row = 0; // scalar: gates the entering-run skip (global run_idx < 0)
-  // CHUNKED preload: 8 rows in flight instead of the whole warp tile -- the full-tile buffer put
-  // the kernel at 32+ live registers/lane and SPILLED TO LOCAL under high occupancy (B200
-  // receipt: VEmit 16us/warp-tile of local-memory thrash). The scan carry crosses chunks freely.
-  constexpr int chunk_rows = (items_per_thread < 8) ? items_per_thread : 8;
-  ValueT carry{};
-  int carry_has = 0;
-  for (int chunk = 0; chunk < items_per_thread; chunk += chunk_rows)
-  {
-    ValueT row_vals[chunk_rows];
-#pragma unroll
-    for (int cr = 0; cr < chunk_rows; ++cr)
-    {
-      const int iter = chunk + cr;
-      const int loc  = warp_tile_offset + iter * 32 + lane_id;
-      if constexpr (full_tile)
-      {
-        row_vals[cr] = tile_vals[loc]; // staged tiles are zero-filled past tile_len
-      }
-      else
-      {
-        row_vals[cr] = (iter < items_per_thread && loc < tile_len) ? tile_vals[loc] : ValueT{};
-      }
-    }
-#pragma unroll
-    for (int cr = 0; cr < chunk_rows; ++cr)
-    {
-      const int iter = chunk + cr;
-      if (iter >= items_per_thread)
-      {
-        break;
-      }
-      const unsigned w = __shfl_sync(full_mask, my_word, iter);
-      ValueT incl      = row_vals[cr];
-      // full tiles are all-valid by construction; only the partial variant tracks validity
-      int has = full_tile ? 1 : (int) (warp_tile_offset + iter * 32 + lane_id < tile_len);
-      // ADAPTIVE scan depth (dense receipt: the fixed 5-step scan is the MIO wall at ~8 ops/row
-      // x 256 rows/tile; step k only matters if some accumulation distance reaches 2^(k-1)).
-      // Each lane's distance to its nearest head at-or-before covers spans, carry-in and
-      // carry-out regions exactly; the warp max bounds the needed steps. Continuous and general.
-      const unsigned at_or_before = w & upto_l;
-      const int my_dist           = (at_or_before != 0u) ? (lane_id - (31 - __clz(at_or_before))) : (lane_id + 1);
-      const int max_dist          = __reduce_max_sync(full_mask, my_dist);
-      // three UNIFORM paths on the bound (receipts: per-step skips cost seg1, a dynamic loop
-      // cost seg4, the fixed scan cost seg1/2 -- each form won different cells). Every path is
-      // unrolled; running extra steps is always mask-safe, so the branch only affects speed.
-      auto scan_steps = [&](int first_off, int last_off) _CCCL_FORCEINLINE_LAMBDA {
-#pragma unroll
-        for (int off = 1; off < 32; off <<= 1)
-        {
-          if (off >= first_off && off <= last_off)
-          {
-            const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-            const ValueT from_left   = shfl_up_sync_wide(incl, off);
-            const int from_has       = full_tile ? 1 : __shfl_up_sync(full_mask, has, off);
-            if constexpr (full_tile && sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>
-                          && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
-            {
-              // force SETP + @p FADD (2 ops) over nvcc's FADD+FSEL+ISETP (3): the guard folds
-              // into the test value with one LOP3 -- nonzero test blocks lanes below the step
-              const unsigned t = (w & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
-              asm volatile("{ .reg .pred p; setp.eq.u32 p, %1, 0; @p add.f32 %0, %0, %2; }"
-                           : "+f"(incl)
-                           : "r"(t), "f"(from_left));
-            }
-            else
-            {
-              if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u) && from_has)
-              {
-                incl = has ? op(from_left, incl) : from_left;
-                has  = 1;
-              }
-            }
-          }
-        }
-      };
-      if (max_dist == 0)
-      {
-        // every lane is a head: incl is already its own value
-      }
-      else if (max_dist <= 3)
-      {
-        scan_steps(1, 2); // reach 3
-      }
-      else
-      {
-        scan_steps(1, 16); // the full pipelined scan
-      }
-      // iter 0 has no earlier row: the carry is empty there (no identity element is combined in)
-      if ((w & upto_l) == 0u && iter > 0 && carry_has)
-      {
-        incl = has ? op(carry, incl) : carry;
-        has  = 1;
-      }
-      const unsigned next_word = __shfl_sync(full_mask, my_word, (iter + 1) & 31);
-      const bool is_end        = (lane_id < 31) ? (((w >> (lane_id + 1)) & 1u) != 0u)
-                                                : ((iter + 1 < items_per_thread) && ((next_word & 1u) != 0u));
-      const int rank_in_row    = __popc(w & upto_l) - 1;
-      if (is_end && runs_before_row + rank_in_row >= 0)
-      {
-        row_out[rank_in_row] = incl;
-      }
-      const int row_runs = __popc(w);
-      row_out += row_runs;
-      runs_before_row += row_runs;
-      carry     = shfl_sync_wide(incl, 31);
-      carry_has = full_tile ? 1 : __shfl_sync(full_mask, has, 31);
-    }
-  }
-  tail_out = carry; // fold since the warp tile's last head (whole tile when head-free)
 }
 
 // QUAD-COMPRESSED STREAM (staged full tiles, 4-byte values): each lane owns FOUR consecutive
@@ -528,117 +506,139 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
   tail_out = carry;
 }
 
-// warp-parallel strided sum over [begin, end) of the tile's values (lead/tail segments and the
-// long-span cooperative walks; every lane participates)
-// order-preserving warp fold of [begin, end): lane l folds a CONTIGUOUS chunk, then a
-// lane-ascending shfl_down tree combines the chunks. The chunk stride is forced ODD so the
-// per-lane smem walks stay bank-conflict-free (a 32-multiple stride lands every lane on one
-// bank). No identity element is assumed: empty chunks carry a has-flag. Every combine is
-// op(earlier indices, later indices) -- associativity is the only requirement.
-template <class ValueT, class ReductionOpT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT
-warp_span_fold(const ValueT* tile_vals, int begin, int end, int lane_id, ReductionOpT op)
+// values-only streaming reduce over one warp tile, boundaries from REGISTER flag words (the
+// value warps snapshot the flags and run fully detached from the rings). Emits every
+// within-warp-tile-closed aggregate; the trailing open sum comes back as the carry. The scan
+// loop is the FROZEN form -- lead/tail ride separate passes, never inside it.
+template <int items_per_thread, bool full_tile, class ValueT, class OffT, class ReductionOpT>
+_CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_from_flags(
+  ValueT* __restrict__ d_aggregates,
+  const ValueT* __restrict__ tile_vals,
+  unsigned my_word,
+  OffT global_runs_before_warp_tile,
+  int warp_tile_offset,
+  int tile_len,
+  int lane_id,
+  ReductionOpT op,
+  ValueT& tail_out)
 {
-  const int len     = end - begin;
-  const int chunk   = (len > 0) ? (((len + 31) / 32) | 1) : 1; // ODD stride: conflict-free lane walks
-  const int lo      = begin + lane_id * chunk;
-  const int hi      = min(lo + chunk, end);
-  const int n_valid = (len > 0) ? ((len + chunk - 1) / chunk) : 0; // nonempty chunks are a PREFIX
-  ValueT acc{};
-  if (lo < hi)
+  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1); // bits [0, lane]
+  // ROW-LEVEL output pointer (replaces the entry WarpScan + a per-element SHFL+IADD of
+  // runs-before-word, and confines any base rematerialization to once per ROW): the row's
+  // emission slots are row_out[popc(w & upto_l) - 1]; rank -1 legally reaches the previous
+  // row's last slot (a run closing across the row boundary)
+  ValueT* row_out     = d_aggregates + global_runs_before_warp_tile;
+  int runs_before_row = 0; // scalar: gates the entering-run skip (global run_idx < 0)
+  // CHUNKED preload: 8 rows in flight instead of the whole warp tile -- the full-tile buffer put
+  // the kernel at 32+ live registers/lane and SPILLED TO LOCAL under high occupancy (B200
+  // receipt: VEmit 16us/warp-tile of local-memory thrash). The scan carry crosses chunks freely.
+  constexpr int chunk_rows = (items_per_thread < 8) ? items_per_thread : 8;
+  ValueT carry{};
+  int carry_has = 0;
+  for (int chunk = 0; chunk < items_per_thread; chunk += chunk_rows)
   {
-    acc = tile_vals[lo]; // the first element seeds: no identity element exists for a general op
-    for (int pos = lo + 1; pos < hi; ++pos)
-    {
-      acc = op(acc, tile_vals[pos]);
-    }
-  }
-  // cub::WarpReduce: ascending shfl_down tree over the first n_valid lanes, associativity-only
-  // (order-preserving; lane-ascending = element-ascending). Result is valid on lane 0.
-  typename WarpReduce<ValueT>::TempStorage storage;
-  return WarpReduce<ValueT>(storage).Reduce(acc, op, n_valid);
-}
-
-// the compute warp may deem this warp tile too sparse to be worth the position-staging, and in that case it will write
-// only the 32 head-flag words. Then, it is up to the store warps to "decode" the positions from the headflags.
-// one warp tile is 32 chunks x 32 elements, so lane i owns word i.
-// This buys 2.5% BWUtil in the MaxSegSize{2^4, 2^6, 2^8}
-struct HeadFlagDecodeT
-{
-  unsigned lane_head_flag_word;
-  int lane_runs_before_word;
-  int lane_first_head_from_word;
-
-  _CCCL_DEVICE_API _CCCL_FORCEINLINE HeadFlagDecodeT(const unsigned* slot_head_flags, int warp_tile_id, int lane_id)
-      : HeadFlagDecodeT(slot_head_flags[warp_tile_id * 32 + lane_id], lane_id)
-  {}
-
-  // register-word form: the value warps snapshot flag words and decode with no smem dependency
-  _CCCL_DEVICE_API _CCCL_FORCEINLINE HeadFlagDecodeT(unsigned lane_word, int lane_id)
-  {
-    lane_head_flag_word           = lane_word;
-    const int lane_word_run_count = __popc(lane_head_flag_word);
-    typename WarpScan<int>::TempStorage warp_scan_storage;
-    int lane_word_run_count_scan;
-    WarpScan<int>(warp_scan_storage).InclusiveSum(lane_word_run_count, lane_word_run_count_scan);
-    // lane i: # of runs starting in head_flag words [0, i), i.e. in elements [0, i*32)
-    lane_runs_before_word = lane_word_run_count_scan - lane_word_run_count;
-    // lane i -> first head position in head flag words [i, 32)
-    // if our own run_count is >0, the head is here!
-    // empty should be +infinity, since we use min
-    lane_first_head_from_word = lane_word_run_count ? (lane_id * 32 + __ffs(lane_head_flag_word) - 1) : 0x7fffffff;
-    // if not, we loop to find the next head in flag word [i, 32). this is just a fold with min
+    ValueT row_vals[chunk_rows];
 #pragma unroll
-    for (int offset = 1; offset < 32; offset <<= 1)
+    for (int cr = 0; cr < chunk_rows; ++cr)
     {
-      const int shuffled_first_head = __shfl_down_sync(full_mask, lane_first_head_from_word, offset);
-      lane_first_head_from_word =
-        min(lane_first_head_from_word, (lane_id + offset < 32) ? shuffled_first_head : 0x7fffffff);
-    }
-    // now, lane i holds the next head in [i, 32). we precalculate this in parallel
-  }
-
-  _CCCL_DEVICE_API _CCCL_FORCEINLINE RunSpanT decode_run(int run_idx) const
-  {
-    // first question: which head_flag word contains my run's (run_idx) head?
-    // lane_runs_before_word's row i = number of heads in words [0, i)
-    // the word containing run_dex is then the largest i with runs_before(i) that is <= j
-    // we do binary search over the distributed lane_runs_before_word table held across the warp
-    int flag_word_idx = 0;
-#pragma unroll
-    for (int step = 16; step; step >>= 1)
-    {
-      // propose candidate
-      const int candidate_word_idx = flag_word_idx + step;
-      // read the i'th row
-      const int candidate_runs_before = __shfl_sync(full_mask, lane_runs_before_word, candidate_word_idx & 31);
-      if (candidate_word_idx < 32 && candidate_runs_before <= run_idx)
+      const int iter = chunk + cr;
+      const int loc  = warp_tile_offset + iter * 32 + lane_id;
+      if constexpr (full_tile)
       {
-        flag_word_idx = candidate_word_idx;
+        row_vals[cr] = tile_vals[loc]; // staged tiles are zero-filled past tile_len
+      }
+      else
+      {
+        row_vals[cr] = (iter < items_per_thread && loc < tile_len) ? tile_vals[loc] : ValueT{};
       }
     }
-    // the lane now knows the index of the word containing its head
-    // we need to convert it to the element position
-    // where is my head in the word?
-    const int run_rank_in_word = run_idx - __shfl_sync(full_mask, lane_runs_before_word, flag_word_idx);
-    // get the actual word
-    const unsigned flag_word = __shfl_sync(full_mask, lane_head_flag_word, flag_word_idx);
-    // where's the first head in any word after mine?
-    const int first_head_after_word = __shfl_sync(full_mask, lane_first_head_from_word, (flag_word_idx + 1) & 31);
-    // how many heads my word has?
-    const int flag_word_run_count = __popc(flag_word);
-    // position of my head inside the word
-    const int head_bit_in_word =
-      nth_set_bit(flag_word, (run_rank_in_word < flag_word_run_count) ? run_rank_in_word : 0);
-    const int head_pos_in_warp_tile = flag_word_idx * 32 + head_bit_in_word;
-    // where does my run end? try find the position of next head in word
-    const int next_head_in_word = flag_word_idx * 32 + __ffs(flag_word & (~1u << head_bit_in_word)) - 1;
-    // does my word contain a head after mine? if not, next_head_in_word is garbage, and we use first_head_after_word
-    const int next_head_pos = (run_rank_in_word + 1 < flag_word_run_count) ? next_head_in_word : first_head_after_word;
-    // NOTE: for the last run head in warp tile, next_head_pos is garbage
-    return {head_pos_in_warp_tile, next_head_pos};
+#pragma unroll
+    for (int cr = 0; cr < chunk_rows; ++cr)
+    {
+      const int iter = chunk + cr;
+      if (iter >= items_per_thread)
+      {
+        break;
+      }
+      const unsigned w = __shfl_sync(full_mask, my_word, iter);
+      ValueT incl      = row_vals[cr];
+      // full tiles are all-valid by construction; only the partial variant tracks validity
+      int has = full_tile ? 1 : (int) (warp_tile_offset + iter * 32 + lane_id < tile_len);
+      // ADAPTIVE scan depth (dense receipt: the fixed 5-step scan is the MIO wall at ~8 ops/row
+      // x 256 rows/tile; step k only matters if some accumulation distance reaches 2^(k-1)).
+      // Each lane's distance to its nearest head at-or-before covers spans, carry-in and
+      // carry-out regions exactly; the warp max bounds the needed steps. Continuous and general.
+      const unsigned at_or_before = w & upto_l;
+      const int my_dist           = (at_or_before != 0u) ? (lane_id - (31 - __clz(at_or_before))) : (lane_id + 1);
+      const int max_dist          = __reduce_max_sync(full_mask, my_dist);
+      // three UNIFORM paths on the bound (receipts: per-step skips cost seg1, a dynamic loop
+      // cost seg4, the fixed scan cost seg1/2 -- each form won different cells). Every path is
+      // unrolled; running extra steps is always mask-safe, so the branch only affects speed.
+      auto scan_steps = [&](int first_off, int last_off) _CCCL_FORCEINLINE_LAMBDA {
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1)
+        {
+          if (off >= first_off && off <= last_off)
+          {
+            const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+            const ValueT from_left   = shfl_up_sync_wide(incl, off);
+            const int from_has       = full_tile ? 1 : __shfl_up_sync(full_mask, has, off);
+            if constexpr (full_tile && sizeof(ValueT) == 4 && ::cuda::std::is_same_v<ValueT, float>
+                          && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
+            {
+              // force SETP + @p FADD (2 ops) over nvcc's FADD+FSEL+ISETP (3): the guard folds
+              // into the test value with one LOP3 -- nonzero test blocks lanes below the step
+              const unsigned t = (w & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
+              asm volatile("{ .reg .pred p; setp.eq.u32 p, %1, 0; @p add.f32 %0, %0, %2; }"
+                           : "+f"(incl)
+                           : "r"(t), "f"(from_left));
+            }
+            else
+            {
+              if (lane_id >= off && ((w & upto_l & ~upto_prev) == 0u) && from_has)
+              {
+                incl = has ? op(from_left, incl) : from_left;
+                has  = 1;
+              }
+            }
+          }
+        }
+      };
+      if (max_dist == 0)
+      {
+        // every lane is a head: incl is already its own value
+      }
+      else if (max_dist <= 3)
+      {
+        scan_steps(1, 2); // reach 3
+      }
+      else
+      {
+        scan_steps(1, 16); // the full pipelined scan
+      }
+      // iter 0 has no earlier row: the carry is empty there (no identity element is combined in)
+      if ((w & upto_l) == 0u && iter > 0 && carry_has)
+      {
+        incl = has ? op(carry, incl) : carry;
+        has  = 1;
+      }
+      const unsigned next_word = __shfl_sync(full_mask, my_word, (iter + 1) & 31);
+      const bool is_end        = (lane_id < 31) ? (((w >> (lane_id + 1)) & 1u) != 0u)
+                                                : ((iter + 1 < items_per_thread) && ((next_word & 1u) != 0u));
+      const int rank_in_row    = __popc(w & upto_l) - 1;
+      if (is_end && runs_before_row + rank_in_row >= 0)
+      {
+        row_out[rank_in_row] = incl;
+      }
+      const int row_runs = __popc(w);
+      row_out += row_runs;
+      runs_before_row += row_runs;
+      carry     = shfl_sync_wide(incl, 31);
+      carry_has = full_tile ? 1 : __shfl_sync(full_mask, has, 31);
+    }
   }
-};
+  tail_out = carry; // fold since the warp tile's last head (whole tile when head-free)
+}
 } // namespace detail::reduce_by_key
 
 CUB_NAMESPACE_END
