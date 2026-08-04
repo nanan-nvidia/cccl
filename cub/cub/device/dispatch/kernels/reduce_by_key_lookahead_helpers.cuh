@@ -70,37 +70,6 @@ struct TileValueRecordT
   ValueT lead_agg; // sum before the tile's first head (whole-tile sum when head-free)
 };
 
-// values loader: plain ignore_oob TMA of the tile's values into the ring slot -- no pad, no
-// skip (values have no predecessor semantics); the last tile ZERO-FILLS past tile_len, so the
-// consumer bands never need tail guards (zeros are additive identity)
-template <int tile_size, class ValueT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE void load_tile_values(
-  ValueT* slot,
-  const ValueT* d_values,
-  int tile_id,
-  int tile_len,
-  bool last_tile,
-  ::cuda::std::uint64_t* full_bar,
-  int lane_id)
-{
-  if (lane_id == 0)
-  {
-    const unsigned nbytes     = (unsigned) ((size_t) tile_len * sizeof(ValueT));
-    const unsigned span_bytes = (nbytes + 15u) & ~15u;
-    ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, full_bar, span_bytes);
-    ptx::cp_async_bulk_ignore_oob(
-      ptx::space_shared,
-      ptx::space_global,
-      slot,
-      d_values + (size_t) tile_id * tile_size,
-      span_bytes,
-      0u,
-      last_tile ? (span_bytes - nbytes) : 0u,
-      full_bar);
-  }
-  __syncwarp();
-}
-
 // __shfl_* has no >8B overloads: wide types (int128) shuffle as 64-bit halves
 template <class T>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_sync_wide(T v, int src_lane)

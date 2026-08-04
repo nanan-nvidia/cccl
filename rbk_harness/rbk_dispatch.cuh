@@ -76,10 +76,7 @@ inline cudaError_t persistent_rbk_encode(
   cudaStream_t stream       = 0,
   ReductionOpT reduction_op = {})
 {
-  using RecordT    = TileValueRecordT<ValueT>;
-  size_t cub_bytes = 0;
-  cub::DeviceReduce::ReduceByKey(
-    nullptr, cub_bytes, d_keys, d_unique, d_values, d_aggregates, d_num_runs, reduction_op, num_items, stream);
+  using RecordT           = TileValueRecordT<ValueT>;
   const long long q_tiles = rbk_state_tiles<Config>((long long) num_items);
   const auto align16      = [](size_t b) {
     return (b + 15) & ~(size_t) 15;
@@ -89,7 +86,7 @@ inline cudaError_t persistent_rbk_encode(
     + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>))
     + align16((size_t) q_tiles * (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned));
 
-  const size_t required = cuda::std::max(cub_bytes, pers_bytes);
+  const size_t required = pers_bytes;
   if (d_temp_storage == nullptr)
   {
     temp_storage_bytes = required;
@@ -100,44 +97,16 @@ inline cudaError_t persistent_rbk_encode(
     return cudaErrorInvalidValue;
   }
   const long long tiles = rbk_state_tiles<Config>((long long) num_items);
-  int device = 0, cc_major = 0, smem_optin = 0;
-  cudaError_t error = cudaGetDevice(&device);
-  if (error == cudaSuccess)
-  {
-    error = cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device);
-  }
-  if (error == cudaSuccess)
-  {
-    error = cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-  }
-  if (error != cudaSuccess)
-  {
-    return error;
-  }
-  // PROTOTYPE: 4-byte values only; staging is required; unsupported inputs ERROR OUT
+  // PROTOTYPE (Blackwell-only): 4-byte values, 16B-aligned values base; anything else errors out
   if constexpr (sizeof(ValueT) != 4)
   {
     return cudaErrorInvalidValue;
   }
-  constexpr size_t kValBlockSmemGate = (size_t) Config::kTileSize * sizeof(ValueT);
-  if ((((size_t) d_values & 15) != 0) || (size_t) smem_optin < kValBlockSmemGate)
+  if (((size_t) d_values & 15) != 0)
   {
     return cudaErrorInvalidValue;
   }
-  if (tiles > 0x7fffffff || cc_major < 10 || (size_t) smem_optin < Config::kDynSmem)
-  {
-    return cub::DeviceReduce::ReduceByKey(
-      d_temp_storage,
-      temp_storage_bytes,
-      d_keys,
-      d_unique,
-      d_values,
-      d_aggregates,
-      d_num_runs,
-      reduction_op,
-      num_items,
-      stream);
-  }
+  cudaError_t error     = cudaSuccess;
   auto* count_states    = (TilePartialStateT*) d_temp_storage;
   auto* value_records   = (RecordT*) ((char*) count_states + align16(tiles * sizeof(TilePartialStateT)));
   auto* tile_prefixes   = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
@@ -174,7 +143,7 @@ inline cudaError_t persistent_rbk_encode(
   }
   // PASS 2: values
   constexpr size_t kValDynSmem   = (size_t) Config::kStages * Config::kTileSize * sizeof(ValueT);
-  constexpr size_t kValBlockSmem = kValBlockSmemGate;
+  constexpr size_t kValBlockSmem = (size_t) Config::kTileSize * sizeof(ValueT);
   auto* vkernel =
     rbk_kernels::DeviceReduceByKeyLookaheadValueKernel<typename Config::Selector, ValueT, OffT, ReductionOpT>;
   error = cudaFuncSetAttribute(vkernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kValBlockSmem);
