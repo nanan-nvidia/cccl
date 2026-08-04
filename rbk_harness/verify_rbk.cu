@@ -379,18 +379,8 @@ static int run_combo(const char* v_name, const char* off_name, bool huge)
   {
     int koff, voff;
   };
-#ifdef K_FUSED
-  // fused prototype: keys must be 16B-aligned (head-pad TMA); misaligned-key cases don't apply
-  constexpr bool kSkipKoff = true;
-#else
-  constexpr bool kSkipKoff = false;
-#endif
   for (const OffCase& o : {OffCase{1, 0}, OffCase{3, 0}})
   {
-    if (kSkipKoff)
-    {
-      break;
-    }
     fails += run_case<T, ValueT, OffsetT>(3 * kTileSize + 7, 1, 1u, false, o.koff, o.voff) ? 0 : 1;
     fails += run_case<T, ValueT, OffsetT>((1 << 20) + 12345, 2, 42u, false, o.koff, o.voff) ? 0 : 1;
     fails += run_case<T, ValueT, OffsetT>(1 << 22, 4096, 1u, false, o.koff, o.voff) ? 0 : 1;

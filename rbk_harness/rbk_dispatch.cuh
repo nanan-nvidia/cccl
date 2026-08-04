@@ -6,9 +6,6 @@
 
 #include <cub/device/device_reduce.cuh>
 #include <cub/device/dispatch/kernels/kernel_reduce_by_key_lookahead.cuh>
-#ifdef K_FUSED
-#  include <cub/device/dispatch/kernels/kernel_reduce_by_key_fused.cuh>
-#endif
 
 #include <cuda/std/algorithm>
 #include <cuda/std/functional>
@@ -76,9 +73,6 @@ inline long long rbk_state_tiles(long long n)
   return (n + Config::kTileSize - 1) / Config::kTileSize;
 }
 
-#ifdef K_FUSED
-#  include "rbk_dispatch_fused.cuh" // supplies persistent_rbk_encode for the fused prototype
-#else
 template <class Config, class KeyT, class ValueT, class NumRunsT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
 inline cudaError_t persistent_rbk_encode(
   void* d_temp_storage,
@@ -221,5 +215,4 @@ inline cudaError_t persistent_rbk_encode(
       d_aggregates, value_records, tile_prefixes, d_keys, Config::kTileSize, (int) tiles, reduction_op);
   return cudaPeekAtLastError();
 }
-#endif // K_FUSED
 } // namespace rbk_impl
