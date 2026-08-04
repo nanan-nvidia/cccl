@@ -239,22 +239,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_quad(
         {
           const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
           const ValueT from_left   = shfl_up_sync_wide(S, off);
-          if constexpr (::cuda::std::is_same_v<ValueT, float>
-                        && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
+          // one merged condition, one predicable one-instruction body: the form the backend
+          // predicates on its own, in plain C++ for every type and op (no per-config paths)
+          const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
+          if (t == 0)
           {
-            // plus<float> instruction selection (B200 receipt: the compiled conditional cost
-            // +1.8% at 2^2); the general path below is the semantics
-            const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
-            asm volatile("{ .reg .pred p; setp.eq.u32 p, %1, 0; @p add.f32 %0, %0, %2; }"
-                         : "+f"(S)
-                         : "r"(t), "f"(from_left));
-          }
-          else
-          {
-            if (lane_id >= off && ((pmask & upto_l & ~upto_prev) == 0u))
-            {
-              S = op(from_left, S);
-            }
+            S = op(from_left, S);
           }
         }
       }
@@ -352,22 +342,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_values_paired(
         {
           const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
           const ValueT from_left   = shfl_up_sync_wide(S, off);
-          if constexpr (::cuda::std::is_same_v<ValueT, float>
-                        && ::cuda::std::is_same_v<ReductionOpT, ::cuda::std::plus<>>)
+          // one merged condition, one predicable one-instruction body: the form the backend
+          // predicates on its own, in plain C++ for every type and op (no per-config paths)
+          const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
+          if (t == 0)
           {
-            // plus<float> instruction selection (B200 receipt: the compiled conditional cost
-            // +1.8% at 2^2); the general path below is the semantics
-            const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
-            asm volatile("{ .reg .pred p; setp.eq.u32 p, %1, 0; @p add.f32 %0, %0, %2; }"
-                         : "+f"(S)
-                         : "r"(t), "f"(from_left));
-          }
-          else
-          {
-            if (lane_id >= off && ((pmask & upto_l & ~upto_prev) == 0u))
-            {
-              S = op(from_left, S);
-            }
+            S = op(from_left, S);
           }
         }
       }
