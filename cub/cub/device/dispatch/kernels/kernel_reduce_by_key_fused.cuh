@@ -44,6 +44,54 @@ struct FusedStateT
   }
 };
 
+// fused-path per-tile prefix: packs (run prefix, last headed tile) -- the fused lookback tracks
+// the last headed tile directly (the shared two-pass PrefixT packs an open length instead)
+template <class OffT, bool = (sizeof(OffT) > 4)>
+struct FusedPrefixT;
+
+template <class OffT>
+struct FusedPrefixT<OffT, false>
+{
+  ::cuda::std::uint64_t dword;
+
+  static _CCCL_DEVICE_API _CCCL_FORCEINLINE FusedPrefixT pack(OffT run_count, int last_tile_with_runs)
+  {
+    return {((::cuda::std::uint64_t) (unsigned) last_tile_with_runs << 32) | (unsigned) run_count};
+  }
+
+  _CCCL_DEVICE_API _CCCL_FORCEINLINE OffT run_count() const
+  {
+    return (OffT) (unsigned) (dword & 0xffffffffull);
+  }
+
+  _CCCL_DEVICE_API _CCCL_FORCEINLINE int last_tile_with_runs() const
+  {
+    return (int) (unsigned) (dword >> 32);
+  }
+};
+
+template <class OffT>
+struct alignas(16) FusedPrefixT<OffT, true>
+{
+  ::cuda::std::uint64_t packed_run_count;
+  ::cuda::std::uint64_t packed_last_tile_with_runs;
+
+  static _CCCL_DEVICE_API _CCCL_FORCEINLINE FusedPrefixT pack(OffT run_count, int last_tile_with_runs)
+  {
+    return {(::cuda::std::uint64_t) run_count, (::cuda::std::uint64_t) (unsigned) last_tile_with_runs};
+  }
+
+  _CCCL_DEVICE_API _CCCL_FORCEINLINE OffT run_count() const
+  {
+    return (OffT) packed_run_count;
+  }
+
+  _CCCL_DEVICE_API _CCCL_FORCEINLINE int last_tile_with_runs() const
+  {
+    return (int) (unsigned) (packed_last_tile_with_runs);
+  }
+};
+
 // the fused prototype has no flag words in global memory, so its record carries the cleanup
 // bookkeeping that the two-pass cleanup derives from PrefixT + flag words
 template <class ValueT, class OffT>
@@ -107,7 +155,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
     ValueT* __restrict__ d_aggregates,
     NumRunsT* __restrict__ d_num_runs,
     FusedStateT* fused_states,
-    PrefixT<OffT>* d_tile_prefix,
+    FusedPrefixT<OffT>* d_tile_prefix,
     FusedValueRecordT<ValueT, OffT>* __restrict__ value_records,
     OffT num_items,
     int num_tiles,
@@ -324,8 +372,8 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
         if (last_runs_tile < 0)
         {
           // the inclusive tile's own count decides whether IT is the last headed tile
-          const PrefixT<OffT> p = d_tile_prefix[base + cut]; // safe: released before its tag-2
-          last_runs_tile        = ((OffT) incl_count - p.run_count() > 0) ? (base + cut) : p.last_tile_with_runs();
+          const FusedPrefixT<OffT> p = d_tile_prefix[base + cut]; // safe: released before its tag-2
+          last_runs_tile             = ((OffT) incl_count - p.run_count() > 0) ? (base + cut) : p.last_tile_with_runs();
         }
         break;
       }
@@ -333,7 +381,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32)
     }
     if (lane_id == 0)
     {
-      d_tile_prefix[tile_id] = PrefixT<OffT>::pack(prefix, last_runs_tile);
+      d_tile_prefix[tile_id] = FusedPrefixT<OffT>::pack(prefix, last_runs_tile);
       ::cuda::atomic_ref<::cuda::std::uint64_t, ::cuda::thread_scope_device> a(fused_states[tile_id].dword);
       a.store(FusedStateT::pack(2u, (::cuda::std::int64_t) (prefix + tile_total_runs)).dword,
               ::cuda::memory_order_release);

@@ -41,10 +41,16 @@ namespace ptx = ::cuda::ptx;
 using rle::encode::compute_head_flags;
 using rle::encode::load_tile_keys;
 using rle::encode::nth_set_bit;
+using rle::encode::poll_and_fold;
+using rle::encode::poll_fold_windows;
+using rle::encode::PrefixT;
+using rle::encode::reduce_and_publish_tile_state;
 using rle::encode::RingCursorT;
 using rle::encode::RunSpanT;
 using rle::encode::scan_warp_tile_run_counts;
 using rle::encode::swizzle_xor_stride32;
+using rle::encode::tile_published;
+using rle::encode::TilePartialStateT;
 using rle::encode::wait_parity;
 using rle::encode::WarpTileRunScanT;
 
@@ -56,28 +62,6 @@ _CCCL_HOST_DEVICE_API constexpr int num_total_threads(const RleLookaheadPolicy& 
 }
 
 constexpr unsigned full_mask = 0xffffffffu;
-
-constexpr unsigned tile_published = 1u;
-
-struct CountStateT
-{
-  ::cuda::std::uint64_t dword;
-
-  _CCCL_DEVICE_API _CCCL_FORCEINLINE unsigned published_tag() const
-  {
-    return (unsigned) (dword >> 32);
-  }
-
-  _CCCL_DEVICE_API _CCCL_FORCEINLINE int run_count() const
-  {
-    return (int) (dword & 0xffffffffu);
-  }
-
-  static _CCCL_DEVICE_API _CCCL_FORCEINLINE CountStateT pack(int run_count)
-  {
-    return {((::cuda::std::uint64_t) tile_published << 32) | (::cuda::std::uint64_t) (unsigned) run_count};
-  }
-};
 
 // per-tile VALUE RECORD, written with plain stores by the value warps
 // and read by the cleanup kernel after the main kernel completes
@@ -101,52 +85,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE StateT load_state(StateT* state_arr, int tile
   ::cuda::atomic_ref<::cuda::std::uint64_t, ::cuda::thread_scope_device> a(state_arr[tile_idx].dword);
   return {a.load(::cuda::memory_order_relaxed)};
 }
-
-template <class OffT, bool = (sizeof(OffT) > 4)>
-struct PrefixT;
-
-template <class OffT>
-struct PrefixT<OffT, false>
-{
-  ::cuda::std::uint64_t dword;
-
-  static _CCCL_DEVICE_API _CCCL_FORCEINLINE PrefixT pack(OffT run_count, int last_tile_with_runs)
-  {
-    return {((::cuda::std::uint64_t) (unsigned) last_tile_with_runs << 32) | (unsigned) run_count};
-  }
-
-  _CCCL_DEVICE_API _CCCL_FORCEINLINE OffT run_count() const
-  {
-    return (OffT) (unsigned) (dword & 0xffffffffull);
-  }
-
-  _CCCL_DEVICE_API _CCCL_FORCEINLINE int last_tile_with_runs() const
-  {
-    return (int) (unsigned) (dword >> 32);
-  }
-};
-
-template <class OffT>
-struct alignas(16) PrefixT<OffT, true>
-{
-  ::cuda::std::uint64_t packed_run_count;
-  ::cuda::std::uint64_t packed_last_tile_with_runs;
-
-  static _CCCL_DEVICE_API _CCCL_FORCEINLINE PrefixT pack(OffT run_count, int last_tile_with_runs)
-  {
-    return {(::cuda::std::uint64_t) run_count, (::cuda::std::uint64_t) (unsigned) last_tile_with_runs};
-  }
-
-  _CCCL_DEVICE_API _CCCL_FORCEINLINE OffT run_count() const
-  {
-    return (OffT) packed_run_count;
-  }
-
-  _CCCL_DEVICE_API _CCCL_FORCEINLINE int last_tile_with_runs() const
-  {
-    return (int) (unsigned) packed_last_tile_with_runs;
-  }
-};
 
 // values loader: plain ignore_oob TMA of the tile's values into the ring slot -- no pad, no
 // skip (values have no predecessor semantics); the last tile ZERO-FILLS past tile_len, so the
@@ -291,23 +229,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE T shfl_xor_sync_wide(T v, int mask)
       hv.h[i] = __shfl_xor_sync(full_mask, hv.h[i], mask);
     }
     return ::cuda::std::bit_cast<T>(hv);
-  }
-}
-
-template <int compute_warps>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE void
-reduce_and_publish_count(CountStateT* count_states, int tile_id, const int* slot_warp_run_counts, int lane_id)
-{
-  // compute_warps<=32 so one lane/warp fits (in practice we will never have anything close to 32)
-  static_assert(compute_warps <= 32, "compute_warps must be less than 32!");
-  const bool active        = lane_id < compute_warps;
-  const int warp_run_count = active ? slot_warp_run_counts[lane_id] : 0;
-  const int run_count      = __reduce_add_sync(full_mask, warp_run_count);
-  if (lane_id == 0)
-  {
-    // CRITICAL: publish as soon as possible, this is why we calculate head_flags first -- the
-    // count chain never waits on a single value read (the disaggregation design)
-    publish_state(count_states, tile_id, CountStateT::pack(run_count));
   }
 }
 

@@ -17,7 +17,7 @@ namespace rbk_impl
 {
 namespace rbk_kernels = CUB_NS_QUALIFIER::detail::reduce_by_key::lookahead;
 
-using CountStateT = rbk_kernels::CountStateT;
+using TilePartialStateT = rbk_kernels::TilePartialStateT;
 template <class ValueT>
 using TileValueRecordT = rbk_kernels::TileValueRecordT<ValueT>;
 template <class OffT>
@@ -104,7 +104,7 @@ inline cudaError_t persistent_rbk_encode(
     return (b + 15) & ~(size_t) 15;
   };
   const size_t pers_bytes =
-    align16((size_t) q_tiles * sizeof(CountStateT)) + align16((size_t) q_tiles * sizeof(RecordT))
+    align16((size_t) q_tiles * sizeof(TilePartialStateT)) + align16((size_t) q_tiles * sizeof(RecordT))
     + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>))
 #  ifdef RBK_PERSIST_FLAGS
     + align16((size_t) q_tiles * (size_t) Config::kNumCompWarps * 32 * sizeof(unsigned))
@@ -160,8 +160,8 @@ inline cudaError_t persistent_rbk_encode(
       num_items,
       stream);
   }
-  auto* count_states  = (CountStateT*) d_temp_storage;
-  auto* value_records = (RecordT*) ((char*) count_states + align16(tiles * sizeof(CountStateT)));
+  auto* count_states  = (TilePartialStateT*) d_temp_storage;
+  auto* value_records = (RecordT*) ((char*) count_states + align16(tiles * sizeof(TilePartialStateT)));
   auto* tile_prefixes = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
 #  ifdef RBK_PERSIST_FLAGS
   auto* flag_words = (unsigned*) ((char*) tile_prefixes + align16(tiles * sizeof(TilePrefixT<OffT>)));

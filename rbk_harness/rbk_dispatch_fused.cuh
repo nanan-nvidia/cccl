@@ -44,7 +44,7 @@ inline cudaError_t persistent_rbk_encode(
   };
   const size_t pers_bytes =
     align16((size_t) q_tiles * sizeof(FusedStateT)) + align16((size_t) q_tiles * sizeof(RecordT))
-    + align16((size_t) q_tiles * sizeof(TilePrefixT<OffT>));
+    + align16((size_t) q_tiles * sizeof(rbk_kernels::FusedPrefixT<OffT>));
   const size_t required = cuda::std::max(cub_bytes, pers_bytes);
   if (d_temp_storage == nullptr)
   {
@@ -102,7 +102,7 @@ inline cudaError_t persistent_rbk_encode(
   }
   auto* fused_states    = (FusedStateT*) d_temp_storage;
   auto* value_records   = (RecordT*) ((char*) fused_states + align16(tiles * sizeof(FusedStateT)));
-  auto* tile_prefixes   = (TilePrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
+  auto* tile_prefixes   = (rbk_kernels::FusedPrefixT<OffT>*) ((char*) value_records + align16(tiles * sizeof(RecordT)));
   const int init_blocks = (int) ((tiles + 255) / 256);
   rbk_init_states<<<init_blocks, 256, 0, stream>>>(fused_states, tiles);
   constexpr int kPadElems = 16 / (int) sizeof(KeyT);

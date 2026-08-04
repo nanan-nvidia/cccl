@@ -19,103 +19,6 @@ CUB_NAMESPACE_BEGIN
 
 namespace detail::reduce_by_key::lookahead
 {
-template <int window_size_cap, class PolicySelector, class OffT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE void poll_fold_windows(
-  CountStateT* count_states,
-  int tile_id,
-  int& last_seen_tile_id,
-  OffT& last_seen_prefix_run_count,
-  int& last_tile_with_runs,
-  int lane_id,
-  int& dense_mode)
-{
-  constexpr int poll_loads_per_lane = current_policy<PolicySelector>().lookahead.poll_loads_per_lane;
-  static_assert(window_size_cap >= 1 && window_size_cap <= 32 * poll_loads_per_lane,
-                "the fold window must be covered by the lanes");
-  while (last_seen_tile_id < tile_id)
-  {
-    const int remain = tile_id - last_seen_tile_id;
-    // # of tiles to fold this iteration
-    const int window_size                         = remain < window_size_cap ? remain : window_size_cap;
-    const int lane_first_tile_id                  = last_seen_tile_id + lane_id;
-    const int lane_tile_count                     = (window_size - lane_id + 31) >> 5;
-    CountStateT packed_words[poll_loads_per_lane] = {}; // must zero initialize
-    bool ready;
-    // first, all tile COUNT states in the window must be ready (values are never polled)
-    do
-    {
-      ready = true;
-#pragma unroll
-      for (int i = 0; i < poll_loads_per_lane; ++i)
-      {
-        // we only try if that state is not published
-        if (i < lane_tile_count && packed_words[i].published_tag() != tile_published)
-        {
-          packed_words[i] = load_state(count_states, lane_first_tile_id + i * 32);
-          if (packed_words[i].published_tag() != tile_published)
-          {
-            ready = false;
-          }
-        }
-      }
-    } while (__ballot_sync(full_mask, !ready) != 0u);
-    int lane_run_count = 0, lane_last_tile_with_runs_in_window = -1;
-    // now, we fold the window
-#pragma unroll
-    for (int i = 0; i < poll_loads_per_lane; ++i)
-    {
-      if (i < lane_tile_count)
-      {
-        // aggregate run_count per lane, this is fine since run_count is commutative
-        lane_run_count += packed_words[i].run_count();
-        // nominate the highest tile id with runs (the closer's lazy value-window bound)
-        lane_last_tile_with_runs_in_window =
-          (packed_words[i].run_count() > 0) ? (i * 32 + lane_id) : lane_last_tile_with_runs_in_window;
-      }
-    }
-    // vote for the highest tile id with runs
-    const int last_tile_with_runs_in_window = __reduce_max_sync(full_mask, lane_last_tile_with_runs_in_window);
-    if (last_tile_with_runs_in_window >= 0)
-    {
-      last_tile_with_runs = last_seen_tile_id + last_tile_with_runs_in_window;
-    }
-    const int window_run_count = __reduce_add_sync(full_mask, lane_run_count);
-    // dense_mode is true if window_run_count > 128
-    dense_mode                 = window_run_count > (window_size << 7);
-    last_seen_prefix_run_count = last_seen_prefix_run_count + window_run_count;
-    last_seen_tile_id += window_size;
-  }
-}
-
-template <class PolicySelector, class OffT>
-_CCCL_DEVICE_API _CCCL_FORCEINLINE void poll_and_fold(
-  CountStateT* count_states,
-  int tile_id,
-  int& last_seen_tile_id,
-  OffT& last_seen_prefix_run_count,
-  int& last_tile_with_runs,
-  int lane_id,
-  int& dense_mode,
-  OffT& curr_prefix_run_count)
-{
-  // adaptive poll: we decide the window size based on the density of the runs. this buys ~5% BWUtil
-  // the 2 window sizes: 96 and 160 = 32 * 5 are decided by the # of SM on blackwell
-  if (dense_mode)
-  // when it is dense, compute has a slower rate of publishing tile states. so we wait for a smaller window first and
-  // fold it. as we fold the small window, more tiles in the next window are becoming ready, so we get some overlapping
-  {
-    poll_fold_windows<96, PolicySelector>(
-      count_states, tile_id, last_seen_tile_id, last_seen_prefix_run_count, last_tile_with_runs, lane_id, dense_mode);
-  }
-  else
-  // when it is sparse, compute has a high rate of publishing tile states. so we just poll the big window at once
-  {
-    poll_fold_windows<32 * current_policy<PolicySelector>().lookahead.poll_loads_per_lane, PolicySelector>(
-      count_states, tile_id, last_seen_tile_id, last_seen_prefix_run_count, last_tile_with_runs, lane_id, dense_mode);
-  }
-  curr_prefix_run_count = last_seen_prefix_run_count;
-}
-
 // we aim for 1 block/SM since it is easier to manage resources: we do not need to worry about occupancy anymore
 template <typename PolicySelector, class KeyT, class ValueT, class NumRunsT, class OffT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
@@ -124,7 +27,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   KeyT* __restrict__ d_unique,
   ValueT* __restrict__ d_aggregates,
   NumRunsT* __restrict__ d_num_runs,
-  CountStateT* __restrict__ count_states,
+  TilePartialStateT* __restrict__ count_states,
 #ifdef RBK_PERSIST_FLAGS
   unsigned* __restrict__ d_flag_words, // [num_tiles][compute_warps*32]: the persisted run structure
 #endif
@@ -186,6 +89,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   __shared__ int tile_id_buf[max_key_ring_stages]; // which global tile each ring slot holds (LOAD gets it with
                                                    // try_cancel)
   __shared__ int warp_run_counts[max_key_ring_stages][compute_warps]; // per compute warp run counts
+  __shared__ int warp_last_heads[max_key_ring_stages][compute_warps]; // per compute warp last head idx (-1 if none)
   __shared__ unsigned head_flag_buf[max_key_ring_stages][compute_warps * 32]; // staged head-flag words
   __shared__ unsigned word_mask[max_key_ring_stages][compute_warps]; // which of a wt's 32 flag words hold heads
 
@@ -206,9 +110,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   // try_cancel writes a 16-byte response into clc_resp + completes clc_bar's tx.
   __shared__ __align__(16) uint4 clc_resp;
   __shared__ ::cuda::std::uint64_t clc_bar;
-  static_assert(sizeof(tile_id_buf) + sizeof(warp_run_counts) + sizeof(head_flag_buf) + sizeof(word_mask)
-                    + sizeof(prefix_packed) + sizeof(full) + sizeof(computed) + sizeof(prefixed) + sizeof(empty)
-                    + sizeof(staged_warp_tile) + sizeof(clc_resp) + sizeof(clc_bar)
+  static_assert(sizeof(tile_id_buf) + sizeof(warp_run_counts) + sizeof(warp_last_heads) + sizeof(head_flag_buf)
+                    + sizeof(word_mask) + sizeof(prefix_packed) + sizeof(full) + sizeof(computed) + sizeof(prefixed)
+                    + sizeof(empty) + sizeof(staged_warp_tile) + sizeof(clc_resp) + sizeof(clc_bar)
                   <= RleLookaheadPolicy::static_smem_budget,
                 "static shared memory exceeds the budget assumed by the floor launch guarantee");
 
@@ -340,9 +244,20 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
             // ^^^ regressed case ^^^
           }
           local_run_count = __reduce_add_sync(full_mask, __popc(my_flags));
+          // last head in this warp tile (feeds the tile's open_len publish): highest nonempty
+          // word, then its highest bit -- the ballot is warp-uniform so the branch is converged
+          const unsigned nonempty_chunk_mask = __ballot_sync(full_mask, my_flags != 0u);
+          int warp_last_head                 = -1;
+          if (nonempty_chunk_mask)
+          {
+            const int last_chunk           = 31 - __clz(nonempty_chunk_mask);
+            const unsigned last_chunk_mask = __shfl_sync(full_mask, my_flags, last_chunk);
+            warp_last_head                 = warp_tile_offset + last_chunk * 32 + 31 - __clz(last_chunk_mask);
+          }
           if (lane_id == 0)
           {
             warp_run_counts[slot_id][compute_warp_id] = local_run_count;
+            warp_last_heads[slot_id][compute_warp_id] = warp_last_head;
             ptx::mbarrier_arrive(&computed[slot_id]); // each compute warp arrives
           }
           // warp 0 waits all compute warp arrivals so that every warp's results are visible,
@@ -350,7 +265,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
           if (compute_warp_id == 0)
           {
             wait_parity(&computed[slot_id], key_ring.parity);
-            reduce_and_publish_count<compute_warps>(count_states, tile_id, warp_run_counts[slot_id], lane_id);
+            reduce_and_publish_tile_state<compute_warps>(
+              count_states, tile_id, tile_len, warp_run_counts[slot_id], warp_last_heads[slot_id], lane_id);
           }
           // no position staging: consumers decode run boundaries from the flag words. Under
           // RBK_PERSIST_FLAGS they also persist to global (the original two-pass: the value pass
@@ -374,10 +290,10 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
       // if you are poll
       else if (squad == squadPoll)
       {
-        int last_seen_tile_id           = 0;
-        OffT last_seen_prefix_run_count = 0;
-        int last_tile_with_runs         = -1; // most recent tile known to contain a run head
-        int poll_dense_mode             = 1;
+        int last_seen_tile_id             = 0;
+        OffT last_seen_prefix_run_count   = 0;
+        OffT last_seen_prefix_open_length = 0;
+        int poll_dense_mode               = 1;
         RingCursorT key_ring;
         for (int pipeline_gen = 0;; ++pipeline_gen, key_ring.advance(key_ring_stages))
         {
@@ -393,19 +309,21 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
             break;
           }
           OffT curr_prefix_run_count;
+          OffT curr_prefix_open_length;
           poll_and_fold<PolicySelector>(
             count_states,
             tile_id,
             last_seen_tile_id,
             last_seen_prefix_run_count,
-            last_tile_with_runs,
+            last_seen_prefix_open_length,
             lane_id,
             poll_dense_mode,
-            curr_prefix_run_count);
+            curr_prefix_run_count,
+            curr_prefix_open_length);
           __syncwarp();
           if (lane_id == 0)
           {
-            prefix_packed[slot_id] = PrefixT::pack(curr_prefix_run_count, last_tile_with_runs);
+            prefix_packed[slot_id] = PrefixT::pack(curr_prefix_run_count, curr_prefix_open_length);
             ptx::mbarrier_arrive(&prefixed[slot_id]); // prefix ready, key stores + value warps may proceed
           }
         }
@@ -1027,8 +945,11 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadCleanupKernel(
   {
     return; // head-free middle tile: the run passes through, a later tile closes it
   }
-  const int last_runs_tile = d_tile_prefix[warp_global].last_tile_with_runs();
-  const int from           = (last_runs_tile >= 0) ? last_runs_tile : 0;
+  // window start: the entering run's head sits at global position t*tile_size - open_len
+  // (open_len includes the head), and every tile between it and t is full, so its tile index
+  // is plain division
+  const OffT open_len = d_tile_prefix[warp_global].open_len();
+  const int from      = (int) (((OffT) warp_global * tile_size - open_len) / tile_size);
   ValueT carry{};
   for (int base = from; base < warp_global; base += 32)
   {
@@ -1072,7 +993,7 @@ __launch_bounds__(device_reduce_by_key_lookahead_launch_bounds<PolicySelector>, 
     KeyT* __restrict__ d_unique,
     ValueT* __restrict__ d_aggregates,
     NumRunsT* __restrict__ d_num_runs,
-    CountStateT* count_states,
+    TilePartialStateT* count_states,
 #ifdef RBK_PERSIST_FLAGS
     unsigned* d_flag_words,
 #endif
