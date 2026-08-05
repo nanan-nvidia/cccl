@@ -669,20 +669,24 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       }
       else if (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32 && warp_tile_run_count < stream_threshold)
       {
-        // (4-byte values, 32x32 FULL warp tiles only: the quad rotate/loads cast through uint4;
-        // partial warp tiles take the flagged row stream)
-        if constexpr (sizeof(ValueT) == 4 && items_per_thread == 32)
+        // (4-byte values, 32x32 FULL warp tiles only: the rotate/loads cast through uint4;
+        // partial warp tiles take the one-element form)
+        if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32)
         {
-          chunk_reduce_rotated<items_per_thread>(
+          // lead fold FIRST: <32> rotates the rows in place, so linear reads must precede it
+          const HeadFlagDecodeT dec(my_word, lane_id);
+          const RunSpanT first_run = dec.decode_run(0);
+          wt_lead                  = warp_span_fold(
+            tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id, reduction_op);
+          stream_band<items_per_thread, 32, true>(
             d_aggregates,
-            staged_vals,
+            tile_vals,
             my_word,
             global_runs_before_warp_tile,
             warp_tile_offset,
-            wt_end,
+            tile_len,
             lane_id,
             reduction_op,
-            wt_lead,
             wt_tail);
         }
       }
@@ -704,12 +708,13 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         {
           if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32)
           {
-            stream_values_quad<items_per_thread>(
+            stream_band<items_per_thread, 4, true>(
               d_aggregates,
               tile_vals,
               my_word,
               global_runs_before_warp_tile,
               warp_tile_offset,
+              tile_len,
               lane_id,
               reduction_op,
               wt_tail);
@@ -719,12 +724,13 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         {
           if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32)
           {
-            stream_values_paired<items_per_thread>(
+            stream_band<items_per_thread, 2, true>(
               d_aggregates,
               tile_vals,
               my_word,
               global_runs_before_warp_tile,
               warp_tile_offset,
+              tile_len,
               lane_id,
               reduction_op,
               wt_tail);
@@ -732,7 +738,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         }
         else
         {
-          stream_values_from_flags<items_per_thread, true>(
+          stream_band<items_per_thread, 1, true>(
             d_aggregates,
             tile_vals,
             my_word,
@@ -788,7 +794,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       }
       else
       {
-        stream_values_from_flags<items_per_thread, false>(
+        stream_band<items_per_thread, 1, false>(
           d_aggregates,
           staged_vals,
           my_word,
