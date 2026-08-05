@@ -81,9 +81,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   // between rounds...
   ValueT carry{}; // fold since the last head seen so far
   bool carry_has     = false; // empty until the first round completes
-  bool tile_had_head = false; // flips at the tile's first headed round (the lead exports there)
-  int run_base       = 0; // runs starting in rounds already finished (uniform; advances at round
-                    // end, so every in-round rank reads the pre-round value)
+  bool lead_exported = false; // one-shot: the lead is only harvestable at the tile's FIRST headed round
+  int run_base       = 0; // runs starting in rounds already finished 
   // when there are many rounds, we do not fully unroll to save instr cache & reg pressure
   constexpr int kUnroll =
     (kLaneElems == 32)  ? 1 //  1 round  -> whole thing
@@ -307,12 +306,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       { // that the caller's re-fold measurably re-reads (the
         // shorter forms keep their round loops branch-free and
         // the caller folds their few-element lead itself)
-        if (!tile_had_head && pmask != 0u) // uniform branch: the tile's first headed round
+        if (!lead_exported && pmask != 0u) // uniform branch: the tile's first headed round
         {
           const int fl          = __ffs(pmask) - 1;
           const ValueT lead_cnd = (lane_id > 0 || carry_has) ? in_val : pfx;
           lead_out              = __shfl_sync(full_mask, lead_cnd, fl);
-          tile_had_head         = true;
+          lead_exported         = true;
         }
       }
     }
