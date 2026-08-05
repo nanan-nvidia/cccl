@@ -57,6 +57,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   int tile_len,
   int lane_id,
   ReductionOpT op,
+  ValueT& lead_out, // fold of [warp-tile start, first head); garbage when the lead span is
+                    // empty or the warp tile is head-free (the caller's has-flags guard both)
   ValueT& tail_out)
 {
   static_assert(items_per_thread <= 32, "one flag word per lane bounds the warp tile");
@@ -89,8 +91,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   }
 
   ValueT carry{}; // fold since the last head seen so far (exact, left-to-right)
-  bool carry_has = false; // empty until a round with valid elements completes
-  int word_base  = 0; // heads in words before the current round (uniform)
+  bool carry_has     = false; // empty until a round with valid elements completes
+  bool tile_had_head = false; // flips at the tile's first headed round (the lead exports there)
+  int word_base      = 0; // heads in words before the current round (uniform)
   // per-granularity unroll (the receipted shapes): full at <32>/<4>, 4-deep at <2>, rolled in
   // fours at <1> -- full unroll of 32 rounds tripled the kernel (SASS gate receipt)
   constexpr int kUnroll = (kLaneElems >= 4) ? kRounds : 4;
@@ -100,6 +103,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     // ---- my kLaneElems head bits + the rank of my first owned run ----
     unsigned nib;
     int rank_base;
+    [[maybe_unused]] unsigned round_word   = 0; // <1> emission: my whole round word
+    [[maybe_unused]] int round_runs_before = 0; // <1> emission: runs before this round
     if constexpr (kLaneElems == 32)
     {
       nib               = my_word;
@@ -134,9 +139,11 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     }
     else
     {
-      const unsigned w = __shfl_sync(full_mask, my_word, it);
-      nib              = (w >> lane_id) & 1u;
-      rank_base        = word_base + __popc(w & ((1u << lane_id) - 1u));
+      const unsigned w  = __shfl_sync(full_mask, my_word, it);
+      nib               = (w >> lane_id) & 1u;
+      round_word        = w;
+      round_runs_before = word_base;
+      rank_base         = word_base + __popc(w & ((1u << lane_id) - 1u));
       word_base += __popc(w);
     }
 
@@ -274,16 +281,57 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       scan_steps(1, 16);
     }
 
-    // ---- deferred incoming close: the run ending at my first head ----
-    // in_emit (a head exists before this lane's span) guarantees every piece below is nonempty
-    const ValueT S_prev   = shfl_up_sync_wide(S, 1);
-    const unsigned before = pmask & ((1u << lane_id) - 1u);
-    const ValueT P_in     = (lane_id > 0) ? ((before != 0u || !carry_has) ? S_prev : op(carry, S_prev)) : carry;
-    const bool in_emit    = brk && (rank_base >= 1);
-    const ValueT in_val   = pfx_has ? op(P_in, pfx) : P_in;
-    if (in_emit)
+    // ---- close the runs this round finishes; export the warp tile's lead at its first head ----
+    if constexpr (kLaneElems != 1)
     {
-      out[rank_base - 1] = in_val;
+      // deferred incoming close: the run ending at my first head. in_emit (a head exists
+      // before this lane's span) guarantees every piece below is nonempty
+      const ValueT S_prev   = shfl_up_sync_wide(S, 1);
+      const unsigned before = pmask & ((1u << lane_id) - 1u);
+      const ValueT P_in     = (lane_id > 0) ? ((before != 0u || !carry_has) ? S_prev : op(carry, S_prev)) : carry;
+      const bool in_emit    = brk && (rank_base >= 1);
+      const ValueT in_val   = pfx_has ? op(P_in, pfx) : P_in;
+      if (in_emit)
+      {
+        out[rank_base - 1] = in_val;
+      }
+      if (!tile_had_head && pmask != 0u) // uniform branch: the tile's first headed round
+      {
+        const int fl          = __ffs(pmask) - 1;
+        const ValueT lead_cnd = (lane_id > 0 || carry_has) ? in_val : pfx;
+        lead_out              = shfl_sync_wide(lead_cnd, fl);
+        tile_had_head         = true;
+      }
+    }
+    else
+    {
+      // is_end form (a head's pre-first-head piece is empty at this granularity by
+      // construction): the lane BEFORE a head stores its own fold, so boundary info travels
+      // as a bit, never as a shuffled value (the row stream's receipted emission shape).
+      // Lanes with no head at-or-before fold the inter-round carry in FIRST: their open run
+      // began in an earlier round, and the store below must carry its whole left part
+      if ((round_word & upto_l) == 0u && it > 0 && carry_has)
+      {
+        S   = has ? op(carry, S) : carry;
+        has = 1;
+      }
+      const unsigned next_word = __shfl_sync(full_mask, my_word, (it + 1) & 31);
+      const bool is_end        = (lane_id < 31) ? (((round_word >> (lane_id + 1)) & 1u) != 0u)
+                                                : ((it + 1 < kRounds) && ((next_word & 1u) != 0u));
+      const int rank_in_round  = round_runs_before + __popc(round_word & upto_l) - 1;
+      if (is_end && rank_in_round >= 0)
+      {
+        out[rank_in_round] = S;
+      }
+      if (!tile_had_head && pmask != 0u) // uniform branch: the tile's first headed round
+      {
+        // post-merge, S_prev already contains the inter-round carry chain
+        const ValueT S_prev   = shfl_up_sync_wide(S, 1);
+        const int fl          = __ffs(pmask) - 1;
+        const ValueT lead_cnd = (lane_id > 0) ? S_prev : carry;
+        lead_out              = shfl_sync_wide(lead_cnd, fl);
+        tile_had_head         = true;
+      }
     }
 
     // ---- carry across rounds ----
@@ -293,7 +341,16 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     {
       S31_has = __shfl_sync(full_mask, has, 31);
     }
-    if (pmask == 0u)
+    if constexpr (kLaneElems == 1)
+    {
+      // the merge above already chained the carry into S: lane 31 holds the complete open fold
+      if (S31_has)
+      {
+        carry     = S31;
+        carry_has = true;
+      }
+    }
+    else if (pmask == 0u)
     {
       if (S31_has)
       {
