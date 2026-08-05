@@ -21,7 +21,7 @@ template <class ValueT, class ReductionOpT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT
 warp_span_fold(const ValueT* tile_vals, int begin, int end, int lane_id, ReductionOpT op)
 {
-  const int len     = end - begin;
+  const int len = end - begin;
   // this is always odd to avoid bank conflicts
   const int chunk   = (len > 0) ? (((len + 31) / 32) | 1) : 1;
   const int lo      = begin + lane_id * chunk;
@@ -47,16 +47,16 @@ warp_span_fold(const ValueT* tile_vals, int begin, int end, int lane_id, Reducti
 // head distance) stitches lane boundaries; each cross-boundary run closes at out[rank_base - 1];
 // a carry chains rounds; the fold since the warp tile's last head returns as tail_out (the
 // caller folds the lead span itself). <32> is the register walk (rows rotate in place first),
-// <4>/<2> the compressed streams, <1> the row form; <1, false> additionally tracks element
-// validity for the input's partial last tile.
-template <int items_per_thread, int kLaneElems, bool kFullTile, class ValueT, class OffT, class ReductionOpT>
+// <4>/<2> the compressed streams, <1> the row form. FULL warp tiles only: the input's partial
+// last tile takes the boundary-directed span form in the caller, so no validity tracking
+// exists here.
+template <int items_per_thread, int kLaneElems, class ValueT, class OffT, class ReductionOpT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   ValueT* __restrict__ d_aggregates,
   const ValueT* __restrict__ tile_vals,
   unsigned my_word,
   OffT global_runs_before_warp_tile,
   int warp_tile_offset,
-  int tile_len,
   int lane_id,
   ReductionOpT op,
   ValueT& lead_out, // fold of [warp-tile start, first head); garbage when the lead span is
@@ -66,8 +66,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   static_assert(items_per_thread <= 32, "one flag word per lane bounds the warp tile");
   static_assert(kLaneElems == 32 || kLaneElems == 4 || kLaneElems == 2 || kLaneElems == 1,
                 "unsupported granularity would silently take the one-element arm");
-  static_assert(kLaneElems == 1 || (items_per_thread == 32 && kFullTile && sizeof(ValueT) == 4),
-                "only the one-element form serves partial tiles, short IPT, and non-4-byte values");
+  static_assert(kLaneElems == 1 || (items_per_thread == 32 && sizeof(ValueT) == 4),
+                "only the one-element form serves short IPT and non-4-byte values");
   constexpr int kRounds = items_per_thread / kLaneElems;
   ValueT* const out     = d_aggregates + global_runs_before_warp_tile;
   const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
@@ -152,7 +152,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     // ---- local walk over my elements: seed at element 0, two-ternary steps after ----
     ValueT pfx, ssh;
     int hs;
-    int has = 1; // element validity (partial form only; constant elsewhere)
     if constexpr (kLaneElems == 32)
     {
       const ValueT* const my_row = tile_vals + warp_tile_offset + lane_id * 32;
@@ -202,11 +201,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       else if constexpr (kLaneElems == 2)
       {
         *(uint2*) v = *(const uint2*) (tile_vals + elem0);
-      }
-      else if constexpr (!kFullTile)
-      {
-        has  = (elem0 < tile_len) ? 1 : 0;
-        v[0] = has ? tile_vals[elem0] : ValueT{};
       }
       else
       {
@@ -269,17 +263,11 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
         {
           const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
           const ValueT from_left   = shfl_up_sync_wide(S, off);
-          int from_has             = 1;
-          if constexpr (!kFullTile)
-          {
-            from_has = __shfl_up_sync(full_mask, has, off);
-          }
           // one merged condition, one predicable body, every type and op
-          const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u) | (from_has ? 0u : 1u);
+          const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
           if (t == 0)
           {
-            S   = has ? op(from_left, S) : from_left;
-            has = 1;
+            S = op(from_left, S);
           }
         }
       }
@@ -345,8 +333,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       // began in an earlier round, and the store below must carry its whole left part
       if ((round_word & upto_l) == 0u && it > 0 && carry_has)
       {
-        S   = has ? op(carry, S) : carry;
-        has = 1;
+        S = op(carry, S);
       }
       const unsigned next_word = __shfl_sync(full_mask, my_word, (it + 1) & 31);
       const bool is_end        = (lane_id < 31) ? (((round_word >> (lane_id + 1)) & 1u) != 0u)
@@ -360,32 +347,21 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
 
     // ---- carry across rounds ----
     const ValueT S31 = shfl_sync_wide(S, 31);
-    int S31_has      = 1;
-    if constexpr (!kFullTile)
-    {
-      S31_has = __shfl_sync(full_mask, has, 31);
-    }
     if constexpr (kLaneElems == 1)
     {
       // the merge above already chained the carry into S: lane 31 holds the complete open fold
-      if (S31_has)
-      {
-        carry     = S31;
-        carry_has = true;
-      }
+      carry     = S31;
+      carry_has = true;
     }
     else if (pmask == 0u)
     {
-      if (S31_has)
-      {
-        carry     = carry_has ? op(carry, S31) : S31;
-        carry_has = true;
-      }
+      carry     = carry_has ? op(carry, S31) : S31;
+      carry_has = true;
     }
     else
     {
       carry     = S31;
-      carry_has = S31_has != 0;
+      carry_has = true;
     }
   }
   tail_out = carry; // fold since the warp tile's last head (whole tile when head-free)

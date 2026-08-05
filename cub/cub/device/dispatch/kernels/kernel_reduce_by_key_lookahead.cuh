@@ -673,13 +673,12 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         // partial warp tiles take the one-element form)
         if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32)
         {
-          stream_band<items_per_thread, 32, true>(
+          stream_band<items_per_thread, 32>(
             d_aggregates,
             tile_vals,
             my_word,
             global_runs_before_warp_tile,
             warp_tile_offset,
-            tile_len,
             lane_id,
             reduction_op,
             wt_lead,
@@ -704,13 +703,12 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         {
           if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32)
           {
-            stream_band<items_per_thread, 4, true>(
+            stream_band<items_per_thread, 4>(
               d_aggregates,
               tile_vals,
               my_word,
               global_runs_before_warp_tile,
               warp_tile_offset,
-              tile_len,
               lane_id,
               reduction_op,
               wt_lead,
@@ -721,13 +719,12 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         {
           if constexpr (from_smem && sizeof(ValueT) == 4 && items_per_thread == 32)
           {
-            stream_band<items_per_thread, 2, true>(
+            stream_band<items_per_thread, 2>(
               d_aggregates,
               tile_vals,
               my_word,
               global_runs_before_warp_tile,
               warp_tile_offset,
-              tile_len,
               lane_id,
               reduction_op,
               wt_lead,
@@ -736,13 +733,12 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         }
         else
         {
-          stream_band<items_per_thread, 1, true>(
+          stream_band<items_per_thread, 1>(
             d_aggregates,
             tile_vals,
             my_word,
             global_runs_before_warp_tile,
             warp_tile_offset,
-            tile_len,
             lane_id,
             reduction_op,
             wt_lead,
@@ -796,21 +792,28 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       }
       else
       {
-        stream_band<items_per_thread, 1, false>(
-          d_aggregates,
-          staged_vals,
-          my_word,
-          global_runs_before_warp_tile,
-          warp_tile_offset,
-          tile_len,
-          lane_id,
-          reduction_op,
-          wt_lead,
-          wt_tail);
+        // the input's LAST tile, one tile out of thousands: the boundary-directed form at any
+        // density. Span boundaries come from the flags and tile_len, so no element past the
+        // end is ever read -- which is why stream_band carries no validity machinery at all
         const HeadFlagDecodeT dec(my_word, lane_id);
-        const RunSpanT first_run = dec.decode_run(0);
-        wt_lead                  = warp_span_fold(
-          staged_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id, reduction_op);
+        for (int run_idx = 0; run_idx + 1 < warp_tile_run_count; ++run_idx)
+        {
+          const RunSpanT run = dec.decode_run(run_idx);
+          const ValueT agg   = warp_span_fold(
+            staged_vals,
+            warp_tile_offset + run.head_pos_in_warp_tile,
+            warp_tile_offset + run.next_head_pos,
+            lane_id,
+            reduction_op);
+          if (lane_id == 0)
+          {
+            d_aggregates[global_runs_before_warp_tile + run_idx] = agg;
+          }
+        }
+        const int first_head = dec.decode_run(0).head_pos_in_warp_tile;
+        const int last_head  = dec.decode_run(warp_tile_run_count - 1).head_pos_in_warp_tile;
+        wt_lead = warp_span_fold(staged_vals, warp_tile_offset, warp_tile_offset + first_head, lane_id, reduction_op);
+        wt_tail = warp_span_fold(staged_vals, warp_tile_offset + last_head, wt_end, lane_id, reduction_op);
       }
     }
     if (lane_id == 0)
