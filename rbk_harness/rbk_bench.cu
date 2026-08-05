@@ -10,13 +10,6 @@
 #include "rbk_keygen.h"
 #include <nvbench/nvbench.cuh>
 
-#ifndef K_IPT
-#  define K_IPT 0
-#endif
-#ifndef K_STAGES
-#  define K_STAGES 0
-#endif
-
 #ifndef K_KEY_T
 #  define K_KEY_T int
 #endif
@@ -73,7 +66,7 @@ struct Bufs
 
 Bufs setup_keys(long long n, const std::vector<KeyT>& h)
 {
-  using config_t = rbk_impl::winner_config<KeyT, ValueT, K_IPT, K_STAGES>;
+  using config_t = rbk_impl::winner_config<KeyT, ValueT>;
   Bufs b;
   b.n                  = n;
   const size_t pad     = (size_t) ((n + config_t::kTileSize - 1) / config_t::kTileSize) * config_t::kTileSize;
@@ -157,7 +150,7 @@ void add_counters(nvbench::state& s, const Bufs& b)
 
 static void persistent_rbk_bench(nvbench::state& state)
 {
-  using config_t    = rbk_impl::winner_config<KeyT, ValueT, K_IPT, K_STAGES>;
+  using config_t    = rbk_impl::winner_config<KeyT, ValueT>;
   const long long n = state.get_int64("Elements{io}");
   const int max_seg = (int) state.get_int64("MaxSegSize");
   auto b            = setup(n, max_seg);
@@ -188,7 +181,7 @@ static void cub_rbk_bench(nvbench::state& state)
 
 static void persistent_rbk_pattern_bench(nvbench::state& state)
 {
-  using config_t    = rbk_impl::winner_config<KeyT, ValueT, K_IPT, K_STAGES>;
+  using config_t    = rbk_impl::winner_config<KeyT, ValueT>;
   const long long n = state.get_int64("Elements{io}");
   auto b            = setup_keys(n, gen_pattern_keys(n, state.get_string("Pattern")));
   add_counters(state, b);

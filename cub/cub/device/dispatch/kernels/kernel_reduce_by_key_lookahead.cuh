@@ -74,12 +74,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
   using PrefixT                = reduce_by_key::PrefixT<OffT>;
   // the dense band's fused-stream crossover (runs per warp tile); below it, per-run span walks
   // are output-proportional and cheaper
-#ifdef RBK_STREAM_DIV
-  constexpr int stream_threshold = policy.warp_tile_size() / RBK_STREAM_DIV;
-#else
   // B200 receipt: /4 pulls the seg4 band into the stream and costs nothing anywhere else
   constexpr int stream_threshold = policy.warp_tile_size() / 4;
-#endif
   // [key_ring_stages][tile_size] input keys
   // [key_ring_stages][tile_size] int16 staged head positions
   extern __shared__ char smem_raw[];
@@ -376,11 +372,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
               wait_parity(&staged_warp_tile[slot_id][warp_tile_id], key_ring.parity);
               const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
               const int warp_tile_offset              = warp_tile_id * warp_tile_size;
-#ifdef K_DRAIN_THRESH
-              constexpr int word_serial_threshold = K_DRAIN_THRESH;
-#else
-            constexpr int word_serial_threshold = 256;
-#endif
+              constexpr int word_serial_threshold     = 256;
               if (warp_tile_run_count >= staging_threshold && warp_tile_run_count <= word_serial_threshold)
               {
                 const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
@@ -499,11 +491,7 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadInitKernel(StateT* states
 
 // THE VALUE PASS
 template <typename PolicySelector, class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
-#ifdef RBK_VBLOCKS
-__launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32, RBK_VBLOCKS)
-#else
 __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32, 6)
-#endif
   _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadValueKernel(
     const ValueT* __restrict__ d_values,
     ValueT* __restrict__ d_aggregates,
@@ -520,12 +508,8 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     constexpr int compute_warps                = policy.compute_warps;
     constexpr int warp_tile_size               = policy.warp_tile_size();
     constexpr int tile_size                    = policy.tile_size();
-#ifdef RBK_STREAM_DIV
-    constexpr int stream_threshold = warp_tile_size / RBK_STREAM_DIV;
-#else
     // B200 receipt: /4 pulls the seg4 band into the stream and costs nothing anywhere else
     constexpr int stream_threshold = warp_tile_size / 4;
-#endif
     __shared__ int wt_counts[compute_warps];
     __shared__ ValueT wt_leads[compute_warps];
     __shared__ ValueT wt_tails[compute_warps];
@@ -545,11 +529,6 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
     extern __shared__ char v_smem_raw[];
     ValueT* const staged_vals = (ValueT*) v_smem_raw;
     __shared__ ::cuda::std::uint64_t staged_bar;
-#ifdef K_VSTAGE_T
-    constexpr int stage_run_threshold = K_VSTAGE_T;
-#else
-    constexpr int stage_run_threshold = 512;
-#endif
     const int stage_len = (int) min((OffT) tile_size, num_items - (OffT) tile_id * tile_size);
     if (threadIdx.x == 0)
     {
@@ -557,7 +536,6 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
         ptx::mbarrier_init(&staged_bar, 1);
         ptx::fence_proxy_async(ptx::space_shared);
       }
-      if (stage_run_threshold == 0)
       {
         // always-stage shape: the TMA IS the fetch; issue it NOW so setup rides under the flight
         const unsigned vbytes = (unsigned) ((size_t) stage_len * sizeof(ValueT));
@@ -572,17 +550,6 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
           0u,
           vspan - vbytes,
           &staged_bar);
-      }
-      else
-      {
-        // routed/unstaged shapes: L2 prefetch (v6b receipt)
-        const char* vbase        = (const char*) (d_values + (size_t) tile_id * tile_size);
-        const char* vbase16      = (const char*) ((size_t) vbase & ~(size_t) 15);
-        const unsigned vpf_bytes = (unsigned) (((size_t) stage_len * sizeof(ValueT)) & ~(size_t) 15);
-        if (vpf_bytes > 0)
-        {
-          asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(vbase16), "r"(vpf_bytes) : "memory");
-        }
       }
       const char* fbase = (const char*) (d_flag_words + (size_t) tile_id * (compute_warps * 32));
       asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fbase),
@@ -732,28 +699,11 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       // (no final else: the hot path is staged-full only; every other shape bailed to the cold
       // outline above)
     };
-    const int tile_total_runs =
-      __shfl_sync(full_mask, lane_runs_before_warp_tile + lane_warp_tile_run_count, compute_warps - 1);
     // TILE-level hot gate, provably warp-uniform (kernel param + blockIdx-derived): a cold CALL
     // inside the band branch chain broke ptxas' convergence proof and dual-compiled every
     // collective band (WARPSYNC/ENDCOLLECTIVE safe copies = the +30% executed-instruction tax)
-    if (tile_len == tile_size && tile_total_runs >= stage_run_threshold)
+    if (tile_len == tile_size)
     {
-      if (stage_run_threshold > 0 && threadIdx.x == 0)
-      {
-        const unsigned vbytes = (unsigned) ((size_t) stage_len * sizeof(ValueT));
-        const unsigned vspan  = (vbytes + 15u) & ~15u;
-        ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, &staged_bar, vspan);
-        ptx::cp_async_bulk_ignore_oob(
-          ptx::space_shared,
-          ptx::space_global,
-          staged_vals,
-          d_values + (size_t) tile_id * tile_size,
-          vspan,
-          0u,
-          vspan - vbytes,
-          &staged_bar);
-      }
       wait_parity(&staged_bar, 0);
       emit_bands(staged_vals, ::cuda::std::true_type{});
     }

@@ -9,14 +9,6 @@
 #include "rbk_dispatch.cuh"
 #include "rbk_keygen.h"
 
-#ifndef K_IPT
-#  define K_IPT 0
-#endif
-
-#ifndef K_STAGES
-#  define K_STAGES 0
-#endif
-
 #define CHECK_CUDA(call)                                                                   \
   do                                                                                       \
   {                                                                                        \
@@ -111,7 +103,7 @@ static bool
 run_op_case(const char* op_name, long long n, int max_seg, unsigned seed, OpT op, int voff = 0, int pattern = 0)
 {
   using KeyT       = int;
-  using RbkConfigT = rbk_impl::winner_config<KeyT, ValueT, K_IPT, K_STAGES>;
+  using RbkConfigT = rbk_impl::winner_config<KeyT, ValueT>;
   auto h           = gen_case_keys<KeyT>(n, max_seg, seed, pattern);
   std::vector<ValueT> hv((size_t) n);
   {
@@ -195,7 +187,7 @@ template <class T, class ValueT, class OffsetT>
 static bool
 run_case(long long n, int max_seg, unsigned seed, bool sampled = false, int koff = 0, int voff = 0, int pattern = 0)
 {
-  using RbkConfigT = rbk_impl::winner_config<T, ValueT, K_IPT, K_STAGES>;
+  using RbkConfigT = rbk_impl::winner_config<T, ValueT>;
   using NumRunsT   = cub::detail::choose_signed_offset_t<OffsetT>;
 
   const size_t pad = (size_t) n; // EXACT allocation: the bounded-TMA tail must never over-read
@@ -338,7 +330,7 @@ run_case(long long n, int max_seg, unsigned seed, bool sampled = false, int koff
 template <class T, class ValueT, class OffsetT>
 static int run_combo(const char* v_name, const char* off_name, bool huge)
 {
-  constexpr int kTileSize = rbk_impl::winner_config<T, ValueT, K_IPT, K_STAGES>::kTileSize;
+  constexpr int kTileSize = rbk_impl::winner_config<T, ValueT>::kTileSize;
   std::printf("== ValueT=%s OffsetT=%s (tile %d)\n", v_name, off_name, kTileSize);
 
   struct Case
