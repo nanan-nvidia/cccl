@@ -360,9 +360,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
               *d_num_runs = (NumRunsT) (curr_prefix_run_count + tile_total_runs);
             }
           }
-          // the drain reads keys via LDS only when the pointer is compile-time provably SMEM: the
-          // old runtime staged/global ternary forced generic LD.E on every key read (SASS
-          // receipt: the flat ~36ns/word KDrain at every density)
           auto drain_tiles = [&](auto staged_tag) _CCCL_FORCEINLINE_LAMBDA {
             constexpr bool wt_keys_staged = decltype(staged_tag)::value;
             const KeyT* tile_keys         = wt_keys_staged ? tile_buf + (size_t) slot_id * slot_stride + slot_pad
@@ -386,10 +383,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
 #endif
               if (warp_tile_run_count >= staging_threshold && warp_tile_run_count <= word_serial_threshold)
               {
-                // word-serial band (profiler receipt: KDrain flat 1.38us/gen at seg4-16 = the broadcast
-                // band's fixed 2-shuffles-per-word loop on the MIO pipe): each lane owns its own
-                // flag word and extracts its runs serially -- no shuffles, no sync collectives, so
-                // the divergence is safe; one smem read + one store per RUN
                 const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
                 const int my_popc      = __popc(my_word);
                 typename WarpScan<int>::TempStorage warp_scan_storage;
@@ -429,19 +422,10 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
               }
               else
               {
-                // sparse band: lane-parallel masked word-serial. Compute published which words
-                // hold heads (one ballot, outside the scan loop); lane i owns the i-th LIVE word
-                // (<32 runs => <32 live words, always one round), so all live words load in ONE
-                // parallel LDS round -- the serial-walk form paid one exposed LDS latency per
-                // word and regressed seg64 2x (receipted). Rank base via warp scan; each lane
-                // extracts its own word's heads serially (no sync collectives, divergence safe).
                 const unsigned live_mask = word_mask[slot_id][warp_tile_id];
                 const int num_live       = __popc(live_mask);
                 if (num_live <= 4)
                 {
-                  // near-empty sub-band: at ~2 live words the serial replay's couple of exposed
-                  // LDS latencies beat the lane-parallel form's warp-scan setup (B200 receipt:
-                  // 193 vs 223us at seg1024); the serial form's loss starts at ~8 live words
                   const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
                   unsigned live         = live_mask;
                   int word_base         = 0;
@@ -513,10 +497,7 @@ _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadInitKernel(StateT* states
   }
 }
 
-// THE VALUE PASS: pipeline-free. One 8-warp block per tile; the persisted flag words are the
-// whole run structure, the persisted tile prefix is the whole cross-tile coordination. No rings,
-// no barriers beyond __syncthreads, no lookahead, no work stealing -- latency hides behind plain
-// occupancy. Emits every within-tile-closed aggregate + the boundary record for the cleanup pass.
+// THE VALUE PASS
 template <typename PolicySelector, class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
 #ifdef RBK_VBLOCKS
 __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32, RBK_VBLOCKS)
@@ -637,10 +618,6 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
       constexpr bool from_smem = decltype(staged_tag)::value;
       if (warp_tile_run_count == 0 || (from_smem && warp_tile_run_count < 4))
       {
-        // whole-warp span band: a 2-run warp tile paid the full rotate + ~390-inst walk (SASS
-        // census); two coalesced span sums cost ~60. All 32 lanes walk each span together.
-        // run_count is warp-uniform, so the head-free case legally skips the decoder and does
-        // its one fold (the unconditional decoder cost +2.1% at 2^12: B200 receipt)
         if (warp_tile_run_count == 0)
         {
           wt_lead = warp_span_fold(tile_vals, warp_tile_offset, wt_end, lane_id, reduction_op);

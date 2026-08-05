@@ -98,6 +98,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     int rank_base;
     [[maybe_unused]] unsigned round_word = 0; // <1> emission: my whole round word
     int round_runs                       = 0; // runs starting in this round (advances run_base at round end)
+    // at which output slot does my first run live? (rank base)
     if constexpr (kLaneElems == 32)
     {
       lane_heads        = my_flags;
@@ -138,7 +139,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       round_runs = __popc(round_word);
     }
 
-    // ---- local walk over my elements: seed at element 0, two-ternary steps after ----
+    // folding the values
     ValueT lane_lead_agg, lane_open_agg;
     int heads_seen;
     if constexpr (kLaneElems == 32)
