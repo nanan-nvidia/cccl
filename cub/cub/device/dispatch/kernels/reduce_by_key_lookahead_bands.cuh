@@ -63,9 +63,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   if constexpr (kLaneElems == 32)
   {
     // rotate row r's eight 16B quads by (r & 7) IN PLACE so the per-lane column walk below is
-    // bank-conflict-free (quads because a 128-bit shared access executes in 4 phases of 8
-    // lanes: each phase covers all 32 banks exactly once, both read and write side). <32> only
-    // ever runs on the staged smem tile, hence the const_cast.
+    // bank-conflict-free (quads because a 128-bit shared access executes in 4 phases of 8 lanes)
     ValueT* const wt_base = const_cast<ValueT*>(tile_vals) + warp_tile_offset;
 #pragma unroll
     for (int rr = 0; rr < 8; ++rr)
@@ -84,9 +82,14 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   bool carry_has     = false; // empty until a round with valid elements completes
   bool tile_had_head = false; // flips at the tile's first headed round (the lead exports there)
   int word_base      = 0; // heads in words before the current round (uniform)
-  // per-granularity unroll (the receipted shapes): full at <32>/<4>, 4-deep at <2>, rolled in
-  // fours at <1> -- full unroll of 32 rounds tripled the kernel (SASS gate receipt)
-  constexpr int kUnroll = (kLaneElems >= 4) ? kRounds : ((kLaneElems == 1) ? 8 : 4);
+  // per-granularity unroll depth, one receipted shape per rung (full unroll of 32 rounds
+  // tripled the kernel: SASS gate receipt)
+  constexpr int kUnroll =
+    (kLaneElems == 32)  ? 1 //  1 round  -> whole thing
+    : (kLaneElems == 4) ? 8 //  8 rounds -> full
+    : (kLaneElems == 2)
+      ? 4 // 16 rounds -> 4-deep
+      : 8; // 32 rounds -> 8-deep (load flight)
 #pragma unroll(kUnroll)
   for (int it = 0; it < kRounds; ++it)
   {
