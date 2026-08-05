@@ -373,43 +373,52 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void device_reduce_by_key_lookahead_body(
               const OffT global_runs_before_warp_tile = curr_prefix_run_count + runs_before_warp_tile;
               const int warp_tile_offset              = warp_tile_id * warp_tile_size;
               constexpr int word_serial_threshold     = 256;
-              if (warp_tile_run_count >= staging_threshold && warp_tile_run_count <= word_serial_threshold)
+              // word-serial finishes when its SLOWEST lane finishes (one lane extracts its word's
+              // whole head count serially); past this heads-per-word cap the broadcast replay's
+              // flat 32 iterations win at any run count (attr receipt: packed r63 keys pass +108%,
+              // uniform inputs at r<=256 top out around 14-16 heads/word so they never reroute)
+              constexpr int word_serial_skew_cap = 20;
+              if (warp_tile_run_count >= staging_threshold)
               {
                 const unsigned my_word = head_flag_buf[slot_id][warp_tile_id * 32 + lane_id];
                 const int my_popc      = __popc(my_word);
-                typename WarpScan<int>::TempStorage warp_scan_storage;
-                int word_scan;
-                WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
-                int rank     = word_scan - my_popc;
-                unsigned rem = my_word;
-                while (rem != 0)
+                if (warp_tile_run_count <= word_serial_threshold
+                    && __reduce_max_sync(full_mask, my_popc) <= word_serial_skew_cap)
                 {
-                  const int bit = __ffs(rem) - 1;
-                  rem &= rem - 1;
-                  d_unique[global_runs_before_warp_tile + rank] =
-                    tile_keys[warp_tile_offset + lane_id * 32 + bit + key_skip];
-                  ++rank;
-                }
-              }
-              else if (warp_tile_run_count >= staging_threshold)
-              {
-                // broadcast band: replay the flag words IN ORDER from smem (same-address LDS is a
-                // free 32-lane broadcast) and emit at head lanes; the word's output base is a
-                // warp-uniform running sum, so the loop has NO shuffles at all. Actives within an
-                // iteration write consecutive unique slots = coalesced.
-                const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
-                int word_base         = 0;
-#pragma unroll
-                for (int iter = 0; iter < items_per_thread; ++iter)
-                {
-                  const unsigned w = head_flag_buf[slot_id][warp_tile_id * 32 + iter];
-                  if ((w >> lane_id) & 1u)
+                  typename WarpScan<int>::TempStorage warp_scan_storage;
+                  int word_scan;
+                  WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, word_scan);
+                  int rank     = word_scan - my_popc;
+                  unsigned rem = my_word;
+                  while (rem != 0)
                   {
-                    const int run_idx                                = word_base + __popc(w & upto_l) - 1;
-                    const int loc                                    = warp_tile_offset + iter * 32 + lane_id;
-                    d_unique[global_runs_before_warp_tile + run_idx] = tile_keys[loc + key_skip];
+                    const int bit = __ffs(rem) - 1;
+                    rem &= rem - 1;
+                    d_unique[global_runs_before_warp_tile + rank] =
+                      tile_keys[warp_tile_offset + lane_id * 32 + bit + key_skip];
+                    ++rank;
                   }
-                  word_base += __popc(w);
+                }
+                else
+                {
+                  // broadcast band: replay the flag words IN ORDER from smem (same-address LDS is a
+                  // free 32-lane broadcast) and emit at head lanes; the word's output base is a
+                  // warp-uniform running sum, so the loop has NO shuffles at all. Actives within an
+                  // iteration write consecutive unique slots = coalesced.
+                  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+                  int word_base         = 0;
+#pragma unroll
+                  for (int iter = 0; iter < items_per_thread; ++iter)
+                  {
+                    const unsigned w = head_flag_buf[slot_id][warp_tile_id * 32 + iter];
+                    if ((w >> lane_id) & 1u)
+                    {
+                      const int run_idx                                = word_base + __popc(w & upto_l) - 1;
+                      const int loc                                    = warp_tile_offset + iter * 32 + lane_id;
+                      d_unique[global_runs_before_warp_tile + run_idx] = tile_keys[loc + key_skip];
+                    }
+                    word_base += __popc(w);
+                  }
                 }
               }
               else
