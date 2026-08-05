@@ -96,7 +96,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   int word_base      = 0; // heads in words before the current round (uniform)
   // per-granularity unroll (the receipted shapes): full at <32>/<4>, 4-deep at <2>, rolled in
   // fours at <1> -- full unroll of 32 rounds tripled the kernel (SASS gate receipt)
-  constexpr int kUnroll = (kLaneElems >= 4) ? kRounds : 4;
+  constexpr int kUnroll = (kLaneElems >= 4) ? kRounds : ((kLaneElems == 1) ? 8 : 4);
 #pragma unroll(kUnroll)
   for (int it = 0; it < kRounds; ++it)
   {
@@ -233,8 +233,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     const int pfx_has = !(nib & 1u); // my pre-first-head piece is empty iff element 0 is a head
 
     // ---- stitch: ONE masked scan over lane tails, depth bounded by the head distance ----
-    ValueT S                      = tail;
-    const unsigned pmask          = __ballot_sync(full_mask, brk);
+    ValueT S = tail;
+    // at one element per lane the round word IS the break mask: no ballot needed
+    const unsigned pmask          = (kLaneElems == 1) ? round_word : __ballot_sync(full_mask, brk);
     const unsigned p_at_or_before = pmask & upto_l;
     const int p_dist              = (p_at_or_before != 0u) ? (lane_id - (31 - __clz(p_at_or_before))) : (lane_id + 1);
     const int p_max               = __reduce_max_sync(full_mask, p_dist);
