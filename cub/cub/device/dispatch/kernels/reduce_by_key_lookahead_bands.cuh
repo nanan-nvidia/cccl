@@ -45,7 +45,7 @@ template <int items_per_thread, int kLaneElems, class ValueT, class OffT, class 
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   ValueT* __restrict__ d_aggregates, // global output array
   const ValueT* __restrict__ tile_vals, // staged values in smem
-  unsigned my_word, // this lanes head_flag
+  unsigned my_flags, // this lanes head_flag
   OffT global_runs_before_warp_tile,
   int warp_tile_offset,
   int lane_id,
@@ -82,7 +82,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   ValueT carry{}; // fold since the last head seen so far
   bool carry_has     = false; // empty until the first round completes
   bool lead_exported = false; // have we closed the run from prev round
-  int run_base       = 0; // runs starting in rounds already finished 
+  int run_base       = 0; // runs starting in rounds already finished
   // when there are many rounds, we do not fully unroll to save instr cache & reg pressure
   constexpr int kUnroll =
     (kLaneElems == 32)  ? 1 //  1 round  -> whole thing
@@ -91,17 +91,17 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       ? 4 // 16 rounds -> 4-deep
       : 8; // 32 rounds -> 8-deep
 #pragma unroll(kUnroll)
-  for (int it = 0; it < kRounds; ++it)
+  for (int round = 0; round < kRounds; ++round)
   {
     // ---- my kLaneElems head bits + the rank of my first owned run ----
-    unsigned nib;
+    unsigned lane_heads;
     int rank_base;
     [[maybe_unused]] unsigned round_word = 0; // <1> emission: my whole round word
     int round_runs                       = 0; // runs starting in this round (advances run_base at round end)
     if constexpr (kLaneElems == 32)
     {
-      nib               = my_word;
-      const int my_popc = __popc(my_word);
+      lane_heads        = my_flags;
+      const int my_popc = __popc(my_flags);
       typename WarpScan<int>::TempStorage warp_scan_storage;
       int rank_scan;
       WarpScan<int>(warp_scan_storage).InclusiveSum(my_popc, rank_scan);
@@ -109,47 +109,46 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     }
     else if constexpr (kLaneElems == 4)
     {
-      const unsigned w0   = __shfl_sync(full_mask, my_word, 4 * it);
-      const unsigned w1   = __shfl_sync(full_mask, my_word, 4 * it + 1);
-      const unsigned w2   = __shfl_sync(full_mask, my_word, 4 * it + 2);
-      const unsigned w3   = __shfl_sync(full_mask, my_word, 4 * it + 3);
-      const unsigned wsel = (lane_id < 8) ? w0 : (lane_id < 16) ? w1 : (lane_id < 24) ? w2 : w3;
-      const int bofs      = (lane_id & 7) * 4;
-      nib                 = (wsel >> bofs) & 0xFu;
-      rank_base           = run_base + ((lane_id >= 8) ? __popc(w0) : 0) + ((lane_id >= 16) ? __popc(w1) : 0)
-                + ((lane_id >= 24) ? __popc(w2) : 0) + __popc(wsel & ((1u << bofs) - 1u));
+      const unsigned w0            = __shfl_sync(full_mask, my_flags, 4 * round);
+      const unsigned w1            = __shfl_sync(full_mask, my_flags, 4 * round + 1);
+      const unsigned w2            = __shfl_sync(full_mask, my_flags, 4 * round + 2);
+      const unsigned w3            = __shfl_sync(full_mask, my_flags, 4 * round + 3);
+      const unsigned my_round_word = (lane_id < 8) ? w0 : (lane_id < 16) ? w1 : (lane_id < 24) ? w2 : w3;
+      const int bit_position       = (lane_id & 7) * 4;
+      lane_heads                   = (my_round_word >> bit_position) & 0xFu;
+      rank_base                    = run_base + ((lane_id >= 8) ? __popc(w0) : 0) + ((lane_id >= 16) ? __popc(w1) : 0)
+                + ((lane_id >= 24) ? __popc(w2) : 0) + __popc(my_round_word & ((1u << bit_position) - 1u));
       round_runs = __popc(w0) + __popc(w1) + __popc(w2) + __popc(w3);
     }
     else if constexpr (kLaneElems == 2)
     {
-      const unsigned w0   = __shfl_sync(full_mask, my_word, 2 * it);
-      const unsigned w1   = __shfl_sync(full_mask, my_word, 2 * it + 1);
-      const unsigned wsel = (lane_id < 16) ? w0 : w1;
-      const int bofs      = (lane_id & 15) * 2;
-      nib                 = (wsel >> bofs) & 0x3u;
-      rank_base           = run_base + ((lane_id < 16) ? 0 : __popc(w0)) + __popc(wsel & ((1u << bofs) - 1u));
-      round_runs          = __popc(w0) + __popc(w1);
+      const unsigned w0            = __shfl_sync(full_mask, my_flags, 2 * round);
+      const unsigned w1            = __shfl_sync(full_mask, my_flags, 2 * round + 1);
+      const unsigned my_round_word = (lane_id < 16) ? w0 : w1;
+      const int bit_position       = (lane_id & 15) * 2;
+      lane_heads                   = (my_round_word >> bit_position) & 0x3u;
+      rank_base  = run_base + ((lane_id < 16) ? 0 : __popc(w0)) + __popc(my_round_word & ((1u << bit_position) - 1u));
+      round_runs = __popc(w0) + __popc(w1);
     }
     else
     {
-      const unsigned w = __shfl_sync(full_mask, my_word, it);
-      nib              = (w >> lane_id) & 1u;
-      round_word       = w;
-      rank_base        = run_base + __popc(w & ((1u << lane_id) - 1u));
-      round_runs       = __popc(w);
+      round_word = __shfl_sync(full_mask, my_flags, round);
+      lane_heads = (round_word >> lane_id) & 1u;
+      rank_base  = run_base + __popc(round_word & ((1u << lane_id) - 1u));
+      round_runs = __popc(round_word);
     }
 
     // ---- local walk over my elements: seed at element 0, two-ternary steps after ----
-    ValueT pfx, ssh;
-    int hs;
+    ValueT lane_lead_agg, lane_open_agg;
+    int heads_seen;
     if constexpr (kLaneElems == 32)
     {
       const ValueT* const my_row = tile_vals + warp_tile_offset + lane_id * 32;
       ValueT v[4];
-      *(uint4*) v = *(const uint4*) (my_row + ((lane_id & 7) << 2));
-      pfx         = v[0];
-      ssh         = v[0];
-      hs          = (int) (nib & 1u);
+      *(uint4*) v   = *(const uint4*) (my_row + ((lane_id & 7) << 2));
+      lane_lead_agg = v[0];
+      lane_open_agg = v[0];
+      heads_seen    = (int) (lane_heads & 1u);
 #pragma unroll
       for (int c = 0; c < 8; ++c)
       {
@@ -161,17 +160,17 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
 #pragma unroll
         for (int j = (c == 0) ? 1 : 0; j < 4; ++j)
         {
-          const int e          = 4 * c + j;
-          const bool head      = (nib >> e) & 1u;
-          const ValueT new_ssh = head ? v[j] : op(ssh, v[j]);
-          const ValueT new_pfx = (head || hs > 0) ? pfx : op(pfx, v[j]);
-          if (head && hs > 0)
+          const int elem_idx        = 4 * c + j;
+          const bool head           = (lane_heads >> elem_idx) & 1u;
+          const ValueT new_open_agg = head ? v[j] : op(lane_open_agg, v[j]);
+          const ValueT new_lead_agg = (head || heads_seen > 0) ? lane_lead_agg : op(lane_lead_agg, v[j]);
+          if (head && heads_seen > 0)
           {
-            out[rank_base + hs - 1] = ssh;
+            out[rank_base + heads_seen - 1] = lane_open_agg;
           }
-          hs += (int) head;
-          ssh = new_ssh;
-          pfx = new_pfx;
+          heads_seen += (int) head;
+          lane_open_agg = new_open_agg;
+          lane_lead_agg = new_lead_agg;
         }
 #pragma unroll
         for (int j = 0; j < 4; ++j)
@@ -182,7 +181,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     }
     else
     {
-      const int elem0 = warp_tile_offset + it * (32 * kLaneElems) + lane_id * kLaneElems;
+      const int elem0 = warp_tile_offset + round * (32 * kLaneElems) + lane_id * kLaneElems;
       ValueT v[kLaneElems];
       if constexpr (kLaneElems == 4)
       {
@@ -201,12 +200,12 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
         // closed form: with two elements there is nothing to walk -- every piece is a direct
         // function of the two head bits (the generic seeded walk cost exactly 4 extra selects
         // per round here = +64/warp tile: ncu source-counter receipt at seg2)
-        const bool h0     = (nib & 1u) != 0u;
-        const bool h1     = (nib & 2u) != 0u;
+        const bool h0     = (lane_heads & 1u) != 0u;
+        const bool h1     = (lane_heads & 2u) != 0u;
         const ValueT both = op(v[0], v[1]);
-        pfx               = h1 ? v[0] : both; // [start, first head): v0 alone iff e1 is the head
-        ssh               = h1 ? v[1] : both; // since my last head (whole pair when headless)
-        hs                = (int) h0 + (int) h1;
+        lane_lead_agg     = h1 ? v[0] : both; // [start, first head): v0 alone iff e1 is the head
+        lane_open_agg     = h1 ? v[1] : both; // since my last head (whole pair when headless)
+        heads_seen        = (int) h0 + (int) h1;
         if (h0 && h1)
         {
           out[rank_base] = v[0]; // the run [e0, e1) lives entirely inside my pair
@@ -214,66 +213,68 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       }
       else
       {
-        pfx = v[0];
-        ssh = v[0];
-        hs  = (int) (nib & 1u);
+        lane_lead_agg = v[0];
+        lane_open_agg = v[0];
+        heads_seen    = (int) (lane_heads & 1u);
 #pragma unroll
         for (int j = 1; j < kLaneElems; ++j)
         {
-          const bool head      = (nib >> j) & 1u;
-          const ValueT new_ssh = head ? v[j] : op(ssh, v[j]);
-          const ValueT new_pfx = (head || hs > 0) ? pfx : op(pfx, v[j]);
-          if (head && hs > 0)
+          const bool head           = (lane_heads >> j) & 1u;
+          const ValueT new_open_agg = head ? v[j] : op(lane_open_agg, v[j]);
+          const ValueT new_lead_agg = (head || heads_seen > 0) ? lane_lead_agg : op(lane_lead_agg, v[j]);
+          if (head && heads_seen > 0)
           {
-            out[rank_base + hs - 1] = ssh;
+            out[rank_base + heads_seen - 1] = lane_open_agg;
           }
-          hs += (int) head;
-          ssh = new_ssh;
-          pfx = new_pfx;
+          heads_seen += (int) head;
+          lane_open_agg = new_open_agg;
+          lane_lead_agg = new_lead_agg;
         }
       }
     }
-    // <2>'s closed form already leaves ssh as the tail in every case (incl. headless)
-    const ValueT tail = (kLaneElems == 2) ? ssh : ((hs > 0) ? ssh : pfx);
-    const bool brk    = nib != 0u;
-    const int pfx_has = !(nib & 1u); // my pre-first-head piece is empty iff element 0 is a head
+    // <2>'s closed form already leaves lane_open_agg as the tail in every case (incl. headless)
+    const ValueT lane_tail_agg = (kLaneElems == 2) ? lane_open_agg : ((heads_seen > 0) ? lane_open_agg : lane_lead_agg);
+    const bool has_head        = lane_heads != 0u;
+    const int lead_has         = !(lane_heads & 1u); // my pre-first-head piece is empty iff element 0 is a head
 
     // ---- stitch: ONE masked scan over lane tails, depth bounded by the head distance ----
-    ValueT S = tail;
-    // at one element per lane the round word IS the break mask: no ballot needed
-    const unsigned pmask          = (kLaneElems == 1) ? round_word : __ballot_sync(full_mask, brk);
-    const unsigned p_at_or_before = pmask & mask_lanes_at_or_below;
-    const int p_dist              = (p_at_or_before != 0u) ? (lane_id - (31 - __clz(p_at_or_before))) : (lane_id + 1);
-    const int p_max               = __reduce_max_sync(full_mask, p_dist);
-    auto scan_steps               = [&](int first_off, int last_off) _CCCL_FORCEINLINE_LAMBDA {
+    ValueT open_agg = lane_tail_agg;
+    // at one element per lane the round word IS the head-lane mask: no ballot needed
+    const unsigned head_lanes             = (kLaneElems == 1) ? round_word : __ballot_sync(full_mask, has_head);
+    const unsigned head_lanes_at_or_below = head_lanes & mask_lanes_at_or_below;
+    const int head_distance =
+      (head_lanes_at_or_below != 0u) ? (lane_id - (31 - __clz(head_lanes_at_or_below))) : (lane_id + 1);
+    const int max_head_distance = __reduce_max_sync(full_mask, head_distance);
+    auto scan_steps             = [&](int first_off, int last_off) _CCCL_FORCEINLINE_LAMBDA {
 #pragma unroll
       for (int off = 1; off < 32; off <<= 1)
       {
         if (off >= first_off && off <= last_off)
         {
-          const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-          const ValueT from_left   = __shfl_up_sync(full_mask, S, off);
+          const unsigned mask_lanes_at_or_below_src = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
+          const ValueT from_left                    = __shfl_up_sync(full_mask, open_agg, off);
           // one merged condition, one predicable body, every type and op
-          const unsigned t = (pmask & mask_lanes_at_or_below & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
-          if (t == 0)
+          const unsigned blockers =
+            (head_lanes & mask_lanes_at_or_below & ~mask_lanes_at_or_below_src) | ((lane_id < off) ? 1u : 0u);
+          if (blockers == 0)
           {
-            S = op(from_left, S);
+            open_agg = op(from_left, open_agg);
           }
         }
       }
     };
-    if (p_max == 0)
+    if (max_head_distance == 0)
     {
     }
-    else if (p_max <= 1)
+    else if (max_head_distance <= 1)
     {
       scan_steps(1, 1);
     }
-    else if (p_max <= 3)
+    else if (max_head_distance <= 3)
     {
       scan_steps(1, 2);
     }
-    else if (p_max <= 7)
+    else if (max_head_distance <= 7)
     {
       scan_steps(1, 4);
     }
@@ -285,33 +286,34 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     // ---- close the runs this round finishes; export the warp tile's lead at its first head ----
     if constexpr (kLaneElems != 1)
     {
-      // deferred incoming close: the run ending at my first head. in_emit (a head exists
+      // deferred incoming close: the run ending at my first head. close_incoming (a head exists
       // before this lane's span) guarantees every piece below is nonempty
-      const ValueT S_prev                 = __shfl_up_sync(full_mask, S, 1);
-      const unsigned heads_strictly_below = pmask & ((1u << lane_id) - 1u);
-      // <2> drops the carry_has test: in_emit (its only consumer there, the lead moved out)
+      const ValueT prev_open_agg          = __shfl_up_sync(full_mask, open_agg, 1);
+      const unsigned heads_strictly_below = head_lanes & ((1u << lane_id) - 1u);
+      // <2> drops the carry_has test: close_incoming (its only consumer there, the lead moved out)
       // implies a head exists before this span, so the selected pieces are nonempty exactly
-      // when read. <32>/<4> keep it: their lead export reads in_val in round 0 (carry empty)
-      const ValueT P_in =
+      // when read. <32>/<4> keep it: their lead export reads incoming_run_agg in round 0 (carry empty)
+      const ValueT incoming_agg =
         (kLaneElems == 2)
-          ? ((lane_id > 0) ? ((heads_strictly_below != 0u) ? S_prev : op(carry, S_prev)) : carry)
-          : ((lane_id > 0) ? ((heads_strictly_below != 0u || !carry_has) ? S_prev : op(carry, S_prev)) : carry);
-      const bool in_emit  = brk && (rank_base >= 1);
-      const ValueT in_val = pfx_has ? op(P_in, pfx) : P_in;
-      if (in_emit)
+          ? ((lane_id > 0) ? ((heads_strictly_below != 0u) ? prev_open_agg : op(carry, prev_open_agg)) : carry)
+          : ((lane_id > 0) ? ((heads_strictly_below != 0u || !carry_has) ? prev_open_agg : op(carry, prev_open_agg))
+                           : carry);
+      const bool close_incoming     = has_head && (rank_base >= 1);
+      const ValueT incoming_run_agg = lead_has ? op(incoming_agg, lane_lead_agg) : incoming_agg;
+      if (close_incoming)
       {
-        out[rank_base - 1] = in_val;
+        out[rank_base - 1] = incoming_run_agg;
       }
       if constexpr (kLaneElems >= 4) // <32>/<4> export their lead (receipts: 2^2 -0.5% in-band
       { // that the caller's re-fold measurably re-reads (the
         // shorter forms keep their round loops branch-free and
         // the caller folds their few-element lead itself)
-        if (!lead_exported && pmask != 0u) // uniform branch: the tile's first headed round
+        if (!lead_exported && head_lanes != 0u) // uniform branch: the tile's first headed round
         {
-          const int fl          = __ffs(pmask) - 1;
-          const ValueT lead_cnd = (lane_id > 0 || carry_has) ? in_val : pfx;
-          lead_out              = __shfl_sync(full_mask, lead_cnd, fl);
-          lead_exported         = true;
+          const int first_head_lane = __ffs(head_lanes) - 1;
+          const ValueT lead_val     = (lane_id > 0 || carry_has) ? incoming_run_agg : lane_lead_agg;
+          lead_out                  = __shfl_sync(full_mask, lead_val, first_head_lane);
+          lead_exported             = true;
         }
       }
     }
@@ -322,36 +324,36 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       // as a bit, never as a shuffled value (the row stream's receipted emission shape).
       // Lanes with no head at-or-before fold the inter-round carry in FIRST: their open run
       // began in an earlier round, and the store below must carry its whole left part
-      if ((round_word & mask_lanes_at_or_below) == 0u && it > 0 && carry_has)
+      if ((round_word & mask_lanes_at_or_below) == 0u && round > 0 && carry_has)
       {
-        S = op(carry, S);
+        open_agg = op(carry, open_agg);
       }
-      const unsigned next_word = __shfl_sync(full_mask, my_word, (it + 1) & 31);
+      const unsigned next_word = __shfl_sync(full_mask, my_flags, (round + 1) & 31);
       const bool is_end        = (lane_id < 31) ? (((round_word >> (lane_id + 1)) & 1u) != 0u)
-                                                : ((it + 1 < kRounds) && ((next_word & 1u) != 0u));
-      const int rank_in_round  = run_base + __popc(round_word & mask_lanes_at_or_below) - 1;
-      if (is_end && rank_in_round >= 0)
+                                                : ((round + 1 < kRounds) && ((next_word & 1u) != 0u));
+      const int my_run_rank    = run_base + __popc(round_word & mask_lanes_at_or_below) - 1;
+      if (is_end && my_run_rank >= 0)
       {
-        out[rank_in_round] = S;
+        out[my_run_rank] = open_agg;
       }
     }
 
     // ---- carry across rounds ----
-    const ValueT S31 = __shfl_sync(full_mask, S, 31);
+    const ValueT round_open_agg = __shfl_sync(full_mask, open_agg, 31);
     if constexpr (kLaneElems == 1)
     {
-      // the merge above already chained the carry into S: lane 31 holds the complete open fold
-      carry     = S31;
+      // the merge above already chained the carry into open_agg: lane 31 holds the complete open fold
+      carry     = round_open_agg;
       carry_has = true;
     }
-    else if (pmask == 0u)
+    else if (head_lanes == 0u)
     {
-      carry     = carry_has ? op(carry, S31) : S31;
+      carry     = carry_has ? op(carry, round_open_agg) : round_open_agg;
       carry_has = true;
     }
     else
     {
-      carry     = S31;
+      carry     = round_open_agg;
       carry_has = true;
     }
     run_base += round_runs;
