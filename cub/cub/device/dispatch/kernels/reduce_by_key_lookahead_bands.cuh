@@ -22,11 +22,13 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE ValueT
 warp_span_fold(const ValueT* tile_vals, int begin, int end, int lane_id, ReductionOpT op)
 {
   const int len     = end - begin;
+  // this is always odd to avoid bank conflicts
   const int chunk   = (len > 0) ? (((len + 31) / 32) | 1) : 1;
   const int lo      = begin + lane_id * chunk;
   const int hi      = min(lo + chunk, end);
   const int n_valid = (len > 0) ? ((len + chunk - 1) / chunk) : 0;
   ValueT acc{};
+  // reduce within each lane
   if (lo < hi)
   {
     acc = tile_vals[lo];
@@ -62,10 +64,10 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   ValueT& tail_out)
 {
   static_assert(items_per_thread <= 32, "one flag word per lane bounds the warp tile");
-  static_assert(kLaneElems == 32 || kLaneElems == 4 || kLaneElems == 2 || kLaneElems == 1, "");
-  static_assert(kLaneElems == 1 || items_per_thread == 32, "the multi-element forms assume 32x32 warp tiles");
-  static_assert(kFullTile || kLaneElems == 1, "partial warp tiles take the one-element form");
-  static_assert(kLaneElems == 1 || sizeof(ValueT) == 4, "the vector loads cast through uint4/uint2");
+  static_assert(kLaneElems == 32 || kLaneElems == 4 || kLaneElems == 2 || kLaneElems == 1,
+                "unsupported granularity would silently take the one-element arm");
+  static_assert(kLaneElems == 1 || (items_per_thread == 32 && kFullTile && sizeof(ValueT) == 4),
+                "only the one-element form serves partial tiles, short IPT, and non-4-byte values");
   constexpr int kRounds = items_per_thread / kLaneElems;
   ValueT* const out     = d_aggregates + global_runs_before_warp_tile;
   const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
