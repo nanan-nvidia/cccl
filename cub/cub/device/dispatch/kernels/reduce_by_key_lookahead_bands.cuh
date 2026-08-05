@@ -81,7 +81,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   // between rounds...
   ValueT carry{}; // fold since the last head seen so far
   bool carry_has     = false; // empty until the first round completes
-  bool lead_exported = false; // one-shot: the lead is only harvestable at the tile's FIRST headed round
+  bool lead_exported = false; // have we closed the run from prev round
   int run_base       = 0; // runs starting in rounds already finished 
   // when there are many rounds, we do not fully unroll to save instr cache & reg pressure
   constexpr int kUnroll =
