@@ -210,22 +210,41 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       {
         v[0] = tile_vals[elem0];
       }
-      pfx = v[0];
-      ssh = v[0];
-      hs  = (int) (nib & 1u);
-#pragma unroll
-      for (int j = 1; j < kLaneElems; ++j)
+      if constexpr (kLaneElems == 2)
       {
-        const bool head      = (nib >> j) & 1u;
-        const ValueT new_ssh = head ? v[j] : op(ssh, v[j]);
-        const ValueT new_pfx = (head || hs > 0) ? pfx : op(pfx, v[j]);
-        if (head && hs > 0)
+        // closed form: with two elements there is nothing to walk -- every piece is a direct
+        // function of the two head bits (the generic seeded walk cost exactly 4 extra selects
+        // per round here = +64/warp tile: ncu source-counter receipt at seg2)
+        const bool h0     = (nib & 1u) != 0u;
+        const bool h1     = (nib & 2u) != 0u;
+        const ValueT both = op(v[0], v[1]);
+        pfx               = h1 ? v[0] : both; // [start, first head): v0 alone iff e1 is the head
+        ssh               = h1 ? v[1] : both; // since my last head (whole pair when headless)
+        hs                = (int) h0 + (int) h1;
+        if (h0 && h1)
         {
-          out[rank_base + hs - 1] = ssh;
+          out[rank_base] = v[0]; // the run [e0, e1) lives entirely inside my pair
         }
-        hs += (int) head;
-        ssh = new_ssh;
-        pfx = new_pfx;
+      }
+      else
+      {
+        pfx = v[0];
+        ssh = v[0];
+        hs  = (int) (nib & 1u);
+#pragma unroll
+        for (int j = 1; j < kLaneElems; ++j)
+        {
+          const bool head      = (nib >> j) & 1u;
+          const ValueT new_ssh = head ? v[j] : op(ssh, v[j]);
+          const ValueT new_pfx = (head || hs > 0) ? pfx : op(pfx, v[j]);
+          if (head && hs > 0)
+          {
+            out[rank_base + hs - 1] = ssh;
+          }
+          hs += (int) head;
+          ssh = new_ssh;
+          pfx = new_pfx;
+        }
       }
     }
     const ValueT tail = (hs > 0) ? ssh : pfx; // since my last head (whole span when headless)
@@ -296,7 +315,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       {
         out[rank_base - 1] = in_val;
       }
-      if constexpr (kLaneElems == 32) // only <32> exports its lead: its span is long enough
+      if constexpr (kLaneElems >= 4) // <32>/<4> export their lead (receipts: 2^2 -0.5% in-band
       { // that the caller's re-fold measurably re-reads (the
         // shorter forms keep their round loops branch-free and
         // the caller folds their few-element lead itself)
