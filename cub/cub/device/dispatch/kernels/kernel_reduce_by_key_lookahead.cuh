@@ -748,6 +748,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
             wt_lead,
             wt_tail);
         }
+        const HeadFlagDecodeT dec(my_word, lane_id);
+        const RunSpanT first_run = dec.decode_run(0);
+        wt_lead                  = warp_span_fold(
+          tile_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id, reduction_op);
       }
       // (no final else: the hot path is staged-full only; every other shape bailed to the cold
       // outline above)
@@ -800,6 +804,10 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
           reduction_op,
           wt_lead,
           wt_tail);
+        const HeadFlagDecodeT dec(my_word, lane_id);
+        const RunSpanT first_run = dec.decode_run(0);
+        wt_lead                  = warp_span_fold(
+          staged_vals, warp_tile_offset, warp_tile_offset + first_run.head_pos_in_warp_tile, lane_id, reduction_op);
       }
     }
     if (lane_id == 0)

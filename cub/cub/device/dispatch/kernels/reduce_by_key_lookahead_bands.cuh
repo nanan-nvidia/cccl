@@ -296,12 +296,17 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       {
         out[rank_base - 1] = in_val;
       }
-      if (!tile_had_head && pmask != 0u) // uniform branch: the tile's first headed round
-      {
-        const int fl          = __ffs(pmask) - 1;
-        const ValueT lead_cnd = (lane_id > 0 || carry_has) ? in_val : pfx;
-        lead_out              = shfl_sync_wide(lead_cnd, fl);
-        tile_had_head         = true;
+      if constexpr (kLaneElems == 32) // only <32> exports its lead: its span is long enough
+      { // that the caller's re-fold measurably re-reads (the
+        // shorter forms keep their round loops branch-free and
+        // the caller folds their few-element lead itself)
+        if (!tile_had_head && pmask != 0u) // uniform branch: the tile's first headed round
+        {
+          const int fl          = __ffs(pmask) - 1;
+          const ValueT lead_cnd = (lane_id > 0 || carry_has) ? in_val : pfx;
+          lead_out              = shfl_sync_wide(lead_cnd, fl);
+          tile_had_head         = true;
+        }
       }
     }
     else
@@ -323,15 +328,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       if (is_end && rank_in_round >= 0)
       {
         out[rank_in_round] = S;
-      }
-      if (!tile_had_head && pmask != 0u) // uniform branch: the tile's first headed round
-      {
-        // post-merge, S_prev already contains the inter-round carry chain
-        const ValueT S_prev   = shfl_up_sync_wide(S, 1);
-        const int fl          = __ffs(pmask) - 1;
-        const ValueT lead_cnd = (lane_id > 0) ? S_prev : carry;
-        lead_out              = shfl_sync_wide(lead_cnd, fl);
-        tile_had_head         = true;
       }
     }
 
