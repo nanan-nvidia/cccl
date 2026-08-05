@@ -247,7 +247,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
         }
       }
     }
-    const ValueT tail = (hs > 0) ? ssh : pfx; // since my last head (whole span when headless)
+    // <2>'s closed form already leaves ssh as the tail in every case (incl. headless)
+    const ValueT tail = (kLaneElems == 2) ? ssh : ((hs > 0) ? ssh : pfx);
     const bool brk    = nib != 0u;
     const int pfx_has = !(nib & 1u); // my pre-first-head piece is empty iff element 0 is a head
 
@@ -308,9 +309,14 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       // before this lane's span) guarantees every piece below is nonempty
       const ValueT S_prev   = shfl_up_sync_wide(S, 1);
       const unsigned before = pmask & ((1u << lane_id) - 1u);
-      const ValueT P_in     = (lane_id > 0) ? ((before != 0u || !carry_has) ? S_prev : op(carry, S_prev)) : carry;
-      const bool in_emit    = brk && (rank_base >= 1);
-      const ValueT in_val   = pfx_has ? op(P_in, pfx) : P_in;
+      // <2> drops the carry_has test: in_emit (its only consumer there, the lead moved out)
+      // implies a head exists before this span, so the selected pieces are nonempty exactly
+      // when read. <32>/<4> keep it: their lead export reads in_val in round 0 (carry empty)
+      const ValueT P_in   = (kLaneElems == 2)
+                            ? ((lane_id > 0) ? ((before != 0u) ? S_prev : op(carry, S_prev)) : carry)
+                            : ((lane_id > 0) ? ((before != 0u || !carry_has) ? S_prev : op(carry, S_prev)) : carry);
+      const bool in_emit  = brk && (rank_base >= 1);
+      const ValueT in_val = pfx_has ? op(P_in, pfx) : P_in;
       if (in_emit)
       {
         out[rank_base - 1] = in_val;
