@@ -410,10 +410,8 @@ int main(int argc, char** argv)
   fails += run_combo<int, float, int>("F32", "I32", huge);
   fails += run_combo<int, float, long long>("F32", "I64", huge);
   // hardening type lines: non-4-byte keys/values exercise every constexpr fallback path
-  fails += run_combo<long long, float, int>("I64K/F32", "I32", huge);
   fails += run_combo<short, int, int>("I16K/I32", "I32", huge);
   fails += run_combo<signed char, int, int>("I8K/I32", "I32", huge);
-  fails += run_combo<__int128, int, int>("I128K/I32", "I32", huge);
   // generic associative (non-commutative) ops through the flagged order-preserving path
   std::printf("== generic ops ==\n");
   const long long gn = (1LL << 24) + 12345; // >= 1024 tiles at every tile size in play

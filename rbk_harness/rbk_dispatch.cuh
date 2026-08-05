@@ -19,8 +19,7 @@ using TilePrefixT = rbk_kernels::PrefixT<OffT>;
 template <class KeyT, class ValueT, int kIptOverride = 0, int kStagesOverride = 0>
 struct winner_config
 {
-  static constexpr int kIPT =
-    (kIptOverride != 0) ? kIptOverride : (sizeof(KeyT) >= 16 ? 8 : (sizeof(KeyT) == 8 ? 16 : 32));
+  static constexpr int kIPT          = (kIptOverride != 0) ? kIptOverride : 32;
   static constexpr int kNumCompWarps = 8;
   static constexpr int kStages       = (kStagesOverride != 0) ? kStagesOverride : 6; // key ring depth
   static constexpr int kPosStages    = (kStages + 1) / 2;
@@ -97,8 +96,9 @@ inline cudaError_t persistent_rbk_encode(
     return cudaErrorInvalidValue;
   }
   const long long tiles = rbk_state_tiles<Config>((long long) num_items);
-  // PROTOTYPE (Blackwell-only): 4-byte values, 16B-aligned values base; anything else errors out
-  if constexpr (sizeof(ValueT) != 4)
+  // PROTOTYPE (Blackwell-only): keys <= 4 bytes, 4-byte values, 16B-aligned values base;
+  // anything else errors out
+  if constexpr (sizeof(KeyT) > 4 || sizeof(ValueT) != 4)
   {
     return cudaErrorInvalidValue;
   }

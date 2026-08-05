@@ -41,15 +41,6 @@ warp_span_fold(const ValueT* tile_vals, int begin, int end, int lane_id, Reducti
   return WarpReduce<ValueT>(storage).Reduce(acc, op, n_valid);
 }
 
-// ONE element-directed band; granularity is the only parameter. Each lane owns kLaneElems
-// consecutive elements per round (rounds tile the warp tile): a seeded two-ternary walk closes
-// lane-interior runs at out[rank_base + hs - 1]; ONE masked scan (depth bounded by the measured
-// head distance) stitches lane boundaries; each cross-boundary run closes at out[rank_base - 1];
-// a carry chains rounds; the fold since the warp tile's last head returns as tail_out (the
-// caller folds the lead span itself). <32> is the register walk (rows rotate in place first),
-// <4>/<2> the compressed streams, <1> the row form. FULL warp tiles only: the input's partial
-// last tile takes the boundary-directed span form in the caller, so no validity tracking
-// exists here.
 template <int items_per_thread, int kLaneElems, class ValueT, class OffT, class ReductionOpT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
   ValueT* __restrict__ d_aggregates,
@@ -63,11 +54,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
                     // empty or the warp tile is head-free (the caller's has-flags guard both)
   ValueT& tail_out)
 {
-  static_assert(items_per_thread <= 32, "one flag word per lane bounds the warp tile");
+  static_assert(items_per_thread == 32 && sizeof(ValueT) == 4, "the prototype pins 32x32 warp tiles and 4-byte values");
   static_assert(kLaneElems == 32 || kLaneElems == 4 || kLaneElems == 2 || kLaneElems == 1,
                 "unsupported granularity would silently take the one-element arm");
-  static_assert(kLaneElems == 1 || (items_per_thread == 32 && sizeof(ValueT) == 4),
-                "only the one-element form serves short IPT and non-4-byte values");
   constexpr int kRounds = items_per_thread / kLaneElems;
   ValueT* const out     = d_aggregates + global_runs_before_warp_tile;
   const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
@@ -262,7 +251,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
         if (off >= first_off && off <= last_off)
         {
           const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
-          const ValueT from_left   = shfl_up_sync_wide(S, off);
+          const ValueT from_left   = __shfl_up_sync(full_mask, S, off);
           // one merged condition, one predicable body, every type and op
           const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
           if (t == 0)
@@ -297,7 +286,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     {
       // deferred incoming close: the run ending at my first head. in_emit (a head exists
       // before this lane's span) guarantees every piece below is nonempty
-      const ValueT S_prev   = shfl_up_sync_wide(S, 1);
+      const ValueT S_prev   = __shfl_up_sync(full_mask, S, 1);
       const unsigned before = pmask & ((1u << lane_id) - 1u);
       // <2> drops the carry_has test: in_emit (its only consumer there, the lead moved out)
       // implies a head exists before this span, so the selected pieces are nonempty exactly
@@ -319,7 +308,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
         {
           const int fl          = __ffs(pmask) - 1;
           const ValueT lead_cnd = (lane_id > 0 || carry_has) ? in_val : pfx;
-          lead_out              = shfl_sync_wide(lead_cnd, fl);
+          lead_out              = __shfl_sync(full_mask, lead_cnd, fl);
           tile_had_head         = true;
         }
       }
@@ -346,7 +335,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     }
 
     // ---- carry across rounds ----
-    const ValueT S31 = shfl_sync_wide(S, 31);
+    const ValueT S31 = __shfl_sync(full_mask, S, 31);
     if constexpr (kLaneElems == 1)
     {
       // the merge above already chained the carry into S: lane 31 holds the complete open fold
