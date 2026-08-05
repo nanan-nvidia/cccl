@@ -65,8 +65,18 @@ inline cudaError_t persistent_rbk_encode(
   NumRunsT* d_num_runs,
   OffT num_items,
   cudaStream_t stream       = 0,
-  ReductionOpT reduction_op = {})
+  ReductionOpT reduction_op = {},
+  float* pass_ms            = nullptr) // when set: wall ms of the 4 launches (init/keys/values/cleanup)
 {
+  cudaEvent_t pass_ev[5];
+  if (pass_ms)
+  {
+    for (auto& e : pass_ev)
+    {
+      cudaEventCreate(&e);
+    }
+    cudaEventRecord(pass_ev[0], stream);
+  }
   using RecordT           = TileValueRecordT<ValueT>;
   const long long q_tiles = rbk_state_tiles<Config>((long long) num_items);
   const auto align16      = [](size_t b) {
@@ -106,6 +116,10 @@ inline cudaError_t persistent_rbk_encode(
   const int init_blocks = (int) ((tiles + 255) / 256);
   rbk_kernels::DeviceReduceByKeyLookaheadInitKernel<typename Config::Selector>
     <<<init_blocks, 256, 0, stream>>>(count_states, tiles);
+  if (pass_ms)
+  {
+    cudaEventRecord(pass_ev[1], stream);
+  }
 
   auto* kernel = rbk_kernels::DeviceReduceByKeyLookaheadKernel<typename Config::Selector, KeyT, ValueT, NumRunsT, OffT>;
   error        = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) Config::kDynSmem);
@@ -133,6 +147,10 @@ inline cudaError_t persistent_rbk_encode(
   {
     return error;
   }
+  if (pass_ms)
+  {
+    cudaEventRecord(pass_ev[2], stream);
+  }
   // PASS 2: values
   constexpr size_t kValDynSmem   = (size_t) Config::kStages * Config::kTileSize * sizeof(ValueT);
   constexpr size_t kValBlockSmem = (size_t) Config::kTileSize * sizeof(ValueT);
@@ -150,11 +168,28 @@ inline cudaError_t persistent_rbk_encode(
   {
     return error;
   }
+  if (pass_ms)
+  {
+    cudaEventRecord(pass_ev[3], stream);
+  }
   // PASS 3: boundary cleanup (one warp per tile with a pending cross-tile close)
   const int cleanup_blocks = (int) ((tiles * 32 + 255) / 256);
   rbk_kernels::DeviceReduceByKeyLookaheadCleanupKernel<KeyT, ValueT, OffT, ReductionOpT>
     <<<cleanup_blocks, 256, 0, stream>>>(
       d_aggregates, value_records, tile_prefixes, d_keys, Config::kTileSize, (int) tiles, reduction_op);
+  if (pass_ms)
+  {
+    cudaEventRecord(pass_ev[4], stream);
+    cudaEventSynchronize(pass_ev[4]);
+    for (int p = 0; p < 4; ++p)
+    {
+      cudaEventElapsedTime(&pass_ms[p], pass_ev[p], pass_ev[p + 1]);
+    }
+    for (auto& e : pass_ev)
+    {
+      cudaEventDestroy(e);
+    }
+  }
   return cudaPeekAtLastError();
 }
 } // namespace rbk_impl
