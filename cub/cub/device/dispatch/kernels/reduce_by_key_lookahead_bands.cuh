@@ -78,26 +78,27 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     __syncwarp();
   }
 
-  ValueT carry{}; // fold since the last head seen so far (exact, left-to-right)
-  bool carry_has     = false; // empty until a round with valid elements completes
+  // between rounds...
+  ValueT carry{}; // fold since the last head seen so far
+  bool carry_has     = false; // empty until the first round completes
   bool tile_had_head = false; // flips at the tile's first headed round (the lead exports there)
-  int word_base      = 0; // heads in words before the current round (uniform)
-  // per-granularity unroll depth, one receipted shape per rung (full unroll of 32 rounds
-  // tripled the kernel: SASS gate receipt)
+  int run_base       = 0; // runs starting in rounds already finished (uniform; advances at round
+                    // end, so every in-round rank reads the pre-round value)
+  // when there are many rounds, we do not fully unroll to save instr cache & reg pressure
   constexpr int kUnroll =
     (kLaneElems == 32)  ? 1 //  1 round  -> whole thing
     : (kLaneElems == 4) ? 8 //  8 rounds -> full
     : (kLaneElems == 2)
       ? 4 // 16 rounds -> 4-deep
-      : 8; // 32 rounds -> 8-deep (load flight)
+      : 8; // 32 rounds -> 8-deep
 #pragma unroll(kUnroll)
   for (int it = 0; it < kRounds; ++it)
   {
     // ---- my kLaneElems head bits + the rank of my first owned run ----
     unsigned nib;
     int rank_base;
-    [[maybe_unused]] unsigned round_word   = 0; // <1> emission: my whole round word
-    [[maybe_unused]] int round_runs_before = 0; // <1> emission: runs before this round
+    [[maybe_unused]] unsigned round_word = 0; // <1> emission: my whole round word
+    int round_runs                       = 0; // runs starting in this round (advances run_base at round end)
     if constexpr (kLaneElems == 32)
     {
       nib               = my_word;
@@ -116,9 +117,9 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       const unsigned wsel = (lane_id < 8) ? w0 : (lane_id < 16) ? w1 : (lane_id < 24) ? w2 : w3;
       const int bofs      = (lane_id & 7) * 4;
       nib                 = (wsel >> bofs) & 0xFu;
-      rank_base           = word_base + ((lane_id >= 8) ? __popc(w0) : 0) + ((lane_id >= 16) ? __popc(w1) : 0)
+      rank_base           = run_base + ((lane_id >= 8) ? __popc(w0) : 0) + ((lane_id >= 16) ? __popc(w1) : 0)
                 + ((lane_id >= 24) ? __popc(w2) : 0) + __popc(wsel & ((1u << bofs) - 1u));
-      word_base += __popc(w0) + __popc(w1) + __popc(w2) + __popc(w3);
+      round_runs = __popc(w0) + __popc(w1) + __popc(w2) + __popc(w3);
     }
     else if constexpr (kLaneElems == 2)
     {
@@ -127,17 +128,16 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       const unsigned wsel = (lane_id < 16) ? w0 : w1;
       const int bofs      = (lane_id & 15) * 2;
       nib                 = (wsel >> bofs) & 0x3u;
-      rank_base           = word_base + ((lane_id < 16) ? 0 : __popc(w0)) + __popc(wsel & ((1u << bofs) - 1u));
-      word_base += __popc(w0) + __popc(w1);
+      rank_base           = run_base + ((lane_id < 16) ? 0 : __popc(w0)) + __popc(wsel & ((1u << bofs) - 1u));
+      round_runs          = __popc(w0) + __popc(w1);
     }
     else
     {
-      const unsigned w  = __shfl_sync(full_mask, my_word, it);
-      nib               = (w >> lane_id) & 1u;
-      round_word        = w;
-      round_runs_before = word_base;
-      rank_base         = word_base + __popc(w & ((1u << lane_id) - 1u));
-      word_base += __popc(w);
+      const unsigned w = __shfl_sync(full_mask, my_word, it);
+      nib              = (w >> lane_id) & 1u;
+      round_word       = w;
+      rank_base        = run_base + __popc(w & ((1u << lane_id) - 1u));
+      round_runs       = __popc(w);
     }
 
     // ---- local walk over my elements: seed at element 0, two-ternary steps after ----
@@ -330,7 +330,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       const unsigned next_word = __shfl_sync(full_mask, my_word, (it + 1) & 31);
       const bool is_end        = (lane_id < 31) ? (((round_word >> (lane_id + 1)) & 1u) != 0u)
                                                 : ((it + 1 < kRounds) && ((next_word & 1u) != 0u));
-      const int rank_in_round  = round_runs_before + __popc(round_word & mask_lanes_at_or_below) - 1;
+      const int rank_in_round  = run_base + __popc(round_word & mask_lanes_at_or_below) - 1;
       if (is_end && rank_in_round >= 0)
       {
         out[rank_in_round] = S;
@@ -355,6 +355,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       carry     = S31;
       carry_has = true;
     }
+    run_base += round_runs;
   }
   tail_out = carry; // fold since the warp tile's last head (whole tile when head-free)
 }
