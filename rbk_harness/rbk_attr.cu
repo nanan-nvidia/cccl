@@ -41,6 +41,10 @@ static std::vector<KeyT> pattern_keys(long long n, const std::string& pat)
   {
     return gen_keys<KeyT>(n, v, 1u);
   }
+  if (pat[0] == 'c')
+  {
+    return gen_keys_columnar<KeyT>(n, v, 1u);
+  }
   return (pat[0] == 'e') ? gen_keys_even<KeyT>(n, v, 1u) : gen_keys_skew<KeyT>(n, v, false, 1u);
 }
 

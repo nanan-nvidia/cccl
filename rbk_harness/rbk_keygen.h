@@ -131,3 +131,37 @@ std::vector<T> gen_keys_zipf(long long n, unsigned seed)
   }
   return k;
 }
+
+// across-warp-tile adversary: all of a block tile's runs live in warp tile 0 (spread evenly
+// there, isolating the cross-tile axis); one long run covers warp tiles 1-7. "Columnar": run
+// head density forms a column down warp-tile index 0. Attacks the static store-warp and
+// compute-warp bindings that within-tile skew never touches
+template <class T>
+std::vector<T> gen_keys_columnar(long long n, int runs_per_block_tile, unsigned seed)
+{
+  std::vector<T> k((size_t) n);
+  KeyDrawer<T> key(seed);
+  constexpr long long wt = 1024, block_tile = 8192;
+  for (long long base = 0; base < n; base += block_tile)
+  {
+    const long long len = std::min<long long>(block_tile, n - base);
+    const long long wt0 = std::min<long long>(wt, len);
+    const long long r   = std::min<long long>(runs_per_block_tile - 1, wt0);
+    for (long long j = 0; j < r; ++j)
+    {
+      const long long lo = base + j * wt0 / r;
+      const long long hi = base + (j + 1) * wt0 / r;
+      const T v          = key.next();
+      for (long long i = lo; i < hi; ++i)
+      {
+        k[i] = v;
+      }
+    }
+    const T tail = key.next();
+    for (long long i = base + wt0; i < base + len; ++i)
+    {
+      k[i] = tail;
+    }
+  }
+  return k;
+}

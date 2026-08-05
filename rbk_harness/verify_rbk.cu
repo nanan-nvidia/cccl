@@ -21,7 +21,8 @@
   } while (0)
 
 // pattern selector for the case tables: 0 = uniform(max_seg), 1 = worst skew(r = max_seg),
-// 2 = even control(r = max_seg), 3 = zipf, 4 = alternating 255/256 warp tiles
+// 2 = even control(r = max_seg), 3 = zipf, 4 = alternating 255/256 warp tiles,
+// 5 = columnar(runs_per_block_tile = max_seg)
 template <class T>
 static std::vector<T> gen_case_keys(long long n, int max_seg, unsigned seed, int pattern)
 {
@@ -35,6 +36,8 @@ static std::vector<T> gen_case_keys(long long n, int max_seg, unsigned seed, int
       return gen_keys_zipf<T>(n, seed);
     case 4:
       return gen_keys_skew<T>(n, 0, true, seed);
+    case 5:
+      return gen_keys_columnar<T>(n, max_seg, seed);
     default:
       return gen_keys<T>(n, max_seg, seed);
   }
@@ -382,6 +385,10 @@ static int run_combo(const char* v_name, const char* off_name, bool huge)
     fails += run_case<T, ValueT, OffsetT>((1 << 20) + 511, r, 5u, false, 0, 0, 2) ? 0 : 1; // even, partial tail
   }
   fails += run_case<T, ValueT, OffsetT>((1 << 22) + 1024, 0, 9u, false, 0, 0, 4) ? 0 : 1; // alternating 255/256
+  for (int r : {64, 256, 1025})
+  {
+    fails += run_case<T, ValueT, OffsetT>((1 << 22) + 4096 + 999, r, 3u, false, 0, 0, 5) ? 0 : 1; // columnar
+  }
   fails += run_case<T, ValueT, OffsetT>((1 << 24) + 12345, 0, 9u, false, 0, 0, 3) ? 0 : 1; // zipf
   if (huge)
   {

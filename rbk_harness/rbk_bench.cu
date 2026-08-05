@@ -125,6 +125,10 @@ std::vector<KeyT> gen_pattern_keys(long long n, const std::string& pat)
     return gen_keys_zipf<KeyT>(n, 1u);
   }
   const int r = std::atoi(pat.c_str() + 1);
+  if (pat[0] == 'c')
+  {
+    return gen_keys_columnar<KeyT>(n, r, 1u);
+  }
   return (pat[0] == 'e') ? gen_keys_even<KeyT>(n, r, 1u) : gen_keys_skew<KeyT>(n, r, false, 1u);
 }
 
@@ -212,7 +216,7 @@ static void cub_rbk_pattern_bench(nvbench::state& state)
 #define RBK_PATTERNS                                                                  \
   {"r3", "e3", "r4", "e4", "r63", "e63", "r64", "e64", "r255", "e255", "r256",        \
    "e256", "r511", "e511", "r512", "e512", "r895", "e895", "r896", "e896", "r1023",   \
-   "alt255_256", "zipf"}
+   "alt255_256", "zipf", "c64", "e8", "c256", "e32", "c1025", "e128"}
 // clang-format on
 
 NVBENCH_BENCH(persistent_rbk_bench)
