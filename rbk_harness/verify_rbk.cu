@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "rbk_dispatch.cuh"
+#include "rbk_keygen.h"
 
 #ifndef K_IPT
 #  define K_IPT 0
@@ -27,30 +28,24 @@
     }                                                                                      \
   } while (0)
 
+// pattern selector for the case tables: 0 = uniform(max_seg), 1 = worst skew(r = max_seg),
+// 2 = even control(r = max_seg), 3 = zipf, 4 = alternating 255/256 warp tiles
 template <class T>
-static std::vector<T> gen_keys(long long n, int max_seg, unsigned seed)
+static std::vector<T> gen_case_keys(long long n, int max_seg, unsigned seed, int pattern)
 {
-  std::vector<T> k((size_t) n);
-  std::mt19937 rng(seed);
-  std::uniform_int_distribution<int> seg(1, max_seg), kd(0, 1000000);
-  long long i = 0;
-  T prev      = T(-1);
-  while (i < n)
+  switch (pattern)
   {
-    int run = seg(rng);
-    T v     = T(kd(rng));
-    for (int tries = 0; v == prev && tries < 8; ++tries)
-    {
-      v = T(kd(rng));
-    }
-    prev        = v;
-    long long e = std::min<long long>(i + run, n);
-    for (; i < e; ++i)
-    {
-      k[i] = v;
-    }
+    case 1:
+      return gen_keys_skew<T>(n, max_seg, false, seed);
+    case 2:
+      return gen_keys_even<T>(n, max_seg, seed);
+    case 3:
+      return gen_keys_zipf<T>(n, seed);
+    case 4:
+      return gen_keys_skew<T>(n, 0, true, seed);
+    default:
+      return gen_keys<T>(n, max_seg, seed);
   }
-  return k;
 }
 
 template <class ValueT>
@@ -112,11 +107,12 @@ struct MinOp
 
 // generic-op verification: exact CPU fold (same op, left-to-right) vs the device line
 template <class ValueT, class OpT>
-static bool run_op_case(const char* op_name, long long n, int max_seg, unsigned seed, OpT op, int voff = 0)
+static bool
+run_op_case(const char* op_name, long long n, int max_seg, unsigned seed, OpT op, int voff = 0, int pattern = 0)
 {
   using KeyT       = int;
   using RbkConfigT = rbk_impl::winner_config<KeyT, ValueT, K_IPT, K_STAGES>;
-  auto h           = gen_keys<KeyT>(n, max_seg, seed);
+  auto h           = gen_case_keys<KeyT>(n, max_seg, seed, pattern);
   std::vector<ValueT> hv((size_t) n);
   {
     std::mt19937 rng(seed ^ 0x51ed2701u);
@@ -196,13 +192,14 @@ static bool run_op_case(const char* op_name, long long n, int max_seg, unsigned 
 }
 
 template <class T, class ValueT, class OffsetT>
-static bool run_case(long long n, int max_seg, unsigned seed, bool sampled = false, int koff = 0, int voff = 0)
+static bool
+run_case(long long n, int max_seg, unsigned seed, bool sampled = false, int koff = 0, int voff = 0, int pattern = 0)
 {
   using RbkConfigT = rbk_impl::winner_config<T, ValueT, K_IPT, K_STAGES>;
   using NumRunsT   = cub::detail::choose_signed_offset_t<OffsetT>;
 
   const size_t pad = (size_t) n; // EXACT allocation: the bounded-TMA tail must never over-read
-  auto h           = gen_keys<T>(n, max_seg, seed);
+  auto h           = gen_case_keys<T>(n, max_seg, seed, pattern);
   auto hv          = gen_values<ValueT>(n, seed);
 
   // reference: pass 1 counts runs; pass 2 fills the compared window(s), aggregates accumulated in double
@@ -385,6 +382,15 @@ static int run_combo(const char* v_name, const char* off_name, bool huge)
     fails += run_case<T, ValueT, OffsetT>((1 << 20) + 12345, 2, 42u, false, o.koff, o.voff) ? 0 : 1;
     fails += run_case<T, ValueT, OffsetT>(1 << 22, 4096, 1u, false, o.koff, o.voff) ? 0 : 1;
   }
+  // constructed worst-skew + matched-even patterns at every router edge (span|<32> 3|4,
+  // staging gate 63|64, <32>|<4> 255|256, <4>|<2> 511|512, <2>|<1> 895|896, near-dense 1023)
+  for (int r : {3, 4, 63, 64, 255, 256, 511, 512, 895, 896, 1023})
+  {
+    fails += run_case<T, ValueT, OffsetT>((1 << 22) + 4096 + 999, r, 1u, false, 0, 0, 1) ? 0 : 1; // skew, partial tail
+    fails += run_case<T, ValueT, OffsetT>((1 << 20) + 511, r, 5u, false, 0, 0, 2) ? 0 : 1; // even, partial tail
+  }
+  fails += run_case<T, ValueT, OffsetT>((1 << 22) + 1024, 0, 9u, false, 0, 0, 4) ? 0 : 1; // alternating 255/256
+  fails += run_case<T, ValueT, OffsetT>((1 << 24) + 12345, 0, 9u, false, 0, 0, 3) ? 0 : 1; // zipf
   if (huge)
   {
     if constexpr (sizeof(OffsetT) < 8)
@@ -420,6 +426,9 @@ int main(int argc, char** argv)
     fails += !run_op_case<unsigned>("affine", gn, seg, 1234u + (unsigned) seg, AffineComposeOp{});
   }
   fails += !run_op_case<int>("min", gn, 64, 4321u, MinOp{});
+  // ordering tripwire on the constructed worst skew (non-commutative op, band-edge r)
+  fails += !run_op_case<unsigned>("affine_skew", gn, 255, 91u, AffineComposeOp{}, 0, /*pattern=*/1);
+  fails += !run_op_case<unsigned>("affine_skew", gn, 896, 92u, AffineComposeOp{}, 0, /*pattern=*/1);
 
   std::printf(fails ? "*** %d FAILURES ***\n" : "ALL PASS\n", fails);
   return fails ? 1 : 0;

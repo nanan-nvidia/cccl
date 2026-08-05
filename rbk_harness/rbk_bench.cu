@@ -3,9 +3,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "rbk_dispatch.cuh"
+#include "rbk_keygen.h"
 #include <nvbench/nvbench.cuh>
 
 #ifndef K_IPT
@@ -40,34 +42,6 @@ using BenchOp = cuda::std::plus<>;
 
 namespace
 {
-// random keys with run lengths uniform in [1, max_seg]; consecutive runs never share a key
-// (adjacency-distinctness enforced post-cast so narrow key types can't merge segments)
-template <class T>
-std::vector<T> gen_keys(long long n, int max_seg, unsigned seed)
-{
-  std::vector<T> k((size_t) n);
-  std::mt19937 rng(seed);
-  std::uniform_int_distribution<int> seg(1, max_seg), kd(0, 1000000);
-  long long i = 0;
-  T prev      = T(-1);
-  while (i < n)
-  {
-    int run = seg(rng);
-    T v     = T(kd(rng));
-    for (int tries = 0; v == prev && tries < 8; ++tries)
-    {
-      v = T(kd(rng));
-    }
-    prev        = v;
-    long long e = std::min<long long>(i + run, n);
-    for (; i < e; ++i)
-    {
-      k[i] = v;
-    }
-  }
-  return k;
-}
-
 template <class T>
 long long cpu_run_count(const std::vector<T>& h)
 {
@@ -97,13 +71,12 @@ struct Bufs
   long long R  = 0;
 };
 
-Bufs setup(long long n, int max_seg)
+Bufs setup_keys(long long n, const std::vector<KeyT>& h)
 {
   using config_t = rbk_impl::winner_config<KeyT, ValueT, K_IPT, K_STAGES>;
   Bufs b;
   b.n                  = n;
   const size_t pad     = (size_t) ((n + config_t::kTileSize - 1) / config_t::kTileSize) * config_t::kTileSize;
-  auto h               = gen_keys<KeyT>(n, max_seg, 1u);
   const long long cpuR = cpu_run_count(h);
   std::vector<ValueT> hv((size_t) n);
   std::mt19937 vrng(2u);
@@ -133,12 +106,33 @@ Bufs setup(long long n, int max_seg)
   cudaMemcpy(&got, b.dn, sizeof(got), cudaMemcpyDeviceToHost);
   if ((long long) got != cpuR)
   {
-    std::printf(
-      "*** OURS CORRECTNESS FAIL: n=%lld max_seg=%d got_R=%lld cpu_R=%lld ***\n", n, max_seg, (long long) got, cpuR);
+    std::printf("*** OURS CORRECTNESS FAIL: n=%lld got_R=%lld cpu_R=%lld ***\n", n, (long long) got, cpuR);
     std::exit(3);
   }
   b.R = cpuR;
   return b;
+}
+
+Bufs setup(long long n, int max_seg)
+{
+  return setup_keys(n, gen_keys<KeyT>(n, max_seg, 1u));
+}
+
+// "rN" = worst skew at N runs/warp tile, "eN" = matched-r even control, plus alt/zipf shapes;
+// the N sweep pins every router edge: 3|4 span, 63|64 staging gate, 255|256 <32>|<4>,
+// 511|512 <4>|<2>, 895|896 <2>|<1>, 1023 near-dense
+std::vector<KeyT> gen_pattern_keys(long long n, const std::string& pat)
+{
+  if (pat == "alt255_256")
+  {
+    return gen_keys_skew<KeyT>(n, 0, true, 1u);
+  }
+  if (pat == "zipf")
+  {
+    return gen_keys_zipf<KeyT>(n, 1u);
+  }
+  const int r = std::atoi(pat.c_str() + 1);
+  return (pat[0] == 'e') ? gen_keys_even<KeyT>(n, r, 1u) : gen_keys_skew<KeyT>(n, r, false, 1u);
 }
 
 void teardown(Bufs& b)
@@ -192,6 +186,42 @@ static void cub_rbk_bench(nvbench::state& state)
   teardown(b);
 }
 
+static void persistent_rbk_pattern_bench(nvbench::state& state)
+{
+  using config_t    = rbk_impl::winner_config<KeyT, ValueT, K_IPT, K_STAGES>;
+  const long long n = state.get_int64("Elements{io}");
+  auto b            = setup_keys(n, gen_pattern_keys(n, state.get_string("Pattern")));
+  add_counters(state, b);
+  state.exec(nvbench::exec_tag::no_batch, [&](nvbench::launch& launch) {
+    rbk_impl::persistent_rbk_encode<config_t>(
+      b.dtemp, b.tempb, b.dk, b.dv, b.du, b.da, b.dn, (int) n, launch.get_stream(), BenchOp{});
+  });
+  teardown(b);
+}
+
+static void cub_rbk_pattern_bench(nvbench::state& state)
+{
+  const long long n = state.get_int64("Elements{io}");
+  auto b            = setup_keys(n, gen_pattern_keys(n, state.get_string("Pattern")));
+  add_counters(state, b);
+  void* tmp   = nullptr;
+  size_t tbsz = 0;
+  cub::DeviceReduce::ReduceByKey(tmp, tbsz, b.dk, b.du, b.dv, b.da, b.dn, BenchOp{}, (int) n);
+  cudaMalloc(&tmp, tbsz);
+  state.exec(nvbench::exec_tag::no_batch, [&](nvbench::launch& launch) {
+    cub::DeviceReduce::ReduceByKey(tmp, tbsz, b.dk, b.du, b.dv, b.da, b.dn, BenchOp{}, (int) n, launch.get_stream());
+  });
+  cudaFree(tmp);
+  teardown(b);
+}
+
+// clang-format off
+#define RBK_PATTERNS                                                                  \
+  {"r3", "e3", "r4", "e4", "r63", "e63", "r64", "e64", "r255", "e255", "r256",        \
+   "e256", "r511", "e511", "r512", "e512", "r895", "e895", "r896", "e896", "r1023",   \
+   "alt255_256", "zipf"}
+// clang-format on
+
 NVBENCH_BENCH(persistent_rbk_bench)
   .set_name("persistent_rbk_i32k_f32v" K_OP_NAME)
   .add_int64_power_of_two_axis("Elements{io}", {28})
@@ -200,4 +230,12 @@ NVBENCH_BENCH(cub_rbk_bench)
   .set_name("cub_DeviceReduce_ReduceByKey_i32k_f32v" K_OP_NAME)
   .add_int64_power_of_two_axis("Elements{io}", {28})
   .add_int64_power_of_two_axis("MaxSegSize", {0, 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20});
+NVBENCH_BENCH(persistent_rbk_pattern_bench)
+  .set_name("persistent_rbk_pattern_i32k_f32v" K_OP_NAME)
+  .add_int64_power_of_two_axis("Elements{io}", {28})
+  .add_string_axis("Pattern", RBK_PATTERNS);
+NVBENCH_BENCH(cub_rbk_pattern_bench)
+  .set_name("cub_DeviceReduce_ReduceByKey_pattern_i32k_f32v" K_OP_NAME)
+  .add_int64_power_of_two_axis("Elements{io}", {28})
+  .add_string_axis("Pattern", RBK_PATTERNS);
 NVBENCH_MAIN;
