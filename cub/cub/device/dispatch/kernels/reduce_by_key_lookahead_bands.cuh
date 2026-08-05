@@ -43,23 +43,22 @@ warp_span_fold(const ValueT* tile_vals, int begin, int end, int lane_id, Reducti
 
 template <int items_per_thread, int kLaneElems, class ValueT, class OffT, class ReductionOpT>
 _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
-  ValueT* __restrict__ d_aggregates,
-  const ValueT* __restrict__ tile_vals,
-  unsigned my_word,
+  ValueT* __restrict__ d_aggregates, // global output array
+  const ValueT* __restrict__ tile_vals, // staged values in smem
+  unsigned my_word, // this lanes head_flag
   OffT global_runs_before_warp_tile,
   int warp_tile_offset,
   int lane_id,
   ReductionOpT op,
-  ValueT& lead_out, // fold of [warp-tile start, first head); garbage when the lead span is
-                    // empty or the warp tile is head-free (the caller's has-flags guard both)
+  ValueT& lead_out, // partials of lead
   ValueT& tail_out)
 {
   static_assert(items_per_thread == 32 && sizeof(ValueT) == 4, "the prototype pins 32x32 warp tiles and 4-byte values");
   static_assert(kLaneElems == 32 || kLaneElems == 4 || kLaneElems == 2 || kLaneElems == 1,
                 "unsupported granularity would silently take the one-element arm");
-  constexpr int kRounds = items_per_thread / kLaneElems;
-  ValueT* const out     = d_aggregates + global_runs_before_warp_tile;
-  const unsigned upto_l = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
+  constexpr int kRounds                 = items_per_thread / kLaneElems;
+  ValueT* const out                     = d_aggregates + global_runs_before_warp_tile;
+  const unsigned mask_lanes_at_or_below = (lane_id == 31) ? 0xffffffffu : ((2u << lane_id) - 1);
 
   if constexpr (kLaneElems == 32)
   {
@@ -241,7 +240,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     ValueT S = tail;
     // at one element per lane the round word IS the break mask: no ballot needed
     const unsigned pmask          = (kLaneElems == 1) ? round_word : __ballot_sync(full_mask, brk);
-    const unsigned p_at_or_before = pmask & upto_l;
+    const unsigned p_at_or_before = pmask & mask_lanes_at_or_below;
     const int p_dist              = (p_at_or_before != 0u) ? (lane_id - (31 - __clz(p_at_or_before))) : (lane_id + 1);
     const int p_max               = __reduce_max_sync(full_mask, p_dist);
     auto scan_steps               = [&](int first_off, int last_off) _CCCL_FORCEINLINE_LAMBDA {
@@ -253,7 +252,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
           const unsigned upto_prev = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
           const ValueT from_left   = __shfl_up_sync(full_mask, S, off);
           // one merged condition, one predicable body, every type and op
-          const unsigned t = (pmask & upto_l & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
+          const unsigned t = (pmask & mask_lanes_at_or_below & ~upto_prev) | ((lane_id < off) ? 1u : 0u);
           if (t == 0)
           {
             S = op(from_left, S);
@@ -286,14 +285,15 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     {
       // deferred incoming close: the run ending at my first head. in_emit (a head exists
       // before this lane's span) guarantees every piece below is nonempty
-      const ValueT S_prev   = __shfl_up_sync(full_mask, S, 1);
-      const unsigned before = pmask & ((1u << lane_id) - 1u);
+      const ValueT S_prev                 = __shfl_up_sync(full_mask, S, 1);
+      const unsigned heads_strictly_below = pmask & ((1u << lane_id) - 1u);
       // <2> drops the carry_has test: in_emit (its only consumer there, the lead moved out)
       // implies a head exists before this span, so the selected pieces are nonempty exactly
       // when read. <32>/<4> keep it: their lead export reads in_val in round 0 (carry empty)
-      const ValueT P_in   = (kLaneElems == 2)
-                            ? ((lane_id > 0) ? ((before != 0u) ? S_prev : op(carry, S_prev)) : carry)
-                            : ((lane_id > 0) ? ((before != 0u || !carry_has) ? S_prev : op(carry, S_prev)) : carry);
+      const ValueT P_in =
+        (kLaneElems == 2)
+          ? ((lane_id > 0) ? ((heads_strictly_below != 0u) ? S_prev : op(carry, S_prev)) : carry)
+          : ((lane_id > 0) ? ((heads_strictly_below != 0u || !carry_has) ? S_prev : op(carry, S_prev)) : carry);
       const bool in_emit  = brk && (rank_base >= 1);
       const ValueT in_val = pfx_has ? op(P_in, pfx) : P_in;
       if (in_emit)
@@ -320,14 +320,14 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       // as a bit, never as a shuffled value (the row stream's receipted emission shape).
       // Lanes with no head at-or-before fold the inter-round carry in FIRST: their open run
       // began in an earlier round, and the store below must carry its whole left part
-      if ((round_word & upto_l) == 0u && it > 0 && carry_has)
+      if ((round_word & mask_lanes_at_or_below) == 0u && it > 0 && carry_has)
       {
         S = op(carry, S);
       }
       const unsigned next_word = __shfl_sync(full_mask, my_word, (it + 1) & 31);
       const bool is_end        = (lane_id < 31) ? (((round_word >> (lane_id + 1)) & 1u) != 0u)
                                                 : ((it + 1 < kRounds) && ((next_word & 1u) != 0u));
-      const int rank_in_round  = round_runs_before + __popc(round_word & upto_l) - 1;
+      const int rank_in_round  = round_runs_before + __popc(round_word & mask_lanes_at_or_below) - 1;
       if (is_end && rank_in_round >= 0)
       {
         out[rank_in_round] = S;
