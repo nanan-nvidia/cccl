@@ -840,14 +840,7 @@ __launch_bounds__(current_policy<PolicySelector>().lookahead.compute_warps * 32,
   }
 }
 
-// boundary cleanup: one warp per tile that owes an entering-run close. Runs AFTER the main
-// kernel (the launch boundary synchronizes), reads plain records, writes each cross-tile run's
-// aggregate = open(from) + whole-sums of the head-free tiles between + lead(this). Every window
-// is disjoint, sums fold in fixed order (deterministic), total work is O(num_tiles) amortized.
-// The record holds only the two value sums; the bookkeeping is derived here: a tile owes a
-// close iff runs exist before it AND it closes them (own head, or input end); the destination
-// is the entering run's rank; the window start is the prefix's last-tile-with-runs; the lead
-// span is empty iff the tile's first element is a head (its key differs from its predecessor).
+// boundary cleanup
 template <class KeyT, class ValueT, class OffT, class ReductionOpT = ::cuda::std::plus<>>
 _CCCL_KERNEL_ATTRIBUTES void DeviceReduceByKeyLookaheadCleanupKernel(
   ValueT* d_aggregates,

@@ -198,9 +198,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       }
       if constexpr (kLaneElems == 2)
       {
-        // closed form: with two elements there is nothing to walk -- every piece is a direct
-        // function of the two head bits (the generic seeded walk cost exactly 4 extra selects
-        // per round here = +64/warp tile: ncu source-counter receipt at seg2)
         const bool h0     = (lane_heads & 1u) != 0u;
         const bool h1     = (lane_heads & 2u) != 0u;
         const ValueT both = op(v[0], v[1]);
@@ -254,7 +251,6 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
         {
           const unsigned mask_lanes_at_or_below_src = (lane_id >= off) ? ((2u << (lane_id - off)) - 1) : 0u;
           const ValueT from_left                    = __shfl_up_sync(full_mask, open_agg, off);
-          // one merged condition, one predicable body, every type and op
           const unsigned blockers =
             (head_lanes & mask_lanes_at_or_below & ~mask_lanes_at_or_below_src) | ((lane_id < off) ? 1u : 0u);
           if (blockers == 0)
@@ -284,16 +280,11 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       scan_steps(1, 16);
     }
 
-    // ---- close the runs this round finishes; export the warp tile's lead at its first head ----
+    //close the runs this round finishes; export the warp tile's lead at its first head
     if constexpr (kLaneElems != 1)
     {
-      // deferred incoming close: the run ending at my first head. close_incoming (a head exists
-      // before this lane's span) guarantees every piece below is nonempty
       const ValueT prev_open_agg          = __shfl_up_sync(full_mask, open_agg, 1);
       const unsigned heads_strictly_below = head_lanes & ((1u << lane_id) - 1u);
-      // <2> drops the carry_has test: close_incoming (its only consumer there, the lead moved out)
-      // implies a head exists before this span, so the selected pieces are nonempty exactly
-      // when read. <32>/<4> keep it: their lead export reads incoming_run_agg in round 0 (carry empty)
       const ValueT incoming_agg =
         (kLaneElems == 2)
           ? ((lane_id > 0) ? ((heads_strictly_below != 0u) ? prev_open_agg : op(carry, prev_open_agg)) : carry)
@@ -305,11 +296,8 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
       {
         out[rank_base - 1] = incoming_run_agg;
       }
-      if constexpr (kLaneElems >= 4) // <32>/<4> export their lead (receipts: 2^2 -0.5% in-band
-      { // that the caller's re-fold measurably re-reads (the
-        // shorter forms keep their round loops branch-free and
-        // the caller folds their few-element lead itself)
-        if (!lead_exported && head_lanes != 0u) // uniform branch: the tile's first headed round
+      if constexpr (kLaneElems >= 4)
+        if (!lead_exported && head_lanes != 0u)
         {
           const int first_head_lane = __ffs(head_lanes) - 1;
           const ValueT lead_val     = (lane_id > 0 || carry_has) ? incoming_run_agg : lane_lead_agg;
@@ -320,11 +308,7 @@ _CCCL_DEVICE_API _CCCL_FORCEINLINE void stream_band(
     }
     else
     {
-      // is_end form (a head's pre-first-head piece is empty at this granularity by
-      // construction): the lane BEFORE a head stores its own fold, so boundary info travels
-      // as a bit, never as a shuffled value (the row stream's receipted emission shape).
-      // Lanes with no head at-or-before fold the inter-round carry in FIRST: their open run
-      // began in an earlier round, and the store below must carry its whole left part
+
       if ((round_word & mask_lanes_at_or_below) == 0u && round > 0 && carry_has)
       {
         open_agg = op(carry, open_agg);
