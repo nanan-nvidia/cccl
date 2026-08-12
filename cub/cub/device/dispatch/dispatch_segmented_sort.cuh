@@ -28,6 +28,7 @@
 #include <thrust/system/cuda/detail/core/triple_chevron_launch.h>
 
 #include <cuda/__cmath/ceil_div.h>
+#include <cuda/std/__algorithm/max.h>
 #include <cuda/std/__algorithm/min.h>
 #include <cuda/std/__host_stdlib/sstream>
 #include <cuda/std/__iterator/reverse_iterator.h>
@@ -63,6 +64,8 @@ CUB_RUNTIME_FUNCTION _CCCL_VISIBILITY_HIDDEN cudaError_t device_segmented_sort_c
   BeginOffsetIteratorT d_begin_offsets,
   EndOffsetIteratorT d_end_offsets,
   local_segment_index_t* group_sizes,
+  const local_segment_index_t* d_group_sizes,
+  local_segment_index_t* d_ticket,
   local_segment_index_t* large_and_medium_segments_indices,
   local_segment_index_t* small_segments_indices,
   cudaStream_t stream,
@@ -91,6 +94,8 @@ CUB_RUNTIME_FUNCTION _CCCL_VISIBILITY_HIDDEN cudaError_t device_segmented_sort_c
     if (const auto error = CubDebug(
           launcher_factory(blocks_in_grid, large_threads_per_block, 0, stream)
             .doit(large_kernel,
+                  d_group_sizes,
+                  d_ticket,
                   large_and_medium_segments_indices,
                   d_current_keys,
                   d_final_keys,
@@ -139,11 +144,11 @@ CUB_RUNTIME_FUNCTION _CCCL_VISIBILITY_HIDDEN cudaError_t device_segmented_sort_c
 
     launcher_factory(small_and_medium_blocks_in_grid, small_threads_per_block, 0, stream)
       .doit(small_kernel,
-            small_segments,
-            medium_segments,
-            medium_blocks,
+            static_cast<local_segment_index_t>(num_segments),
+            d_group_sizes,
+            d_ticket + 1,
             small_segments_indices,
-            large_and_medium_segments_indices + num_segments - medium_segments,
+            large_and_medium_segments_indices,
             d_current_keys,
             d_final_keys,
             d_current_values,
@@ -192,6 +197,7 @@ __launch_bounds__(1) _CCCL_KERNEL_ATTRIBUTES void DeviceSegmentedSortContinuatio
   const BeginOffsetIteratorT d_begin_offsets,
   const EndOffsetIteratorT d_end_offsets,
   local_segment_index_t* const group_sizes,
+  local_segment_index_t* const d_ticket,
   local_segment_index_t* const large_and_medium_segments_indices,
   local_segment_index_t* const small_segments_indices,
   const KernelLauncherFactory launcher_factory,
@@ -200,6 +206,10 @@ __launch_bounds__(1) _CCCL_KERNEL_ATTRIBUTES void DeviceSegmentedSortContinuatio
   const int medium_segments_per_block,
   const int small_segments_per_block)
 {
+  // The writes are visible to the child grids launched by this thread below
+  d_ticket[0] = 0;
+  d_ticket[1] = 0;
+
   // In case of CDP:
   // 1. each CTA has a different main stream
   // 2. all streams are non-blocking
@@ -222,6 +232,8 @@ __launch_bounds__(1) _CCCL_KERNEL_ATTRIBUTES void DeviceSegmentedSortContinuatio
     d_begin_offsets,
     d_end_offsets,
     group_sizes,
+    group_sizes,
+    d_ticket,
     large_and_medium_segments_indices,
     small_segments_indices,
     0, // always launching on the main stream (see motivation above)
@@ -507,7 +519,8 @@ struct CCCL_DEPRECATED_BECAUSE("Use the tuning API for DeviceSegmentedSort") Dis
 
       large_and_medium_segments_indices.grow(max_num_segments_per_invocation);
       small_segments_indices.grow(max_num_segments_per_invocation);
-      group_sizes.grow(num_selected_groups);
+      // Two extra elements serve as the ticket counters of the sorting kernels
+      group_sizes.grow(num_selected_groups + 2);
 
       auto medium_indices_iterator = ::cuda::std::make_reverse_iterator(large_and_medium_segments_indices.get());
 
@@ -859,6 +872,7 @@ private:
               current_begin_offset,                                                     \
               current_end_offset,                                                       \
               group_sizes.get(),                                                        \
+              group_sizes.get() + num_selected_groups,                                  \
               large_and_medium_segments_indices.get(),                                  \
               small_segments_indices.get(),                                             \
               launcher_factory,                                                         \
@@ -879,6 +893,12 @@ private:
       NV_IF_ELSE_TARGET(
         NV_IS_HOST,
         ({
+          if (const auto error = CubDebug(launcher_factory.MemsetAsync(
+                group_sizes.get() + num_selected_groups, 0, 2 * sizeof(local_segment_index_t), stream)))
+          {
+            return error;
+          }
+
           local_segment_index_t h_group_sizes[num_selected_groups];
           if (const auto error = CubDebug(launcher_factory.MemcpyAsync(
                 h_group_sizes,
@@ -908,6 +928,8 @@ private:
                 current_begin_offset,
                 current_end_offset,
                 h_group_sizes,
+                group_sizes.get(),
+                group_sizes.get() + num_selected_groups,
                 large_and_medium_segments_indices.get(),
                 small_segments_indices.get(),
                 stream,
@@ -1085,6 +1107,7 @@ CUB_RUNTIME_FUNCTION _CCCL_VISIBILITY_HIDDEN _CCCL_FORCEINLINE cudaError_t sort_
                 current_begin_offset,
                 current_end_offset,
                 group_sizes.get(),
+                group_sizes.get() + num_selected_groups,
                 large_and_medium_segments_indices.get(),
                 small_segments_indices.get(),
                 launcher_factory,
@@ -1106,43 +1129,114 @@ CUB_RUNTIME_FUNCTION _CCCL_VISIBILITY_HIDDEN _CCCL_FORCEINLINE cudaError_t sort_
     NV_IF_ELSE_TARGET(
       NV_IS_HOST,
       ({
-        local_segment_index_t h_group_sizes[num_selected_groups];
-        if (const auto error = CubDebug(launcher_factory.MemcpyAsync(
-              h_group_sizes,
-              group_sizes.get(),
-              num_selected_groups * sizeof(local_segment_index_t),
-              cudaMemcpyDeviceToHost,
-              stream)))
+        // The grid sizes must not depend on the partitioning results so the launch sequence can be
+        // captured into a CUDA graph: fill the device, bounded by worst-case counts known on the host.
+        int sm_count = 0;
+        if (const auto error = CubDebug(launcher_factory.MultiProcessorCount(sm_count)))
         {
           return error;
         }
 
-        if (const auto error = CubDebug(SyncStream(stream)))
+        int large_occupancy = 0;
+        if (const auto error = CubDebug(launcher_factory.MaxSmOccupancy(
+              large_occupancy, large_kernel, active_policy.large_segment.threads_per_block)))
         {
           return error;
         }
 
-        if (const auto error = detail::segmented_sort::device_segmented_sort_continuation(
-              large_kernel,
-              small_kernel,
-              current_num_segments,
-              d_keys.Current(),
-              get_final_output(d_keys, active_policy.large_segment.radix_bits),
-              d_keys_double_buffer,
-              d_values.Current(),
-              get_final_output(d_values, active_policy.large_segment.radix_bits),
-              d_values_double_buffer,
-              current_begin_offset,
-              current_end_offset,
-              h_group_sizes,
-              large_and_medium_segments_indices.get(),
-              small_segments_indices.get(),
-              stream,
-              launcher_factory,
-              active_policy.large_segment.threads_per_block,
-              active_policy.small_segment.threads_per_block,
-              active_policy.medium_segment.segments_per_block(),
-              active_policy.small_segment.segments_per_block()))
+        int small_occupancy = 0;
+        if (const auto error = CubDebug(launcher_factory.MaxSmOccupancy(
+              small_occupancy, small_kernel, active_policy.small_segment.threads_per_block)))
+        {
+          return error;
+        }
+
+        // Every large segment holds more than a medium tile of items, bounding the number of large segments
+        const auto max_large_segments =
+          (::cuda::std::min) (static_cast<::cuda::std::int64_t>(current_num_segments),
+                              num_items
+                                / (static_cast<::cuda::std::int64_t>(active_policy.medium_segment.items_per_tile())
+                                   + 1));
+
+        // Upper bound for ceil(medium_segments / medium_per_block) + ceil(small_segments / small_per_block)
+        const auto max_small_and_medium_blocks =
+          ::cuda::ceil_div(static_cast<::cuda::std::int64_t>(current_num_segments),
+                           static_cast<::cuda::std::int64_t>(active_policy.medium_segment.segments_per_block()))
+          + 1;
+
+        const auto clamp_grid = [](::cuda::std::int64_t max_blocks, int fill_blocks) {
+          return static_cast<local_segment_index_t>(
+            (::cuda::std::max) (::cuda::std::int64_t{1},
+                                (::cuda::std::min) (max_blocks, static_cast<::cuda::std::int64_t>(fill_blocks))));
+        };
+
+        const local_segment_index_t large_blocks_in_grid = clamp_grid(max_large_segments, sm_count * large_occupancy);
+        const local_segment_index_t small_blocks_in_grid =
+          clamp_grid(max_small_and_medium_blocks, sm_count * small_occupancy);
+
+        auto* const d_ticket = group_sizes.get() + num_selected_groups;
+        if (const auto error =
+              CubDebug(launcher_factory.MemsetAsync(d_ticket, 0, 2 * sizeof(local_segment_index_t), stream)))
+        {
+          return error;
+        }
+
+#ifdef CUB_DEBUG_LOG
+        _CubLog("Invoking DeviceSegmentedSortKernelLarge<<<%d, %d, 0, %lld>>>()\n",
+                static_cast<int>(large_blocks_in_grid),
+                active_policy.large_segment.threads_per_block,
+                (long long) stream);
+#endif // CUB_DEBUG_LOG
+
+        launcher_factory(large_blocks_in_grid, active_policy.large_segment.threads_per_block, 0, stream)
+          .doit(large_kernel,
+                group_sizes.get(),
+                d_ticket,
+                large_and_medium_segments_indices.get(),
+                d_keys.Current(),
+                get_final_output(d_keys, active_policy.large_segment.radix_bits),
+                d_keys_double_buffer,
+                d_values.Current(),
+                get_final_output(d_values, active_policy.large_segment.radix_bits),
+                d_values_double_buffer,
+                current_begin_offset,
+                current_end_offset);
+
+        if (const auto error = CubDebug(cudaPeekAtLastError()))
+        {
+          return error;
+        }
+        if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+        {
+          return error;
+        }
+
+#ifdef CUB_DEBUG_LOG
+        _CubLog("Invoking DeviceSegmentedSortKernelSmall<<<%d, %d, 0, %lld>>>()\n",
+                static_cast<int>(small_blocks_in_grid),
+                active_policy.small_segment.threads_per_block,
+                (long long) stream);
+#endif // CUB_DEBUG_LOG
+
+        launcher_factory(small_blocks_in_grid, active_policy.small_segment.threads_per_block, 0, stream)
+          .doit(small_kernel,
+                current_num_segments,
+                group_sizes.get(),
+                d_ticket + 1,
+                small_segments_indices.get(),
+                large_and_medium_segments_indices.get(),
+                d_keys.Current(),
+                get_final_output(d_keys, active_policy.large_segment.radix_bits),
+                d_values.Current(),
+                get_final_output(d_values, active_policy.large_segment.radix_bits),
+                current_begin_offset,
+                current_end_offset);
+
+        if (const auto error = CubDebug(cudaPeekAtLastError()))
+        {
+          return error;
+        }
+        if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
         {
           return error;
         }
@@ -1373,7 +1467,8 @@ CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE auto dispatch(
 
       large_and_medium_segments_indices.grow(max_num_segments_per_invocation);
       small_segments_indices.grow(max_num_segments_per_invocation);
-      group_sizes.grow(num_selected_groups);
+      // Two extra elements serve as the ticket counters of the sorting kernels
+      group_sizes.grow(num_selected_groups + 2);
 
       auto medium_indices_iterator = ::cuda::std::make_reverse_iterator(large_and_medium_segments_indices.get());
 
