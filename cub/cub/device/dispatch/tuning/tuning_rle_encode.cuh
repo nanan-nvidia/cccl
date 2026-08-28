@@ -19,6 +19,10 @@
 #include <cub/block/block_load.cuh>
 #include <cub/block/block_scan.cuh>
 #include <cub/detail/delay_constructor.cuh>
+#include <cub/detail/warpspeed/allocators/smem_allocator.cuh>
+#include <cub/detail/warpspeed/resource/smem_resource_raw.cuh>
+#include <cub/detail/warpspeed/squad/squad_desc.cuh>
+#include <cub/detail/warpspeed/sync_handler.cuh>
 #include <cub/device/dispatch/tuning/common.cuh>
 #include <cub/device/dispatch/tuning/tuning_reduce_by_key.cuh>
 #include <cub/util_device.cuh>
@@ -118,7 +122,8 @@ struct RleLookaheadPolicy
   int key_ring_stages; //!< Depth of the key staging ring: how many pipeline generations can be in flight
   // positions ring depth: positions are written at staging and consumed by store about 2 pipeline_gens later,
   // so it can be SHALLOWER than the keys ring and this buys room for more key_ring_stages
-  int pos_ring_stages; //!< Depth of the run-positions ring; 2 * pos_ring_stages >= key_ring_stages must hold
+  int pos_ring_stages; //!< Depth of the run-positions ring (any depth >= 1: the pos ring is a warpspeed
+                       //!< resource and paces itself, the old 2 * pos_ring_stages >= key_ring_stages bound is gone)
   int poll_items_per_thread; //!< Number of tile-state loads each poll-warp lane keeps in flight
   int dense_poll_items_per_thread; //!< Loads per lane for the smaller poll window used in dense mode; the window is
                                    //!< warp_threads * dense_poll_items_per_thread tile states
@@ -160,19 +165,9 @@ struct RleLookaheadPolicy
          + (key_align < detail::bulk_copy_min_align ? detail::bulk_copy_min_align / key_size : 0);
   }
 
-  [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr ::cuda::std::size_t
-  dyn_smem_bytes(int key_size, int key_align) const noexcept
-  {
-    return static_cast<::cuda::std::size_t>(key_ring_stages) * slot_stride(key_size, key_align) * key_size
-         + static_cast<::cuda::std::size_t>(pos_ring_stages) * tile_size() * sizeof(detail::rle::encode::position_t);
-  }
-
-  static constexpr ::cuda::std::size_t static_smem_budget = 8 * 1024;
-
-  //!< the unstaged floor configuration keeps at most this many key generations in flight
+  //! the unstaged floor configuration keeps at most this many key generations in flight
   static constexpr int floor_key_ring_cap = 4;
-  //!< one pos-ring stage may cover at most this many key generations: the parity bound
-  //!< pos_ring_stages * max_key_stages_per_pos_stage >= key_ring_stages must hold
+  //! how many key generations one floor pos-ring stage covers (a depth heuristic, not a correctness bound)
   static constexpr int max_key_stages_per_pos_stage = 2;
 
   [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr int floor_key_ring_stages() const noexcept
@@ -183,12 +178,6 @@ struct RleLookaheadPolicy
   [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr int floor_pos_ring_stages() const noexcept
   {
     return ::cuda::ceil_div(floor_key_ring_stages(), max_key_stages_per_pos_stage);
-  }
-
-  [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr ::cuda::std::size_t floor_dyn_smem_bytes() const noexcept
-  {
-    return static_cast<::cuda::std::size_t>(floor_pos_ring_stages()) * tile_size()
-         * sizeof(detail::rle::encode::position_t);
   }
 
   [[nodiscard]] _CCCL_HOST_DEVICE_API friend constexpr bool
@@ -220,6 +209,100 @@ struct RleLookaheadPolicy
   }
 #endif // _CCCL_HOSTED()
 };
+
+namespace detail::rle::encode
+{
+[[nodiscard]] _CCCL_HOST_DEVICE_API constexpr warpspeed::SquadDesc squad_load(const RleLookaheadPolicy&)
+{
+  return {0, 1};
+}
+
+[[nodiscard]] _CCCL_HOST_DEVICE_API constexpr warpspeed::SquadDesc squad_compute(const RleLookaheadPolicy& policy)
+{
+  return {1, policy.compute_warps};
+}
+
+[[nodiscard]] _CCCL_HOST_DEVICE_API constexpr warpspeed::SquadDesc squad_poll(const RleLookaheadPolicy&)
+{
+  return {2, 1};
+}
+
+// one store warp drains each compute warp's tile
+[[nodiscard]] _CCCL_HOST_DEVICE_API constexpr warpspeed::SquadDesc squad_store(const RleLookaheadPolicy& policy)
+{
+  return {3, policy.compute_warps};
+}
+
+[[nodiscard]] _CCCL_HOST_DEVICE_API constexpr warpspeed::SquadDesc squad_bookkeeper(const RleLookaheadPolicy&)
+{
+  return {4, 1};
+}
+
+_CCCL_HOST_DEVICE_API constexpr void rle_setup_phases(
+  const RleLookaheadPolicy& policy,
+  warpspeed::SyncHandler& sync_handler,
+  warpspeed::SmemAllocator& smem_allocator,
+  warpspeed::SmemResourceRaw& key_ring,
+  warpspeed::SmemResourceRaw& warp_aggr,
+  warpspeed::SmemResourceRaw& prefix,
+  warpspeed::SmemResourceRaw& clc,
+  warpspeed::SmemResourceRaw& pos)
+{
+  const warpspeed::SquadDesc tile_consumers[] = {
+    squad_compute(policy), squad_poll(policy), squad_store(policy), squad_bookkeeper(policy)};
+  key_ring.addPhase(sync_handler, smem_allocator, squad_load(policy));
+  key_ring.addPhase(sync_handler, smem_allocator, tile_consumers);
+  const warpspeed::SquadDesc aggr_readers[] = {squad_compute(policy), squad_store(policy), squad_bookkeeper(policy)};
+  warp_aggr.addPhase(sync_handler, smem_allocator, squad_compute(policy));
+  warp_aggr.addPhase(sync_handler, smem_allocator, aggr_readers);
+  const warpspeed::SquadDesc prefix_readers[] = {squad_store(policy), squad_bookkeeper(policy)};
+  prefix.addPhase(sync_handler, smem_allocator, squad_poll(policy));
+  prefix.addPhase(sync_handler, smem_allocator, prefix_readers);
+  clc.addPhase(sync_handler, smem_allocator, squad_load(policy));
+  clc.addPhase(sync_handler, smem_allocator, squad_load(policy));
+  pos.addPhase(sync_handler, smem_allocator, squad_compute(policy));
+  pos.addPhase(sync_handler, smem_allocator, squad_store(policy));
+}
+
+[[nodiscard]] _CCCL_HOST_DEVICE_API constexpr ::cuda::std::size_t rle_lookahead_smem_bytes(
+  const RleLookaheadPolicy& policy,
+  int key_size,
+  int key_align,
+  int prefix_size,
+  int prefix_align,
+  int key_ring_stages,
+  int pos_ring_stages,
+  bool keys_staged)
+{
+  warpspeed::SyncHandler sync_handler{};
+  warpspeed::SmemAllocator smem_allocator{};
+  const int compute_warps     = policy.compute_warps;
+  const int tile_size         = policy.tile_size();
+  const int slot_stride_bytes = policy.slot_stride(key_size, key_align) * key_size;
+  // match sizeof(rle_tile_meta_t) / sizeof(rle_warp_aggr_t) / sizeof(rle_pos_slot_t): no padding
+  const int tile_meta_bytes = (1 + compute_warps * detail::warp_threads) * int{sizeof(int)};
+  const int warp_aggr_bytes = 3 * compute_warps * int{sizeof(int)};
+  const int pos_slot_bytes  = tile_size * int{sizeof(position_t)};
+  (void) smem_allocator.alloc(
+    keys_staged ? static_cast<::cuda::std::uint32_t>(key_ring_stages) * slot_stride_bytes : 0u,
+    detail::bulk_copy_min_align);
+  (void) smem_allocator.alloc(static_cast<::cuda::std::uint32_t>(key_ring_stages) * tile_meta_bytes, alignof(int));
+  (void) smem_allocator.alloc(static_cast<::cuda::std::uint32_t>(key_ring_stages) * warp_aggr_bytes, alignof(int));
+  (void) smem_allocator.alloc(static_cast<::cuda::std::uint32_t>(key_ring_stages) * prefix_size, prefix_align);
+  (void) smem_allocator.alloc(sizeof(uint4), alignof(uint4));
+  (void) smem_allocator.alloc(static_cast<::cuda::std::uint32_t>(pos_ring_stages) * pos_slot_bytes, alignof(position_t));
+
+  warpspeed::SmemResourceRaw tile_meta(sync_handler, nullptr, tile_meta_bytes, tile_meta_bytes, key_ring_stages);
+  warpspeed::SmemResourceRaw warp_aggr(sync_handler, nullptr, warp_aggr_bytes, warp_aggr_bytes, key_ring_stages);
+  warpspeed::SmemResourceRaw prefix(sync_handler, nullptr, prefix_size, prefix_size, key_ring_stages);
+  warpspeed::SmemResourceRaw clc(sync_handler, nullptr, int{sizeof(uint4)}, int{sizeof(uint4)}, 1);
+  warpspeed::SmemResourceRaw pos(sync_handler, nullptr, pos_slot_bytes, pos_slot_bytes, pos_ring_stages);
+  warpspeed::SmemResourceRaw keys(sync_handler, nullptr, slot_stride_bytes, slot_stride_bytes, key_ring_stages);
+  rle_setup_phases(policy, sync_handler, smem_allocator, tile_meta, warp_aggr, prefix, clc, pos);
+  sync_handler.mHasInitialized = true;
+  return static_cast<::cuda::std::size_t>(smem_allocator.sizeBytes());
+}
+} // namespace detail::rle::encode
 
 //! The tuning policy for all algorithms in @ref DeviceRunLengthEncode
 struct RleEncodePolicy

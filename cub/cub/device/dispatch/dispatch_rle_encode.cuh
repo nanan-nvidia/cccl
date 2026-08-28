@@ -294,48 +294,48 @@ CUB_RUNTIME_FUNCTION cudaError_t invoke_lookahead(
   }
   auto* tile_partial_states = static_cast<tile_partial_state_t*>(allocations[0]);
 
-  int key_ring_stages   = lookahead_policy.key_ring_stages;
-  int pos_ring_stages   = lookahead_policy.pos_ring_stages;
-  bool keys_staged      = true;
-  size_t dyn_smem_bytes = lookahead_policy.dyn_smem_bytes(int{sizeof(key_t)}, int{alignof(key_t)});
-  NV_IF_TARGET(NV_IS_HOST,
-               ({
-                 int device         = 0;
-                 int max_optin_smem = 0;
-                 if (const auto error = CubDebug(cudaGetDevice(&device)))
-                 {
-                   return error;
-                 }
-                 if (const auto error = CubDebug(
-                       cudaDeviceGetAttribute(&max_optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device)))
-                 {
-                   return error;
-                 }
-                 if (dyn_smem_bytes + RleLookaheadPolicy::static_smem_budget <= static_cast<size_t>(max_optin_smem))
-                 {
-                   if (const auto error = CubDebug(launcher_factory.set_max_dynamic_smem_size_for(
-                         kernel_source.LookaheadKernel(), static_cast<int>(dyn_smem_bytes))))
-                   {
-                     return error;
-                   }
-                 }
-                 else
-                 {
-                   keys_staged = false;
-                 }
-               }),
-               ({ keys_staged = false; }))
+  int key_ring_stages = lookahead_policy.key_ring_stages;
+  int pos_ring_stages = lookahead_policy.pos_ring_stages;
+  bool keys_staged    = true;
+  size_t dyn_smem_bytes =
+    rle_lookahead_smem_bytes<key_t, OffsetT>(lookahead_policy, key_ring_stages, pos_ring_stages, true);
+  NV_IF_TARGET(
+    NV_IS_HOST,
+    ({
+      int max_dyn_smem_size = 0;
+      if (const auto error =
+            CubDebug(launcher_factory.max_dynamic_smem_size_for(max_dyn_smem_size, kernel_source.LookaheadKernel())))
+      {
+        return error;
+      }
+      if (dyn_smem_bytes <= static_cast<size_t>(max_dyn_smem_size))
+      {
+        // set the attribute to the device maximum, not the used size, so concurrent dispatches with
+        // different ring depths do not fight over the attribute
+        if (const auto error = CubDebug(
+              launcher_factory.set_max_dynamic_smem_size_for(kernel_source.LookaheadKernel(), max_dyn_smem_size)))
+        {
+          return error;
+        }
+      }
+      else
+      {
+        keys_staged = false;
+      }
+    }),
+    ({ keys_staged = false; }))
   if (!keys_staged)
   {
     // vvv regressed case: CDP callers always land here. Fits under 48KB SMEM vvv
     key_ring_stages = lookahead_policy.floor_key_ring_stages();
     pos_ring_stages = lookahead_policy.floor_pos_ring_stages();
-    dyn_smem_bytes  = lookahead_policy.floor_dyn_smem_bytes();
+    dyn_smem_bytes =
+      rle_lookahead_smem_bytes<key_t, OffsetT>(lookahead_policy, key_ring_stages, pos_ring_stages, false);
     // ^^^ regressed case ^^^
   }
 
   {
-    constexpr int init_kernel_threads = 128;
+    constexpr int init_kernel_threads = rle_init_kernel_threads;
     const auto init_grid_size         = ::cuda::ceil_div(num_tiles, init_kernel_threads);
     CUB_DETAIL_RLE_ENCODE_LOG(
       "Invoking DeviceRleEncodeLookaheadInitKernel<<<%d, %d, 0, %lld>>>()\n",
@@ -438,6 +438,16 @@ CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE cudaError_t dispatch(
     {
       return error;
     }
+#  if _CCCL_HOSTED() && defined(CUB_DEBUG_LOG)
+    NV_IF_TARGET(NV_IS_HOST, ({
+                   std::stringstream ss;
+                   ss << policy_selector(cc);
+                   _CubLog("Dispatching DeviceRunLengthEncode::Encode to compute capability %d.%d with tuning: %s\n",
+                           cc.major_cap(),
+                           cc.minor_cap(),
+                           ss.str().c_str());
+                 }))
+#  endif // _CCCL_HOSTED() && defined(CUB_DEBUG_LOG)
     return detail::dispatch_compute_cap(policy_selector, cc, [&](auto policy_getter) -> cudaError_t {
       if CUB_DETAIL_CONSTEXPR_ISH (policy_getter().algorithm == RleAlgorithm::lookahead)
       {
